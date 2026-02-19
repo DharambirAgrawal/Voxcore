@@ -1,0 +1,5 @@
+# This directory holds pre-generated backchannel WAV clips.
+# Run `python -m backchannel.generator` to populate it.
+# Files: uh_huh.wav, yeah.wav, i_see.wav, go_on.wav, interesting.wav,
+#        right.wav, mm_hmm.wav, okay.wav, sure.wav, oh_wow.wav,
+#        got_it.wav, tell_me_more.wav, really.wav, makes_sense.wav, understood.wav

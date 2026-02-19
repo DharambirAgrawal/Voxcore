@@ -1,0 +1,46 @@
+# ╔══════════════════════════════════════════════════════════════════════════════════╗
+# ║                        VOXCORE — requirements.txt                               ║
+# ║                        ALL PYTHON DEPENDENCIES                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════════╝
+#
+# Install: pip install -r requirements.txt
+#
+# NOTE: torch is CPU-only (for Silero VAD). No GPU required.
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+# --- Groq SDK (STT + LLM + TTS — all-in-one) ---
+groq>=0.12.0
+
+# --- Audio Capture & Playback ---
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.11.0
+
+# --- Voice Activity Detection (Silero VAD) ---
+torch>=2.0.0
+torchaudio>=2.0.0
+silero-vad>=5.0
+
+# --- Audio Analysis (Backchannel cue detection) ---
+librosa>=0.10.0
+
+# --- LLM & AI ---
+# (groq SDK handles all LLM calls — no separate openai package needed)
+
+# --- Vector Memory (Long-term) ---
+chromadb>=0.5.0
+
+# --- Web Framework (API + WebSocket server) ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# --- Configuration & Environment ---
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# --- Async HTTP (for tool calls, webhook, HF fallback) ---
+aiohttp>=3.9.0
+
+# --- Utilities ---
+pydantic>=2.0.0

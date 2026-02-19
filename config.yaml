@@ -1,0 +1,108 @@
+# ╔══════════════════════════════════════════════════════════════════════════════════╗
+# ║                          VOXCORE — config.yaml                                  ║
+# ║                   MASTER CONFIGURATION — ALL SETTINGS LIVE HERE                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════════╝
+#
+# PURPOSE:
+#   Single source of truth for all VoxCore configuration. Every module reads
+#   its settings from this file at startup via load_config() in main.py.
+#   Hot-reloadable via the POST /config API endpoint.
+#
+# LOADED BY:
+#   main.py → load_config() → yaml.safe_load() → passed to all module constructors
+#
+# SCHEMA:
+#   Top-level keys: persona, models, audio, backchannel, memory, agent, safety, server
+#   All keys are REQUIRED unless marked (optional).
+#
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+persona:
+  name: "Aria"                       # Display name of the AI persona
+  system_prompt: |
+    You are Aria, a warm, focused, and capable assistant.
+    Keep all spoken responses under 3 sentences unless asked for more.
+    Always start responses with an emotion tag: [cheerful] [calm] [concerned] [excited] [empathetic]
+    When you need to perform a task, include ONLY in your output:
+    <agent>{"action": "tool_name", "params": {...}}</agent>
+    Do NOT describe the tool call in your speech. Just say 'On it' or 'Let me check'.
+  voice: "tara"                      # Orpheus voice: tara / leah / jess / leo / dan / mia / zac / zoe
+  language: "en"                     # "en" for English, "ar" for Arabic
+
+models:
+  stt_primary: "whisper-large-v3-turbo"                          # Groq Whisper — primary STT
+  stt_fallback: "https://your-hf-space.hf.space/transcribe"     # HuggingFace faster-whisper endpoint (your own)
+  llm_fast: "llama-3.1-8b-instant"                               # Fast brain — all real-time responses
+  llm_smart: "meta-llama/llama-4-scout-17b-16e-instruct"        # Smart brain — complex reasoning
+  llm_agentic: "moonshotai/kimi-k2-instruct"                    # Agentic brain — tool use
+  llm_deep: "qwen/qwen3-32b"                                    # Deep brain — summaries / analysis
+  llm_power: "openai/gpt-oss-120b"                              # Power brain — max intelligence (rare)
+  tts: "canopylabs/orpheus-v1-english"                           # Orpheus TTS — English
+  tts_arabic: "canopylabs/orpheus-arabic-saudi"                  # Orpheus TTS — Arabic (optional)
+  safety: "meta-llama/llama-guard-4-12b"                         # Llama Guard — safety filtering
+
+audio:
+  sample_rate: 16000                 # STT input sample rate in Hz (16kHz mono)
+  output_sample_rate: 48000          # TTS output sample rate in Hz (Orpheus outputs 48kHz)
+  chunk_ms: 30                       # VAD chunk size in milliseconds
+  vad_speech_threshold: 0.5          # Silero VAD speech probability threshold (0.0–1.0)
+  vad_silence_threshold: 0.7         # Silero VAD silence probability threshold for end-of-turn
+  vad_silence_duration_ms: 400       # Milliseconds of silence before end-of-turn is declared
+  noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
+
+backchannel:
+  enabled: true                      # Enable/disable backchannel system entirely
+  min_pause_ms: 350                  # Phrase boundary detection: minimum pause in ms
+  min_gap_between_s: 8               # Minimum seconds between consecutive backchannels
+  min_user_speech_s: 2               # User must speak at least this many seconds before backchannel
+  clips_dir: "backchannel/clips/"    # Directory containing pre-generated WAV clips
+  energy_threshold: 0.02             # RMS energy threshold for phrase boundary detection
+  clips:                             # List of clip basenames (without .wav) to generate
+    - uh_huh
+    - yeah
+    - i_see
+    - go_on
+    - interesting
+    - right
+    - mm_hmm
+    - okay
+    - sure
+    - oh_wow
+    - got_it
+    - tell_me_more
+    - really
+    - makes_sense
+    - understood
+
+memory:
+  short_term_turns: 20               # Number of recent turns to keep in rolling window
+  compress_after_turns: 20           # Trigger compression when history exceeds this count
+  long_term_enabled: true            # Enable/disable ChromaDB persistent memory
+  long_term_db: "./data/memory.db"   # ChromaDB persistent storage path
+  retrieval_top_k: 5                 # Number of past memory chunks to retrieve at session start
+  embedding_model: "default"         # ChromaDB default embedding or custom model name
+
+agent:
+  enabled: true                      # Enable/disable agentic tool execution
+  text_out_webhook: null             # (optional) POST URL for agent JSON output
+  max_concurrent_tools: 3            # Max tools running in parallel
+  tool_timeout_s: 30                 # Timeout for individual tool execution
+  tools:                             # List of enabled tool names (must match files in agent/tools/)
+    - web_search
+    - memory
+    - calendar
+
+safety:
+  enabled: true                      # Enable/disable Llama Guard safety layer
+  check_input: true                  # Run safety check on user input
+  check_output: true                 # Run safety check on LLM output before TTS
+  unsafe_response: "I'm not able to help with that. Let's talk about something else."
+  log_incidents: true                # Log safety violations to file
+
+server:
+  host: "0.0.0.0"                    # Server bind host
+  port: 8000                         # Server bind port
+  websocket_enabled: true            # Enable WebSocket server for remote clients
+  cors_origins:                      # Allowed CORS origins for web clients
+    - "http://localhost:3000"
+    - "http://localhost:5173"
