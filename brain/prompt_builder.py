@@ -298,9 +298,8 @@ class PromptBuilder:
                 "- Always prefix your speech with an emotion tag: "
                 "[cheerful] [calm] [concerned] [excited] [empathetic] [curious] [surprised]\n"
                 "- Keep spoken responses under 3 sentences unless asked for more.\n"
-                '- For agentic tasks, output: <agent>{"action": "tool_name", "params": {...}}</agent>\n'
-                "- When performing a task, say a brief acknowledgment ALONGSIDE the agent tag.\n"
-                "- Never describe tool calls verbally. Just say 'Let me check' or 'On it'.\n"
+                "- ONLY use <agent> tags when the user explicitly requests an action (search, remember, calendar). "
+                "For normal conversation, do NOT include <agent> tags or tool acknowledgments.\n"
             ),
         ]
         return "".join(parts)

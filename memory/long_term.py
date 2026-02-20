@@ -309,3 +309,38 @@ class LongTermMemory:
             metadata={"hnsw:space": "cosine"},
         )
         self._logger.info("Long-term memory cleared")
+
+    async def save_session(self, session) -> None:
+        """Summarize and persist the current session's history to ChromaDB on shutdown.
+
+        This ensures short sessions (< 20 turns) still get committed to long-term memory,
+        capturing names, preferences, and key facts even if compression never triggered.
+        """
+        from core.session import Turn
+
+        turns = list(session.history)
+        if not turns:
+            self._logger.info("No turns to persist")
+            return
+
+        # Build a plain-text summary of the entire session
+        lines: list[str] = []
+        for turn in turns:
+            lines.append(f"{turn.role}: {turn.content}")
+        transcript = "\n".join(lines)
+
+        # Store as a single document with session metadata
+        await self.store(
+            transcript,
+            metadata={
+                "source": "session_save",
+                "session_id": session.session_id,
+                "turn_count": len(turns),
+                "persona": session.persona_name,
+            },
+        )
+        self._logger.info(
+            "Persisted session %s (%d turns) to long-term memory",
+            session.session_id,
+            len(turns),
+        )

@@ -516,6 +516,12 @@ async def initialize_system(
     long_term_memory = LongTermMemory(
         event_bus=event_bus, config=config.get("memory")
     )
+
+    # Wire MemoryTool to LongTermMemory so the tool can actually read/write
+    mem_tool = tool_router._tools.get("memory")
+    if mem_tool is not None and hasattr(mem_tool, "set_memory"):
+        mem_tool.set_memory(long_term_memory)
+
     compressor = MemoryCompressor(
         event_bus=event_bus, llm_client=llm_client
     )
@@ -557,7 +563,10 @@ async def initialize_system(
         await long_term_memory.initialize()
         mem_cfg = config.get("memory", {})
         if mem_cfg.get("long_term_enabled", False):
-            past = await long_term_memory.query("session context", top_k=3)
+            # Query for recent conversations to restore context
+            past = await long_term_memory.query(
+                "user name preferences conversation summary", top_k=3
+            )
             if past:
                 # Inject restored context into session compressed_summary
                 restored = "\n".join(item["content"] for item in past)
@@ -728,8 +737,9 @@ async def shutdown(modules: dict[str, Any]) -> None:
     # Save to long-term memory
     try:
         ltm = modules.get("long_term_memory")
-        if ltm and hasattr(ltm, "save_session"):
-            await ltm.save_session()
+        session = modules.get("session")
+        if ltm and session:
+            await ltm.save_session(session)
     except Exception as exc:
         logger.warning("Long-term memory save error: %s", exc)
 

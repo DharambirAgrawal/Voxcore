@@ -29,7 +29,7 @@ from brain.llm_client import LLMClient
 CONSTANTS:
 ═══════════════════════════════════════════════════════════════════════════════════
 
-COMPRESS_MODEL = "qwen3-32b"                # Deep thinking model for summarization
+COMPRESS_MODEL = "qwen/qwen3-32b"            # Deep thinking model for summarization (Groq namespace)
 MAX_SUMMARY_TOKENS = 300                    # Max tokens for the summary output
 BATCH_SIZE = 5                              # Minimum turns before compressing
 
@@ -166,7 +166,7 @@ from brain.llm_client import LLMClient
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-COMPRESS_MODEL = "qwen3-32b"
+COMPRESS_MODEL = "qwen/qwen3-32b"
 MAX_SUMMARY_TOKENS = 300
 BATCH_SIZE = 5
 

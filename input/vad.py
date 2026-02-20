@@ -243,6 +243,12 @@ class VADProcessor:
         self._audio_buffer: List[np.ndarray] = []
         self._audio_queue: Optional[asyncio.Queue] = None
 
+        # Post-speaking cooldown — ignore mic for N ms after AI stops speaking
+        # to let speaker tail / reverb decay before processing audio.
+        self._post_speak_cooldown_ms: float = 700.0
+        self._last_speaking_end: float = 0.0
+        self._was_speaking: bool = False
+
         self._logger: logging.Logger = logging.getLogger("VAD")
 
     def _load_model(self) -> None:
@@ -275,11 +281,37 @@ class VADProcessor:
             # ── Echo suppression: ignore mic input while AI is speaking ──
             # Without hardware AEC, the mic picks up TTS audio from speakers.
             # Suppress VAD entirely during SPEAKING to avoid false triggers.
-            if self.session is not None and self.session.state == TurnState.SPEAKING:
-                # Don't process audio while AI is talking — the
-                # InterruptionDetector handles interrupt detection separately
-                # with a higher threshold specifically designed for echo.
+            ai_speaking = (
+                self.session is not None
+                and self.session.state == TurnState.SPEAKING
+            )
+            if ai_speaking:
+                # Track that we were in SPEAKING so we can apply cooldown later
+                self._was_speaking = True
+                # Reset Silero internal state so stale activations don't carry over
+                if self._model is not None:
+                    self._model.reset_states()
                 continue
+
+            # ── Post-speaking cooldown ──
+            # Right after SPEAKING→LISTENING, residual speaker reverb bleeds
+            # into the mic for a few hundred ms. Ignore audio during this window.
+            if self._was_speaking:
+                self._was_speaking = False
+                self._last_speaking_end = time.time()
+                # Also reset any in-progress speech detection
+                if self._is_speaking:
+                    self._is_speaking = False
+                    self._audio_buffer = []
+                    self._silence_start_time = 0.0
+                self._logger.debug("Post-speaking cooldown started (%.0fms)", self._post_speak_cooldown_ms)
+
+            if self._last_speaking_end > 0:
+                elapsed_ms = (time.time() - self._last_speaking_end) * 1000.0
+                if elapsed_ms < self._post_speak_cooldown_ms:
+                    continue  # Still in cooldown — discard chunk
+                else:
+                    self._last_speaking_end = 0.0  # Cooldown expired
 
             speech_prob = self.get_speech_probability(chunk)
             
