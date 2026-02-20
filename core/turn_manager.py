@@ -242,6 +242,15 @@ class TurnManager:
 
         self._current_llm_task: Optional[asyncio.Task] = None
         self._interrupted_content: str = ""
+        self._just_interrupted: bool = False  # True when previous turn was interrupted
+
+        # Stop words — user says these to silence the AI.  No LLM call needed.
+        self._stop_phrases: set[str] = {
+            "stop", "shut up", "be quiet", "enough", "okay stop",
+            "stop talking", "quiet", "hush", "silence", "okay enough",
+            "stop it", "that's enough", "ok stop", "ok enough",
+            "please stop", "can you stop", "stop please",
+        }
 
         # Subscribe to relevant events
         self._transcript_queue = event_bus.subscribe(EventType.TRANSCRIPT_READY)
@@ -271,12 +280,25 @@ class TurnManager:
                 continue
 
             self._logger.info("User said: %s", text)
+
+            # ── Stop-word detection ──
+            # If the user just interrupted with a stop command, don't call the
+            # LLM — just quietly go back to listening.
+            normalised = text.strip().lower().rstrip(".!?,")
+            if self._just_interrupted and normalised in self._stop_phrases:
+                self._logger.info("Stop phrase detected ('%s') — staying silent", normalised)
+                self._just_interrupted = False
+                await self.session.add_turn("user", text)
+                # Don't start LLM response — stay in LISTENING
+                continue
+
             await self.session.add_turn("user", text)
 
             if self.safety_guard is not None:
                 asyncio.create_task(self.safety_guard.check(text, direction="input"))
 
             await self._start_llm_response(text)
+            self._just_interrupted = False  # consumed
 
     # ── LLM orchestration ─────────────────────────────────────────────────
 
@@ -307,7 +329,8 @@ class TurnManager:
             if self.safety_guard is not None:
                 asyncio.create_task(self.safety_guard.check(full_text, direction="output"))
 
-            await self.event_bus.publish(EventType.LLM_STREAM_DONE, {"text": full_text})
+            # NOTE: LLM_STREAM_DONE is already published by ResponseParser
+            # at the end of parse_stream(). Do NOT publish it again here.
 
         except asyncio.CancelledError:
             # Interrupted — save what we had
@@ -347,6 +370,7 @@ class TurnManager:
                 )
                 self._interrupted_content = ""
 
+            self._just_interrupted = True  # next transcript is the interrupting speech
             await self.session.set_state(TurnState.LISTENING)
 
     # ── playback done handling ─────────────────────────────────────────────

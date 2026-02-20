@@ -207,7 +207,13 @@ class TTSClient:
         self._logger.info("Kokoro-ONNX TTS loaded (voice=%s)", voice_profile.voice_name)
 
     async def run(self) -> None:
-        """Main loop — consume LLM_SPEECH_TOKEN events and synthesize audio."""
+        """Main loop — consume LLM_SPEECH_TOKEN events and synthesize audio.
+
+        A sentinel (None) is injected into the speech queue when LLM_STREAM_DONE
+        fires.  When the sentinel is dequeued (i.e. after all real sentences have
+        been synthesized), TTS_ALL_DONE is published so AudioPlayer knows no more
+        audio is coming and can safely fire PLAYBACK_DONE.
+        """
         # Register interrupt handler
         interrupt_queue: asyncio.Queue = self.event_bus.subscribe(EventType.INTERRUPT_DETECTED)
 
@@ -218,8 +224,27 @@ class TTSClient:
 
         asyncio.create_task(_handle_interrupts())
 
+        # When the LLM stream finishes, inject a sentinel so we know all
+        # sentences have been synthesized once we reach it in the queue.
+        async def _on_llm_stream_done(event) -> None:
+            try:
+                self._speech_token_queue.put_nowait(None)  # sentinel
+            except asyncio.QueueFull:
+                self._logger.warning("Speech queue full — could not inject TTS sentinel")
+
+        self.event_bus.subscribe(EventType.LLM_STREAM_DONE, _on_llm_stream_done)
+
         while True:
             event = await self._speech_token_queue.get()
+
+            # Sentinel from LLM_STREAM_DONE — all sentences synthesized
+            if event is None:
+                if not self._is_cancelled:
+                    await self.event_bus.publish(
+                        EventType.TTS_ALL_DONE, {}, source="TTSClient"
+                    )
+                    self._logger.info("TTS: all sentences synthesized → TTS_ALL_DONE")
+                continue
 
             if self._is_cancelled:
                 # Drain pending sentences

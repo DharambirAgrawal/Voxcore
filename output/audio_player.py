@@ -224,12 +224,14 @@ class AudioPlayer:
         self._tts_chunk_queue: asyncio.Queue = event_bus.subscribe(EventType.TTS_CHUNK_READY)
         self._interrupt_queue: asyncio.Queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
         self._backchannel_queue: asyncio.Queue = event_bus.subscribe(EventType.BACKCHANNEL_FIRE)
+        self._tts_all_done_queue: asyncio.Queue = event_bus.subscribe(EventType.TTS_ALL_DONE)
 
         # State
         self._is_playing: bool = False
         self._is_interrupted: bool = False
         self._current_stream: Optional[sd.OutputStream] = None
         self._audio_accumulator: bytearray = bytearray()
+        self._tts_stream_done: bool = False  # True once TTSClient has synthesized all sentences
 
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
 
@@ -240,7 +242,27 @@ class AudioPlayer:
             self._process_interrupts(),
             self._process_backchannels(),
             self._playback_loop(),
+            self._watch_tts_all_done(),
         )
+
+    async def _watch_tts_all_done(self) -> None:
+        """Set _tts_stream_done when TTSClient signals all sentences synthesized.
+
+        If the playback loop has already drained the queue (it's blocked on
+        ``_play_queue.get()``), we fire PLAYBACK_DONE directly here.
+        """
+        while True:
+            await self._tts_all_done_queue.get()
+            self._tts_stream_done = True
+            self._logger.debug("Received TTS_ALL_DONE — will fire PLAYBACK_DONE when queue drains")
+
+            # Edge case: playback already finished but was waiting for this flag
+            if self._play_queue.empty() and not self._is_playing:
+                await self.event_bus.publish(
+                    EventType.PLAYBACK_DONE, {}, source="AudioPlayer"
+                )
+                self._tts_stream_done = False
+                self._logger.debug("Playback complete (TTS_ALL_DONE arrived after queue drained)")
 
     async def _process_tts_chunks(self) -> None:
         """Collect TTS audio chunks; when a sentence is complete, enqueue for playback."""
@@ -252,6 +274,12 @@ class AudioPlayer:
 
             audio_chunk: bytes = event.data["audio"]
             is_sentence_done: bool = event.data.get("sentence_done", False)
+
+            # First chunk of a new response — reset TTS-done flag
+            if not self._audio_accumulator and not self._tts_stream_done:
+                pass  # already False
+            if len(self._audio_accumulator) == 0:
+                self._tts_stream_done = False
 
             self._audio_accumulator.extend(audio_chunk)
 
@@ -267,7 +295,13 @@ class AudioPlayer:
                     self._audio_accumulator = bytearray()
 
     async def _playback_loop(self) -> None:
-        """Main loop — pull audio arrays from queue and play them."""
+        """Main loop — pull audio arrays from queue and play them.
+
+        PLAYBACK_DONE is only published when both conditions are met:
+          1. The play queue is empty (all enqueued audio has been played)
+          2. _tts_stream_done is True (TTSClient has synthesized ALL sentences)
+        This prevents premature SPEAKING→LISTENING transitions between sentences. 
+        """
         while True:
             audio_array = await self._play_queue.get()
 
@@ -285,10 +319,13 @@ class AudioPlayer:
             await self._play_audio(audio_array)
             self._is_playing = False
 
-            if self._play_queue.empty():
+            # Only fire PLAYBACK_DONE when TTS has finished synthesizing
+            # all sentences AND the play queue has drained.
+            if self._play_queue.empty() and self._tts_stream_done:
                 await self.event_bus.publish(
                     EventType.PLAYBACK_DONE, {}, source="AudioPlayer"
                 )
+                self._tts_stream_done = False  # Reset for next response
                 self._logger.debug("Playback complete")
 
     async def _play_audio(self, audio: np.ndarray) -> None:

@@ -271,6 +271,16 @@ class PromptBuilder:
             context_block = self._build_context_block(text_in_entries)
             current_user_msg = f"{context_block}\n\n{current_user_msg}"
 
+        # 5b. If the previous assistant turn was interrupted, tell the LLM
+        #     so it responds to the user's words, not to the interruption.
+        if self._last_assistant_was_interrupted(history_turns):
+            current_user_msg = (
+                "[SYSTEM NOTE: The user just interrupted your previous response. "
+                "Respond directly to what the user is saying now — do NOT comment "
+                "on being interrupted.]\n\n"
+                + current_user_msg
+            )
+
         messages.append({"role": "user", "content": current_user_msg})
 
         # 6. Truncate to budget
@@ -303,6 +313,17 @@ class PromptBuilder:
             ),
         ]
         return "".join(parts)
+
+    @staticmethod
+    def _last_assistant_was_interrupted(history_turns: list[Turn]) -> bool:
+        """Check whether the most recent assistant turn was interrupted."""
+        # Walk backwards from second-to-last turn (last is current user msg)
+        for turn in reversed(history_turns[:-1]):
+            if turn.role == "assistant":
+                return turn.was_interrupted
+            # If we hit another user turn first, no interrupted assistant
+            break
+        return False
 
     @staticmethod
     def _format_turn(turn: Turn) -> str:

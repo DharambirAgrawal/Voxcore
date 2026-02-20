@@ -243,6 +243,7 @@ class EventType(str, Enum):
     # --- Output Events ---
     TTS_CHUNK_READY = "tts_chunk_ready"
     TTS_SENTENCE_DONE = "tts_sentence_done"
+    TTS_ALL_DONE = "tts_all_done"
     PLAYBACK_DONE = "playback_done"
 
     # --- State Events ---

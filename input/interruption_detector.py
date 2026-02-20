@@ -150,6 +150,7 @@ import logging
 import time
 
 import numpy as np
+import torch
 
 from core.session import Session, TurnState
 from core.event_bus import EventBus, EventType
@@ -161,14 +162,18 @@ class InterruptionDetector:
     """Monitors audio input during SPEAKING state to detect user interruptions.
 
     Without hardware AEC, the mic picks up TTS audio from speakers.
-    We use three defenses:
-      1. High VAD threshold (0.85) — speaker bleed rarely reaches this.
-      2. Long sustained-speech window (800ms) — bleed is bursty, not sustained.
-      3. RMS energy gate — the chunk must be significantly louder than the
-         calibrated ambient noise floor (the user's voice is much closer to
-         the mic than the speakers).
+    We use a layered defense to distinguish real user speech from bleed:
+      1. VAD threshold (0.55) — speaker bleed typically < 0.4.
+      2. Sustained-speech window (350ms) — bleed is bursty, not sustained.
+      3. RMS energy gate — chunk must be louder than 2.5× ambient noise
+         (the user's voice is much closer to the mic than the speakers).
       4. Cooldown after state transitions — ignore the first 500ms after
-         entering SPEAKING, which is when TTS audio starts hitting the mic.
+         entering SPEAKING while TTS ramps up.
+
+    IMPORTANT: Uses its OWN Silero VAD model instance.  The main VADProcessor
+    resets its model state every chunk during SPEAKING (echo suppression), which
+    would destroy the continuity the InterruptionDetector needs to accumulate
+    speech probability across frames.
     """
 
     def __init__(
@@ -182,13 +187,17 @@ class InterruptionDetector:
         self.session = session
         self.event_bus = event_bus
         self.mic_stream = mic_stream
-        self.vad = vad
+        self.vad = vad  # kept for reference (sample_rate, noise_floor)
 
-        # Tuning knobs — intentionally strict to avoid false interrupts
-        self._interrupt_threshold: float = config.get("interrupt_threshold", 0.85)
-        self._interrupt_duration_ms: int = config.get("interrupt_duration_ms", 800)
+        # Own Silero model — loaded lazily in run()
+        self._own_model = None
+        self._sample_rate: int = config.get("sample_rate", 16000)
+
+        # Tuning knobs — balanced for responsiveness without false positives
+        self._interrupt_threshold: float = config.get("interrupt_threshold", 0.55)
+        self._interrupt_duration_ms: int = config.get("interrupt_duration_ms", 350)
         # RMS must exceed noise_floor × this multiplier to be considered
-        self._energy_multiplier: float = config.get("interrupt_energy_multiplier", 5.0)
+        self._energy_multiplier: float = config.get("interrupt_energy_multiplier", 2.5)
 
         self._speech_detected_at: float = 0.0
         self._speaking_since: float = 0.0  # When we entered SPEAKING state
@@ -197,10 +206,35 @@ class InterruptionDetector:
 
         self._logger = logging.getLogger("InterruptionDetector")
 
+    def _load_own_model(self) -> None:
+        """Load a private Silero VAD model so we don't share state with the
+        main VADProcessor (which resets its model during SPEAKING)."""
+        try:
+            model, _ = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=False,
+            )
+        except Exception:
+            from silero_vad import load_silero_vad  # type: ignore[import-untyped]
+            model = load_silero_vad()
+        self._own_model = model
+        self._logger.info("InterruptionDetector: private Silero VAD model loaded")
+
+    def _get_speech_probability(self, chunk: np.ndarray) -> float:
+        """Run Silero VAD on a chunk using our private model instance."""
+        tensor = torch.from_numpy(chunk).float()
+        return float(self._own_model(tensor, self._sample_rate).item())
+
     async def run(self) -> None:
         """Main loop: consume audio, check state, run VAD, check for interrupt."""
+        self._load_own_model()
         self._audio_queue = self.mic_stream.add_consumer()
         self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)
+        self._logger.info(
+            "InterruptionDetector started (threshold=%.2f, duration=%dms, energy=%.1f×)",
+            self._interrupt_threshold, self._interrupt_duration_ms, self._energy_multiplier,
+        )
 
         while True:
             chunk = await self._audio_queue.get()
@@ -210,7 +244,6 @@ class InterruptionDetector:
                 continue
 
             # ── Cooldown: ignore audio right after entering SPEAKING ──
-            # The first ~500ms is when TTS audio starts hitting the mic.
             now = time.monotonic()
             if self._speaking_since > 0 and (now - self._speaking_since) * 1000 < self._state_cooldown_ms:
                 continue
@@ -220,10 +253,20 @@ class InterruptionDetector:
             noise_floor = self.mic_stream.noise_floor
             if noise_floor > 0 and rms < noise_floor * self._energy_multiplier:
                 # Audio is just speaker bleed / ambient — not a nearby voice
+                if self._speech_detected_at > 0.0:
+                    self._logger.debug(
+                        "RMS gate reset (rms=%.4f < floor %.4f × %.1f = %.4f)",
+                        rms, noise_floor, self._energy_multiplier,
+                        noise_floor * self._energy_multiplier,
+                    )
                 self._speech_detected_at = 0.0
                 continue
 
-            speech_prob = self.vad.get_speech_probability(chunk)
+            speech_prob = self._get_speech_probability(chunk)
+            self._logger.debug(
+                "Interrupt check: prob=%.3f (thr=%.2f), rms=%.4f (floor=%.4f)",
+                speech_prob, self._interrupt_threshold, rms, noise_floor,
+            )
             await self._check_interrupt(speech_prob, rms)
 
     async def _check_interrupt(self, speech_prob: float, rms: float) -> None:
@@ -233,6 +276,7 @@ class InterruptionDetector:
         if speech_prob > self._interrupt_threshold:
             if self._speech_detected_at == 0.0:
                 self._speech_detected_at = now
+                self._logger.debug("Interrupt candidate started (prob=%.3f)", speech_prob)
             else:
                 duration_ms = (now - self._speech_detected_at) * 1000
                 if duration_ms >= self._interrupt_duration_ms:
@@ -245,8 +289,19 @@ class InterruptionDetector:
                         duration_ms, speech_prob, rms,
                     )
                     self._speech_detected_at = 0.0
-                    await asyncio.sleep(0.5)  # Longer cooldown to prevent re-trigger
+                    await asyncio.sleep(0.5)  # Cooldown to prevent re-trigger
+                else:
+                    self._logger.debug(
+                        "Interrupt building: %.0fms / %dms",
+                        duration_ms, self._interrupt_duration_ms,
+                    )
         else:
+            if self._speech_detected_at > 0.0:
+                elapsed = (now - self._speech_detected_at) * 1000
+                self._logger.debug(
+                    "Interrupt candidate reset after %.0fms (prob=%.3f dropped below %.2f)",
+                    elapsed, speech_prob, self._interrupt_threshold,
+                )
             self._speech_detected_at = 0.0
 
     async def _handle_state_change(self, event) -> None:
@@ -257,6 +312,9 @@ class InterruptionDetector:
         if new_state == TurnState.SPEAKING or new_state == "speaking":
             self._speech_detected_at = 0.0
             self._speaking_since = time.monotonic()
+            # Reset private model state so it starts fresh for this speaking turn
+            if self._own_model is not None:
+                self._own_model.reset_states()
         elif old_state == TurnState.SPEAKING or old_state == "speaking":
             self._speech_detected_at = 0.0
             self._speaking_since = 0.0
