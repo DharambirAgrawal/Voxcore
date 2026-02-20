@@ -193,3 +193,160 @@ PERFORMANCE:
     - Memory: ~40MB for model weights
     - No GPU required
 """
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                           VOXCORE — input/vad.py                                ║
+║          SILERO VAD WRAPPER — VOICE ACTIVITY DETECTION ON AUDIO CHUNKS          ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import time
+from typing import List, Optional
+
+import numpy as np
+import torch
+
+from core.event_bus import EventBus, EventType
+from input.mic_stream import MicStream
+
+
+class VADProcessor:
+    """Silero VAD wrapper that processes audio chunks and fires speech events."""
+
+    def __init__(
+        self, event_bus: EventBus, mic_stream: MicStream, config: dict
+    ) -> None:
+        self.event_bus: EventBus = event_bus
+        self.mic_stream: MicStream = mic_stream
+        self.sample_rate: int = config.get("sample_rate", 16000)
+        self.speech_threshold: float = config.get("vad_speech_threshold", 0.5)
+        self.silence_threshold: float = config.get("vad_silence_threshold", 0.7)
+        self.silence_duration_ms: int = config.get("vad_silence_duration_ms", 400)
+        self.chunk_ms: int = config.get("chunk_ms", 30)
+
+        # Silero VAD model — loaded lazily in _load_model()
+        self._model: Optional[torch.nn.Module] = None
+
+        # State tracking
+        self._is_speaking: bool = False
+        self._speech_start_time: float = 0.0
+        self._silence_start_time: float = 0.0
+        self._audio_buffer: List[np.ndarray] = []
+        self._audio_queue: Optional[asyncio.Queue] = None
+
+        self._logger: logging.Logger = logging.getLogger("VAD")
+
+    def _load_model(self) -> None:
+        """Load the Silero VAD model (CPU only)."""
+        try:
+            model, _ = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=False,
+            )
+        except Exception:
+            # Fallback to the silero_vad package if torch.hub fails
+            from silero_vad import load_silero_vad  # type: ignore[import-untyped]
+
+            model = load_silero_vad()
+
+        self._model = model
+        self._logger.info("Silero VAD model loaded")
+
+    async def run(self) -> None:
+        """Process audio chunks forever, firing speech start/end events."""
+        self._load_model()
+        self._audio_queue = self.mic_stream.add_consumer()
+
+        while True:
+            chunk: np.ndarray = await self._audio_queue.get()
+            speech_prob = self._get_speech_probability(chunk)
+            await self._process_probability(speech_prob, chunk)
+
+    def _get_speech_probability(self, chunk: np.ndarray) -> float:
+        """Run Silero VAD inference on a single audio chunk."""
+        tensor = torch.from_numpy(chunk).float()
+        prob: float = self._model(tensor, self.sample_rate).item()  # type: ignore[union-attr]
+        return prob
+
+    async def _process_probability(
+        self, speech_prob: float, chunk: np.ndarray
+    ) -> None:
+        """Update speech state machine and fire events as needed."""
+        if not self._is_speaking:
+            # ── Waiting for speech to start ──
+            if speech_prob > self.speech_threshold:
+                self._is_speaking = True
+                self._speech_start_time = time.time()
+                self._audio_buffer = []
+                self._audio_buffer.append(chunk)
+                self._silence_start_time = 0.0
+                self.event_bus.publish(EventType.SPEECH_START, {})
+                self._logger.info("Speech started")
+        else:
+            # ── Currently in a speech segment ──
+            self._audio_buffer.append(chunk)
+
+            if speech_prob < (1.0 - self.silence_threshold):
+                # This chunk is silence
+                if self._silence_start_time == 0.0:
+                    self._silence_start_time = time.time()
+
+                silence_duration_ms = (
+                    time.time() - self._silence_start_time
+                ) * 1000.0
+
+                if silence_duration_ms >= self.silence_duration_ms:
+                    # End of turn detected
+                    self._is_speaking = False
+                    audio_bytes = self._buffer_to_bytes()
+                    duration = time.time() - self._speech_start_time
+
+                    self.event_bus.publish(
+                        EventType.SPEECH_END,
+                        {
+                            "audio_buffer": audio_bytes,
+                            "duration_s": duration,
+                        },
+                    )
+
+                    self._logger.info("Speech ended (%.1fs)", duration)
+                    self._silence_start_time = 0.0
+                    self._audio_buffer = []
+            else:
+                # Still speaking — reset silence timer
+                self._silence_start_time = 0.0
+
+    def _buffer_to_bytes(self) -> bytes:
+        """Concatenate buffered float32 chunks and convert to int16 PCM bytes."""
+        full_audio = np.concatenate(self._audio_buffer)
+        audio_int16 = (full_audio * 32767).astype(np.int16)
+        return audio_int16.tobytes()
+
+    @property
+    def is_speaking(self) -> bool:
+        """Whether VAD currently detects active speech."""
+        return self._is_speaking
+
+    @property
+    def speech_duration(self) -> float:
+        """Duration in seconds of the current speech segment (0.0 if silent)."""
+        if self._is_speaking:
+            return time.time() - self._speech_start_time
+        return 0.0
+
+    def reset(self) -> None:
+        """Reset all VAD state — used after interruption."""
+        self._is_speaking = False
+        self._audio_buffer = []
+        self._silence_start_time = 0.0
+        self._speech_start_time = 0.0
+        if self._model is not None:
+            self._model.reset_states()
+        self._logger.debug("VAD state reset")

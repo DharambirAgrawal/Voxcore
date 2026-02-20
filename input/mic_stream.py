@@ -167,3 +167,147 @@ NOTES ON AUDIO FORMAT:
     - Each chunk represents 30ms of audio
     - Queue holds 200 chunks = 6 seconds of buffered audio
 """
+
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                        VOXCORE — input/mic_stream.py                            ║
+║             CONTINUOUS MICROPHONE CAPTURE — 16kHz MONO PCM STREAM              ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+from typing import Any, Optional, List
+
+import numpy as np
+import sounddevice as sd
+
+from core.event_bus import EventBus
+
+
+class MicStream:
+    """Continuous microphone audio capture producing fixed-size chunks."""
+
+    def __init__(self, event_bus: EventBus, config: dict) -> None:
+        self.event_bus: EventBus = event_bus
+        self.sample_rate: int = config.get("sample_rate", 16000)
+        self.chunk_ms: int = config.get("chunk_ms", 30)
+        self.chunk_samples: int = int(self.sample_rate * self.chunk_ms / 1000)
+        self.calibration_duration: float = config.get("noise_floor_calibration_s", 0.5)
+        self.noise_floor: float = 0.0
+        self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._consumer_queues: List[asyncio.Queue] = []
+        self._stream: Optional[sd.InputStream] = None
+        self._running: bool = False
+        self._logger: logging.Logger = logging.getLogger("MicStream")
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def run(self) -> None:
+        """Start mic capture and run forever until cancelled."""
+        self._loop = asyncio.get_running_loop()
+
+        await self._calibrate_noise_floor()
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=self.chunk_samples,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+        self._running = True
+        self._logger.info(
+            "Mic stream started (16kHz, mono, %dms chunks)", self.chunk_ms
+        )
+
+        # Block forever — sounddevice pushes audio via its own C thread callback
+        await asyncio.Event().wait()
+
+    def _audio_callback(
+        self,
+        indata: np.ndarray,
+        frames: int,
+        time_info: Any,
+        status: sd.CallbackFlags,
+    ) -> None:
+        """
+        Called from PortAudio C thread. Must be fast, no awaits, no heavy work.
+        Copies data and pushes float32 normalised chunks to all consumer queues.
+        """
+        if status.input_overflow:
+            self._logger.warning("Mic input overflow detected")
+
+        # Flatten mono and copy
+        chunk: np.ndarray = indata[:, 0].copy()
+        chunk_f32: np.ndarray = chunk.astype(np.float32) / 32768.0
+
+        if self._loop is None:
+            return
+
+        # Push to the main audio_queue
+        def _enqueue_main() -> None:
+            try:
+                self.audio_queue.put_nowait(chunk_f32)
+            except asyncio.QueueFull:
+                self._logger.warning("Main audio queue full — dropping chunk")
+
+        self._loop.call_soon_threadsafe(_enqueue_main)
+
+        # Fan-out to every registered consumer queue
+        for q in self._consumer_queues:
+
+            def _enqueue_consumer(queue: asyncio.Queue = q) -> None:
+                try:
+                    queue.put_nowait(chunk_f32)
+                except asyncio.QueueFull:
+                    self._logger.warning("Consumer audio queue full — dropping chunk")
+
+            self._loop.call_soon_threadsafe(_enqueue_consumer)
+
+    async def _calibrate_noise_floor(self) -> None:
+        """Record a short silence segment to estimate ambient noise RMS."""
+        self._logger.info(
+            "Calibrating noise floor (%.1fs)...", self.calibration_duration
+        )
+
+        num_samples = int(self.sample_rate * self.calibration_duration)
+        audio = sd.rec(
+            num_samples,
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+        )
+        # sd.rec is non-blocking; wait in a thread-friendly way
+        await asyncio.get_running_loop().run_in_executor(None, sd.wait)
+
+        audio_f32 = audio.astype(np.float32) / 32768.0
+        rms_energy: float = float(np.sqrt(np.mean(audio_f32 ** 2)))
+        self.noise_floor = rms_energy * 1.5
+        self._logger.info("Noise floor set to %.6f", self.noise_floor)
+
+    async def get_chunk(self) -> np.ndarray:
+        """Await and return the next audio chunk from the main queue."""
+        return await self.audio_queue.get()
+
+    def add_consumer(self) -> asyncio.Queue:
+        """
+        Register a new consumer and return a dedicated queue that will
+        receive a copy of every audio chunk independently.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._consumer_queues.append(q)
+        return q
+
+    async def stop(self) -> None:
+        """Stop and close the microphone stream."""
+        self._running = False
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+        self._logger.info("Mic stream stopped")
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the mic stream is currently active."""
+        return self._running

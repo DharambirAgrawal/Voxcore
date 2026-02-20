@@ -174,3 +174,138 @@ NOTES:
       but wrapped in async for consistency with the VoxCore pipeline
     - For production, consider running ChromaDB as a server (HttpClient)
 """
+
+
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                     VOXCORE — memory/long_term.py                               ║
+║           LONG-TERM MEMORY — CHROMADB VECTOR STORE FOR CONVERSATIONS            ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import logging
+import hashlib
+import time
+from typing import Optional
+from pathlib import Path
+
+import chromadb
+from chromadb.config import Settings
+
+from core.event_bus import EventBus, EventType
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_PERSIST_DIR = "data/chromadb"
+DEFAULT_COLLECTION = "voxcore_memory"
+MAX_RESULTS = 10
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLASS: LongTermMemory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LongTermMemory:
+    """ChromaDB-backed persistent semantic memory."""
+
+    def __init__(self, event_bus: EventBus, config: dict = None) -> None:
+        self._bus = event_bus
+        config = config or {}
+        self._persist_dir = config.get("persist_dir", DEFAULT_PERSIST_DIR)
+        self._collection_name = config.get("collection_name", DEFAULT_COLLECTION)
+        self._client: Optional[chromadb.ClientAPI] = None
+        self._collection: Optional[chromadb.Collection] = None
+        self._logger = logging.getLogger("LongTermMemory")
+
+    async def initialize(self) -> None:
+        """Initialize ChromaDB client, collection, and event subscriptions."""
+        Path(self._persist_dir).mkdir(parents=True, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=self._persist_dir)
+        self._collection = self._client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._logger.info(
+            f"LongTermMemory initialized with {self._collection.count()} documents"
+        )
+        self._bus.subscribe(EventType.MEMORY_COMPRESS, self._on_compress)
+
+    async def store(self, text: str, metadata: dict = None) -> str:
+        """Embed and store a text document, returning its hash-based ID."""
+        doc_id = hashlib.sha256(text.encode()).hexdigest()[:16]
+        meta = metadata or {}
+        meta["stored_at"] = time.time()
+        meta["text_length"] = len(text)
+        self._collection.upsert(
+            ids=[doc_id],
+            documents=[text],
+            metadatas=[meta],
+        )
+        self._logger.info(f"Stored document {doc_id} ({len(text)} chars)")
+        return doc_id
+
+    async def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        where_filter: dict = None,
+    ) -> list[dict]:
+        """Semantic similarity search against stored documents."""
+        top_k = min(top_k, MAX_RESULTS)
+        kwargs = {"query_texts": [query_text], "n_results": top_k}
+        if where_filter:
+            kwargs["where"] = where_filter
+        results = self._collection.query(**kwargs)
+
+        output: list[dict] = []
+        for i in range(len(results["ids"][0])):
+            output.append(
+                {
+                    "id": results["ids"][0][i],
+                    "content": results["documents"][0][i],
+                    "distance": results["distances"][0][i],
+                    "metadata": results["metadatas"][0][i],
+                }
+            )
+        return output
+
+    async def _on_compress(self, event) -> None:
+        """Handle MEMORY_COMPRESS events by storing summaries or raw turns."""
+        if "summary" in event.data:
+            await self.store(
+                event.data["summary"],
+                metadata={
+                    "source": "compressor",
+                    "turn_count": len(event.data.get("turns", [])),
+                },
+            )
+        else:
+            for turn in event.data.get("turns", []):
+                text = f"{turn.role}: {turn.text}"
+                await self.store(
+                    text, metadata={"source": "overflow", "role": turn.role}
+                )
+
+    async def delete(self, doc_id: str) -> bool:
+        """Delete a document by ID. Returns True on success, False on failure."""
+        try:
+            self._collection.delete(ids=[doc_id])
+            return True
+        except Exception as exc:
+            self._logger.warning(f"Failed to delete document {doc_id}: {exc}")
+            return False
+
+    def count(self) -> int:
+        """Return the number of documents in the collection."""
+        return self._collection.count()
+
+    async def clear(self) -> None:
+        """Drop and recreate the collection, erasing all stored documents."""
+        self._client.delete_collection(self._collection_name)
+        self._collection = self._client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._logger.info("Long-term memory cleared")

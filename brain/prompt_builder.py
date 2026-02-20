@@ -183,3 +183,166 @@ TOKEN BUDGET RATIONALE:
     3. The fast brain only needs recent context for conversational responses
     4. Complex tasks that need more context get routed to bigger models
 """
+
+
+
+"""
+VOXCORE — brain/prompt_builder.py
+Assembles the full message array for every LLM call.
+"""
+
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Optional
+
+from core.session import Session, Turn, TextInEntry
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MAX_PROMPT_TOKENS = 5000
+MAX_HISTORY_TURNS = 20
+MAX_TEXT_IN_CHARS = 2000
+MAX_SUMMARY_CHARS = 1000
+
+# Model-specific token budgets
+_MODEL_BUDGETS = {
+    "fast": 5000,
+    "smart": 20000,
+    "agentic": 30000,
+}
+
+_MODEL_BUDGET_MAP = {
+    "llama-3.1-8b": "fast",
+    "llama-3.1-8b-instant": "fast",
+    "scout-17b": "smart",
+    "kimi-k2": "agentic",
+}
+
+
+class PromptBuilder:
+    """Constructs the LLM message array from session state."""
+
+    def __init__(self, config: dict) -> None:
+        self.persona_name: str = config.get("name", "Aria")
+        self.system_prompt: str = config.get("system_prompt", "")
+        self.language: str = config.get("language", "en")
+        self._logger: logging.Logger = logging.getLogger("PromptBuilder")
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Public API
+    # ───────────────────────────────────────────────────────────────────────
+
+    def build(self, session: Session, *, _token_budget: int = MAX_PROMPT_TOKENS) -> list[dict]:
+        """Build the complete messages array for the LLM call."""
+
+        # 1. System message
+        system_msg = self._build_system_message()
+        messages: list[dict] = [{"role": "system", "content": system_msg}]
+
+        # 2. Compressed memory summary (if available)
+        if session.compressed_summary:
+            summary = session.compressed_summary[:MAX_SUMMARY_CHARS]
+            messages.append({
+                "role": "assistant",
+                "content": f"[MEMORY SUMMARY]: {summary}",
+            })
+
+        # 3. Recent history (all except last user message)
+        history_turns = session.get_recent_history(MAX_HISTORY_TURNS)
+
+        if history_turns:
+            for turn in history_turns[:-1]:
+                messages.append({
+                    "role": turn.role,
+                    "content": self._format_turn(turn),
+                })
+
+        # 4. Flush text-in injections
+        text_in_entries = session.flush_text_in()
+
+        # 5. Build current user message (last turn + optional context block)
+        current_user_msg = history_turns[-1].content if history_turns else ""
+
+        if text_in_entries:
+            context_block = self._build_context_block(text_in_entries)
+            current_user_msg = f"{context_block}\n\n{current_user_msg}"
+
+        messages.append({"role": "user", "content": current_user_msg})
+
+        # 6. Truncate to budget
+        self._truncate_to_budget(messages, budget=_token_budget)
+
+        return messages
+
+    def build_for_model(self, session: Session, model: str) -> list[dict]:
+        """Build messages array tailored for a specific model's context budget."""
+
+        tier = _MODEL_BUDGET_MAP.get(model, "fast")
+        budget = _MODEL_BUDGETS[tier]
+        return self.build(session, _token_budget=budget)
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ───────────────────────────────────────────────────────────────────────
+
+    def _build_system_message(self) -> str:
+        parts = [
+            self.system_prompt,
+            f"\nCurrent date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            (
+                "\n\nRESPONSE FORMAT RULES:\n"
+                "- Always prefix your speech with an emotion tag: "
+                "[cheerful] [calm] [concerned] [excited] [empathetic] [curious] [surprised]\n"
+                "- Keep spoken responses under 3 sentences unless asked for more.\n"
+                '- For agentic tasks, output: <agent>{"action": "tool_name", "params": {...}}</agent>\n'
+                "- When performing a task, say a brief acknowledgment ALONGSIDE the agent tag.\n"
+                "- Never describe tool calls verbally. Just say 'Let me check' or 'On it'.\n"
+            ),
+        ]
+        return "".join(parts)
+
+    @staticmethod
+    def _format_turn(turn: Turn) -> str:
+        if turn.was_interrupted:
+            return f"{turn.content} [INTERRUPTED]"
+        if turn.agent_output:
+            return f"{turn.content}\n<agent>{json.dumps(turn.agent_output)}</agent>"
+        return turn.content
+
+    @staticmethod
+    def _build_context_block(entries: list[TextInEntry]) -> str:
+        header = "[CONTEXT — The following information has been injected into the conversation]:\n"
+        body_parts: list[str] = []
+        total_len = len(header)
+
+        for entry in entries:
+            line = f"- [{entry.source.upper()}] {entry.content}\n"
+            if total_len + len(line) > MAX_TEXT_IN_CHARS:
+                remaining = MAX_TEXT_IN_CHARS - total_len
+                if remaining > 0:
+                    body_parts.append(line[:remaining])
+                break
+            body_parts.append(line)
+            total_len += len(line)
+
+        footer = "[END CONTEXT]\n"
+        return header + "".join(body_parts) + footer
+
+    def _truncate_to_budget(self, messages: list[dict], *, budget: int = MAX_PROMPT_TOKENS) -> None:
+        """Remove oldest history messages (after system msg) until under token budget."""
+
+        removed = 0
+        while len(messages) > 2:  # keep at least system + current user
+            total_tokens = sum(len(m["content"]) // 4 for m in messages)
+            if total_tokens <= budget:
+                break
+            # Remove the oldest history message (index 1), preserving system at 0
+            messages.pop(1)
+            removed += 1
+
+        if removed:
+            self._logger.warning("Truncated %d history messages to fit token budget", removed)

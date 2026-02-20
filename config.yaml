@@ -26,7 +26,7 @@ persona:
     When you need to perform a task, include ONLY in your output:
     <agent>{"action": "tool_name", "params": {...}}</agent>
     Do NOT describe the tool call in your speech. Just say 'On it' or 'Let me check'.
-  voice: "tara"                      # Orpheus voice: tara / leah / jess / leo / dan / mia / zac / zoe
+  voice: "hannah"    # VALID Groq Orpheus voices: troy, hannah, austin, diana, daniel, autumn
   language: "en"                     # "en" for English, "ar" for Arabic
 
 models:

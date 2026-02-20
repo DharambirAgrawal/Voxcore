@@ -177,3 +177,116 @@ ADDING A NEW TOOL:
     5. Add the tool name to config.yaml agent.tools list
     That's it — the router handles the rest.
 """
+
+
+import asyncio
+import logging
+import time
+
+from typing import Optional
+from core.event_bus import EventBus, EventType
+from input.text_injector import TextInjector
+
+from agent.tools.base_tool import BaseTool
+from agent.tools.web_search import WebSearchTool
+from agent.tools.memory_tool import MemoryTool
+from agent.tools.calendar_tool import CalendarTool
+
+
+class ToolRouter:
+    """Routes agent tool calls to registered tool handlers."""
+
+    def __init__(self, event_bus: EventBus, text_injector: TextInjector, config: dict) -> None:
+        self.event_bus: EventBus = event_bus
+        self.text_injector: TextInjector = text_injector
+        self.tool_timeout: int = config.get("tool_timeout_s", 30)
+        self.max_concurrent: int = config.get("max_concurrent_tools", 3)
+
+        self._tools: dict[str, BaseTool] = {}
+        self._active_tasks: list[asyncio.Task] = []
+
+        self._agent_json_queue: asyncio.Queue = event_bus.subscribe(EventType.AGENT_JSON_OUT)
+
+        self._logger: logging.Logger = logging.getLogger("ToolRouter")
+
+        self._register_tools(config.get("tools", []))
+
+    def _register_tools(self, enabled_tools: list[str]) -> None:
+        """Register enabled tools from config into the internal registry."""
+        TOOL_MAP: dict[str, type[BaseTool]] = {
+            "web_search": WebSearchTool,
+            "memory": MemoryTool,
+            "calendar": CalendarTool,
+        }
+
+        for name in enabled_tools:
+            if name in TOOL_MAP:
+                self._tools[name] = TOOL_MAP[name]()
+                self._logger.info("Registered tool: %s", name)
+            else:
+                self._logger.warning("Unknown tool: %s", name)
+
+        self._logger.info("Registered %d tools", len(self._tools))
+
+    async def run(self) -> None:
+        """Main loop — consumes AGENT_JSON_OUT events and dispatches tool execution."""
+        while True:
+            event = await self._agent_json_queue.get()
+            action: str = event.data["action"]
+            params: dict = event.data.get("params", {})
+
+            if action not in self._tools:
+                self._logger.warning("No tool registered for action '%s'", action)
+                await self.text_injector.inject_tool_result(
+                    action, f"Unknown tool: {action}", success=False
+                )
+                continue
+
+            if len(self._active_tasks) >= self.max_concurrent:
+                self._logger.warning("Too many concurrent tools — queueing")
+                await asyncio.sleep(1)
+
+            task = asyncio.create_task(self._execute_tool(action, params))
+            self._active_tasks.append(task)
+            task.add_done_callback(lambda t: self._active_tasks.remove(t))
+
+    async def _execute_tool(self, action: str, params: dict) -> None:
+        """Execute a single tool call with timeout, inject result back into conversation."""
+        tool = self._tools[action]
+        start = time.time()
+        self._logger.info("Executing tool '%s' with params: %s", action, params)
+
+        try:
+            result = await asyncio.wait_for(
+                tool.execute(params),
+                timeout=self.tool_timeout,
+            )
+            duration = time.time() - start
+            self._logger.info("Tool '%s' completed in %.1fs", action, duration)
+
+            await self.text_injector.inject_tool_result(action, str(result), success=True)
+
+            await self.event_bus.publish(
+                EventType.TOOL_RESULT_READY,
+                {"action": action, "result": result, "success": True},
+                source="ToolRouter",
+            )
+
+        except asyncio.TimeoutError:
+            self._logger.error("Tool '%s' timed out after %ds", action, self.tool_timeout)
+            await self.text_injector.inject_tool_result(action, "Tool timed out", success=False)
+
+        except Exception as e:
+            self._logger.error("Tool '%s' failed: %s", action, e)
+            await self.text_injector.inject_tool_result(
+                action, f"Error: {str(e)}", success=False
+            )
+
+    def register_tool(self, name: str, tool: BaseTool) -> None:
+        """Dynamically register a tool at runtime."""
+        self._tools[name] = tool
+        self._logger.info("Registered tool: %s", name)
+
+    def get_registered_tools(self) -> list[str]:
+        """Return names of all registered tools."""
+        return list(self._tools.keys())

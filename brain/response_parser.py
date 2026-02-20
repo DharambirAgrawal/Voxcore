@@ -194,3 +194,189 @@ EXAMPLE LLM OUTPUT AND PARSING:
     
     TTS starts playing sentence 0 while the LLM is still generating sentence 1+.
 """
+
+
+
+"""
+VOXCORE — brain/response_parser.py
+Splits streaming LLM output into speech tokens + agent JSON in real-time.
+"""
+
+import asyncio
+import logging
+import json
+import re
+
+from typing import AsyncGenerator, Optional
+from core.event_bus import EventBus, EventType
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SENTENCE_ENDINGS = re.compile(r'(?<=[.!?])\s+')
+AGENT_OPEN_TAG = "<agent>"
+AGENT_CLOSE_TAG = "</agent>"
+EMOTION_TAG_PATTERN = re.compile(r'\[(\w+)\]')
+
+
+class ResponseParser:
+    """Real-time LLM output parser that splits speech and agent output."""
+
+    def __init__(self, event_bus: EventBus) -> None:
+        self.event_bus: EventBus = event_bus
+
+        # Speech buffer state
+        self._speech_buffer: str = ""
+        self._sentence_index: int = 0
+        self._current_emotion: str = ""
+
+        # Agent buffer state
+        self._agent_buffer: str = ""
+        self._in_agent_tag: bool = False
+
+        # Full response tracking
+        self._full_response: str = ""
+        self._is_first_token: bool = True
+
+        self._logger: logging.Logger = logging.getLogger("ResponseParser")
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Public API
+    # ───────────────────────────────────────────────────────────────────────
+
+    async def parse_stream(self, token_stream: AsyncGenerator[str, None]) -> str:
+        """Consume streaming tokens, fire speech/agent events, return full response."""
+        self._reset()
+
+        async for token in token_stream:
+            self._full_response += token
+
+            if self._is_first_token:
+                self._is_first_token = False
+
+            await self._process_token(token)
+
+        # Flush any remaining speech
+        await self._flush_speech_buffer()
+
+        # Signal stream completion
+        await self.event_bus.publish(EventType.LLM_STREAM_DONE, {})
+
+        return self._full_response
+
+    def get_partial_response(self) -> str:
+        """Return whatever response has been generated so far (used on interrupt)."""
+        return self._full_response
+
+    @property
+    def is_first_token_received(self) -> bool:
+        """Whether at least one token has been received."""
+        return not self._is_first_token
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Internal processing
+    # ───────────────────────────────────────────────────────────────────────
+
+    async def _process_token(self, token: str) -> None:
+        # CASE 1: Currently inside <agent> block
+        if self._in_agent_tag:
+            self._agent_buffer += token
+
+            if AGENT_CLOSE_TAG in self._agent_buffer:
+                parts = self._agent_buffer.split(AGENT_CLOSE_TAG, 1)
+                raw = parts[0]
+                after_tag = parts[1] if len(parts) > 1 else ""
+
+                try:
+                    parsed = json.loads(raw)
+                    await self.event_bus.publish(EventType.LLM_AGENT_TAG, {
+                        "action": parsed.get("action"),
+                        "params": parsed.get("params", {}),
+                        "raw": raw,
+                    })
+                    self._logger.info("Agent tag parsed: action=%s", parsed.get("action"))
+                except json.JSONDecodeError:
+                    self._logger.error("Failed to parse agent JSON: %s", raw)
+
+                self._in_agent_tag = False
+                self._agent_buffer = ""
+
+                # Process any text after </agent> as speech
+                if after_tag.strip():
+                    self._speech_buffer += after_tag
+                    await self._check_sentence_boundaries()
+
+            return
+
+        # CASE 2 & 3: Not in agent block — accumulate into speech buffer
+        self._speech_buffer += token
+
+        # Check for <agent> tag start
+        if AGENT_OPEN_TAG in self._speech_buffer:
+            parts = self._speech_buffer.split(AGENT_OPEN_TAG, 1)
+            text_before = parts[0]
+            text_after = parts[1] if len(parts) > 1 else ""
+
+            # Flush speech before the agent tag
+            if text_before.strip():
+                old_buffer = self._speech_buffer
+                self._speech_buffer = text_before
+                await self._flush_speech_buffer()
+
+            self._in_agent_tag = True
+            self._agent_buffer = text_after
+            self._speech_buffer = ""
+            return
+
+        # Normal speech — check for sentence boundaries
+        await self._check_sentence_boundaries()
+
+    async def _check_sentence_boundaries(self) -> None:
+        """Split buffer on sentence endings and emit complete sentences."""
+        parts = SENTENCE_ENDINGS.split(self._speech_buffer)
+
+        if len(parts) > 1:
+            # All parts except last are complete sentences
+            for sentence in parts[:-1]:
+                await self._emit_sentence(sentence)
+            # Keep the remainder (incomplete sentence) in buffer
+            self._speech_buffer = parts[-1]
+
+    async def _emit_sentence(self, sentence: str) -> None:
+        """Fire an LLM_SPEECH_TOKEN event for a complete sentence."""
+        sentence = sentence.strip()
+        if not sentence:
+            return
+
+        # Extract emotion tag if present
+        match = EMOTION_TAG_PATTERN.search(sentence)
+        if match:
+            self._current_emotion = match.group(1)
+
+        await self.event_bus.publish(EventType.LLM_SPEECH_TOKEN, {
+            "text": sentence,
+            "sentence_index": self._sentence_index,
+            "emotion": self._current_emotion,
+        })
+
+        self._logger.debug("Sentence %d: '%s'",
+                           self._sentence_index,
+                           sentence[:60] + "..." if len(sentence) > 60 else sentence)
+        self._sentence_index += 1
+
+    async def _flush_speech_buffer(self) -> None:
+        """Emit whatever remains in the speech buffer as a final sentence."""
+        if self._speech_buffer.strip():
+            await self._emit_sentence(self._speech_buffer)
+            self._speech_buffer = ""
+
+    def _reset(self) -> None:
+        """Reset all state for a new response."""
+        self._speech_buffer = ""
+        self._agent_buffer = ""
+        self._in_agent_tag = False
+        self._sentence_index = 0
+        self._current_emotion = ""
+        self._full_response = ""
+        self._is_first_token = True

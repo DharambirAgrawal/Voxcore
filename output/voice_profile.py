@@ -121,3 +121,79 @@ EXPORTS:
     - VALID_EMOTIONS        (list constant)
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+
+import logging
+from typing import Optional
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+AVAILABLE_VOICES_EN = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
+AVAILABLE_VOICES_AR = ["fahad", "sultan", "lulwa", "noura"]
+
+VALID_EMOTIONS = [
+    "cheerful", "calm", "concerned", "excited", "empathetic",
+    "curious", "surprised", "sad", "angry", "whisper", "laugh",
+]
+
+
+class VoiceProfile:
+    """Holds all voice-related configuration for the current persona."""
+
+    def __init__(self, config: dict) -> None:
+        self.voice_name: str = config.get("persona", {}).get("voice", "tara")
+        self.language: str = config.get("persona", {}).get("language", "en")
+        self.sample_rate: int = config.get("audio", {}).get("output_sample_rate", 48000)
+        self.response_format: str = "wav"
+        self.default_emotion: str = "calm"
+
+        self._logger: logging.Logger = logging.getLogger("VoiceProfile")
+
+        self._validate()
+
+    def _validate(self) -> None:
+        """Validate voice name against available voices for the selected language."""
+        if self.language == "en":
+            if self.voice_name not in AVAILABLE_VOICES_EN:
+                self._logger.warning(
+                    "Unknown voice '%s'. Available: %s", self.voice_name, AVAILABLE_VOICES_EN
+                )
+                self.voice_name = "tara"
+        elif self.language == "ar":
+            if self.voice_name not in AVAILABLE_VOICES_AR:
+                self._logger.warning(
+                    "Unknown Arabic voice '%s'. Available: %s", self.voice_name, AVAILABLE_VOICES_AR
+                )
+                self.voice_name = "fahad"
+
+    def get_tts_model(self) -> str:
+        """Return the appropriate Orpheus model for the configured language."""
+        if self.language == "ar":
+            return "canopylabs/orpheus-arabic-saudi"
+        return "canopylabs/orpheus-v1-english"
+
+    def to_dict(self) -> dict:
+        """Return all voice settings as a dictionary."""
+        return {
+            "voice_name": self.voice_name,
+            "language": self.language,
+            "sample_rate": self.sample_rate,
+            "response_format": self.response_format,
+            "default_emotion": self.default_emotion,
+            "tts_model": self.get_tts_model(),
+        }
+
+    def update(
+        self,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        default_emotion: Optional[str] = None,
+    ) -> None:
+        """Hot-reload voice settings at runtime."""
+        if voice:
+            self.voice_name = voice
+        if language:
+            self.language = language
+        if default_emotion and default_emotion in VALID_EMOTIONS:
+            self.default_emotion = default_emotion
+        self._validate()

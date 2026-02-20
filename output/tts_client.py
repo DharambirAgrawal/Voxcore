@@ -165,3 +165,172 @@ ORPHEUS EMOTION TAGS (passed inline in text):
     
     Example: "[excited] I found it! [calm] Let me explain what happened."
 """
+
+
+
+import asyncio
+import logging
+import os
+
+from groq import AsyncGroq
+from core.event_bus import EventBus, EventType
+from output.voice_profile import VoiceProfile
+
+
+class TTSClient:
+    """Groq Orpheus TTS client that converts sentences to streaming audio."""
+
+    def __init__(self, event_bus: EventBus, voice_profile: VoiceProfile, config: dict) -> None:
+        self.event_bus: EventBus = event_bus
+        self.voice_profile: VoiceProfile = voice_profile
+        self.model: str = config.get("tts", "canopylabs/orpheus-v1-english")
+        self._groq_client: AsyncGroq = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+
+        self._speech_token_queue: asyncio.Queue = event_bus.subscribe(EventType.LLM_SPEECH_TOKEN)
+        self._is_cancelled: bool = False
+
+        self._logger: logging.Logger = logging.getLogger("TTSClient")
+
+    async def run(self) -> None:
+        """Main loop — consume LLM_SPEECH_TOKEN events and synthesize audio."""
+        # Register interrupt handler
+        interrupt_queue: asyncio.Queue = self.event_bus.subscribe(EventType.INTERRUPT_DETECTED)
+
+        async def _handle_interrupts() -> None:
+            while True:
+                await interrupt_queue.get()
+                self._is_cancelled = True
+
+        asyncio.create_task(_handle_interrupts())
+
+        while True:
+            event = await self._speech_token_queue.get()
+
+            if self._is_cancelled:
+                # Drain pending sentences
+                while not self._speech_token_queue.empty():
+                    try:
+                        self._speech_token_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                self._is_cancelled = False
+                continue
+
+            sentence: str = event.data["text"]
+            sentence_index: int = event.data["sentence_index"]
+            await self._synthesize_sentence(sentence, sentence_index)
+
+    async def _synthesize_sentence(self, sentence: str, sentence_index: int) -> None:
+        """Synthesize a single sentence via Groq Orpheus TTS and publish audio chunks."""
+        self._logger.info(
+            "TTS: synthesizing sentence %d: '%s'",
+            sentence_index,
+            sentence[:60] + ("..." if len(sentence) > 60 else ""),
+        )
+
+        try:
+            response = await self._groq_client.audio.speech.create(
+                model=self.model,
+                input=sentence,
+                voice=self.voice_profile.voice_name,
+                response_format=self.voice_profile.response_format,
+            )
+
+            # Try streaming iteration first; fall back to complete bytes
+            try:
+                async for chunk in response.iter_bytes(chunk_size=4096):
+                    if self._is_cancelled:
+                        break
+                    await self.event_bus.publish(
+                        EventType.TTS_CHUNK_READY,
+                        {
+                            "audio": chunk,
+                            "sentence_index": sentence_index,
+                            "sentence_done": False,
+                        },
+                        source="TTSClient",
+                    )
+            except AttributeError:
+                # Response is complete bytes — split into chunks
+                audio_bytes: bytes = response.content
+                chunk_size = 4096
+                for i in range(0, len(audio_bytes), chunk_size):
+                    if self._is_cancelled:
+                        break
+                    chunk = audio_bytes[i : i + chunk_size]
+                    is_last = (i + chunk_size) >= len(audio_bytes)
+                    await self.event_bus.publish(
+                        EventType.TTS_CHUNK_READY,
+                        {
+                            "audio": chunk,
+                            "sentence_index": sentence_index,
+                            "sentence_done": is_last,
+                        },
+                        source="TTSClient",
+                    )
+
+            # Signal sentence completion
+            await self.event_bus.publish(
+                EventType.TTS_SENTENCE_DONE,
+                {"sentence_index": sentence_index},
+                source="TTSClient",
+            )
+            self._logger.info("TTS: sentence %d synthesized", sentence_index)
+
+        except Exception as e:
+            error_msg = str(e)
+            if "rate_limit" in error_msg.lower() or "429" in error_msg:
+                self._logger.warning("TTS rate limited — retrying in 1s")
+                await asyncio.sleep(1.0)
+                try:
+                    response = await self._groq_client.audio.speech.create(
+                        model=self.model,
+                        input=sentence,
+                        voice=self.voice_profile.voice_name,
+                        response_format=self.voice_profile.response_format,
+                    )
+                    audio_bytes = response.content
+                    chunk_size = 4096
+                    for i in range(0, len(audio_bytes), chunk_size):
+                        if self._is_cancelled:
+                            break
+                        chunk = audio_bytes[i : i + chunk_size]
+                        is_last = (i + chunk_size) >= len(audio_bytes)
+                        await self.event_bus.publish(
+                            EventType.TTS_CHUNK_READY,
+                            {
+                                "audio": chunk,
+                                "sentence_index": sentence_index,
+                                "sentence_done": is_last,
+                            },
+                            source="TTSClient",
+                        )
+                    await self.event_bus.publish(
+                        EventType.TTS_SENTENCE_DONE,
+                        {"sentence_index": sentence_index},
+                        source="TTSClient",
+                    )
+                except Exception as retry_err:
+                    self._logger.error("TTS retry also failed: %s", retry_err)
+            else:
+                self._logger.error("TTS synthesis failed: %s", e)
+
+    async def cancel(self) -> None:
+        """Cancel current synthesis and drain pending sentences."""
+        self._is_cancelled = True
+        while not self._speech_token_queue.empty():
+            try:
+                self._speech_token_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._logger.info("TTS cancelled — clearing queue")
+
+    async def synthesize_single(self, text: str) -> bytes:
+        """One-off synthesis for safety refusals, etc. Returns complete WAV bytes."""
+        response = await self._groq_client.audio.speech.create(
+            model=self.model,
+            input=text,
+            voice=self.voice_profile.voice_name,
+            response_format="wav",
+        )
+        return response.content

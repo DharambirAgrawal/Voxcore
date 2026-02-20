@@ -194,3 +194,215 @@ LATENCY:
     - sounddevice output latency: ~10ms
     - This is the final step — after this, the user hears the AI's voice
 """
+
+
+import asyncio
+import logging
+import io
+from typing import Optional
+
+import numpy as np
+import sounddevice as sd
+from scipy.io import wavfile
+
+from core.session import Session, TurnState
+from core.event_bus import EventBus, EventType
+
+
+class AudioPlayer:
+    """Interruptible async audio player for TTS output and backchannel clips."""
+
+    def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
+        self.session: Session = session
+        self.event_bus: EventBus = event_bus
+        self.output_sample_rate: int = config.get("output_sample_rate", 48000)
+
+        # Audio queue — holds parsed audio arrays waiting to be played
+        self._play_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+        # Event subscriptions
+        self._tts_chunk_queue: asyncio.Queue = event_bus.subscribe(EventType.TTS_CHUNK_READY)
+        self._interrupt_queue: asyncio.Queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
+        self._backchannel_queue: asyncio.Queue = event_bus.subscribe(EventType.BACKCHANNEL_FIRE)
+
+        # State
+        self._is_playing: bool = False
+        self._is_interrupted: bool = False
+        self._current_stream: Optional[sd.OutputStream] = None
+        self._audio_accumulator: bytearray = bytearray()
+
+        self._logger: logging.Logger = logging.getLogger("AudioPlayer")
+
+    async def run(self) -> None:
+        """Run all player loops concurrently."""
+        await asyncio.gather(
+            self._process_tts_chunks(),
+            self._process_interrupts(),
+            self._process_backchannels(),
+            self._playback_loop(),
+        )
+
+    async def _process_tts_chunks(self) -> None:
+        """Collect TTS audio chunks; when a sentence is complete, enqueue for playback."""
+        while True:
+            event = await self._tts_chunk_queue.get()
+
+            if self._is_interrupted:
+                continue
+
+            audio_chunk: bytes = event.data["audio"]
+            is_sentence_done: bool = event.data.get("sentence_done", False)
+
+            self._audio_accumulator.extend(audio_chunk)
+
+            if is_sentence_done:
+                try:
+                    sr, audio_array = wavfile.read(
+                        io.BytesIO(bytes(self._audio_accumulator))
+                    )
+                    await self._play_queue.put(audio_array)
+                except Exception as e:
+                    self._logger.error("Failed to parse accumulated WAV: %s", e)
+                finally:
+                    self._audio_accumulator = bytearray()
+
+    async def _playback_loop(self) -> None:
+        """Main loop — pull audio arrays from queue and play them."""
+        while True:
+            audio_array = await self._play_queue.get()
+
+            if self._is_interrupted:
+                # Drain the queue
+                while not self._play_queue.empty():
+                    try:
+                        self._play_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                self._is_interrupted = False
+                continue
+
+            self._is_playing = True
+            await self._play_audio(audio_array)
+            self._is_playing = False
+
+            if self._play_queue.empty():
+                await self.event_bus.publish(
+                    EventType.PLAYBACK_DONE, {}, source="AudioPlayer"
+                )
+                self._logger.debug("Playback complete")
+
+    async def _play_audio(self, audio: np.ndarray) -> None:
+        """Play audio array through speakers with 20ms frame interrupt granularity."""
+        # Normalize to float32
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float32) / 32768.0
+        elif audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+
+        # Ensure mono is shaped correctly
+        if audio.ndim == 1:
+            audio = audio.reshape(-1, 1)
+
+        frame_ms = 20
+        frame_samples = self.output_sample_rate * frame_ms // 1000
+        total_samples = audio.shape[0]
+
+        try:
+            self._current_stream = sd.OutputStream(
+                samplerate=self.output_sample_rate,
+                channels=audio.shape[1],
+                dtype="float32",
+            )
+            self._current_stream.start()
+
+            offset = 0
+            while offset < total_samples:
+                if self._is_interrupted:
+                    break
+
+                end = min(offset + frame_samples, total_samples)
+                frame = audio[offset:end]
+                self._current_stream.write(frame)
+                offset = end
+
+                # Yield to event loop so interrupts can be detected
+                await asyncio.sleep(0)
+
+            self._current_stream.stop()
+            self._current_stream.close()
+        except Exception as e:
+            self._logger.error("Playback error: %s", e)
+        finally:
+            self._current_stream = None
+
+    async def _process_interrupts(self) -> None:
+        """Listen for interrupt events and immediately stop playback."""
+        while True:
+            await self._interrupt_queue.get()
+            self._logger.info("INTERRUPT — stopping playback")
+
+            self._is_interrupted = True
+
+            # Clear play queue
+            while not self._play_queue.empty():
+                try:
+                    self._play_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            # Clear accumulator
+            self._audio_accumulator = bytearray()
+
+            # Stop sounddevice immediately
+            sd.stop()
+
+            # Close current stream if active
+            if self._current_stream is not None:
+                try:
+                    self._current_stream.stop()
+                    self._current_stream.close()
+                except Exception:
+                    pass
+                self._current_stream = None
+
+            # Brief delay then re-enable
+            await asyncio.sleep(0.05)
+            self._is_interrupted = False
+
+    async def _process_backchannels(self) -> None:
+        """Play backchannel audio clips (e.g. 'mhm', 'yeah') when not speaking."""
+        while True:
+            event = await self._backchannel_queue.get()
+
+            if self._is_playing:
+                continue
+            if self.session.state == TurnState.SPEAKING:
+                continue
+
+            clip_path: str = event.data["clip_path"]
+            clip_name: str = event.data.get("clip_name", clip_path)
+
+            try:
+                sr, audio = wavfile.read(clip_path)
+                audio_float = audio.astype(np.float32)
+                if audio.dtype == np.int16:
+                    audio_float = audio_float / 32768.0
+                sd.play(audio_float * 0.8, samplerate=sr, blocking=False)
+                self._logger.debug("Backchannel: played '%s'", clip_name)
+            except Exception as e:
+                self._logger.error("Backchannel playback failed: %s", e)
+
+    async def stop(self) -> None:
+        """Stop all playback and clear the queue."""
+        sd.stop()
+        self._is_playing = False
+        while not self._play_queue.empty():
+            try:
+                self._play_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    @property
+    def is_playing(self) -> bool:
+        """Whether audio is currently being played."""
+        return self._is_playing

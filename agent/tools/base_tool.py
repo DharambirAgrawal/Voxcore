@@ -97,3 +97,41 @@ EXPORTS:
     - BaseTool   (abstract class)
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+
+from abc import ABC, abstractmethod
+from typing import Any
+import logging
+
+
+class BaseTool(ABC):
+    """Abstract base class for all VoxCore tools."""
+
+    name: str = ""
+    description: str = ""
+    required_params: list[str] = []
+    optional_params: list[str] = []
+
+    def __init__(self) -> None:
+        self._logger: logging.Logger = logging.getLogger(f"Tool.{self.name}")
+
+    @abstractmethod
+    async def execute(self, params: dict) -> Any:
+        """Execute the tool's main action. Must be implemented by subclasses."""
+        ...
+
+    def validate_params(self, params: dict) -> tuple[bool, str]:
+        """Check that all required parameters are present."""
+        for name in self.required_params:
+            if name not in params:
+                return False, f"Missing required parameter: {name}"
+        return True, ""
+
+    def get_schema(self) -> dict:
+        """Return a JSON-serialisable schema describing this tool's interface."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "required_params": self.required_params,
+            "optional_params": self.optional_params,
+        }

@@ -138,3 +138,98 @@ ECHO CANCELLATION NOTE:
     - Implementing software AEC using WebRTC's AEC module
     - Using a hardware AEC solution
 """
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                  VOXCORE — input/interruption_detector.py                        ║
+║        MONITORS VAD WHILE SPEAKING — FIRES INTERRUPT IF USER TALKS OVER        ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import logging
+import time
+
+from core.session import Session, TurnState
+from core.event_bus import EventBus, EventType
+from input.mic_stream import MicStream
+from input.vad import VADProcessor
+
+
+class InterruptionDetector:
+    """Monitors audio input during SPEAKING state to detect user interruptions."""
+
+    def __init__(
+        self,
+        session: Session,
+        event_bus: EventBus,
+        mic_stream: MicStream,
+        vad: VADProcessor,
+        config: dict,
+    ) -> None:
+        self.session = session
+        self.event_bus = event_bus
+        self.mic_stream = mic_stream
+        self.vad = vad
+
+        self._interrupt_threshold: float = config.get("interrupt_threshold", 0.6)
+        self._interrupt_duration_ms: int = config.get("interrupt_duration_ms", 300)
+        self._speech_detected_at: float = 0.0
+        self._audio_queue: asyncio.Queue = None
+
+        self._logger = logging.getLogger("InterruptionDetector")
+
+    async def run(self) -> None:
+        """Main loop: consume audio, check state, run VAD, check for interrupt."""
+        self._audio_queue = self.mic_stream.add_consumer()
+        # Wire up state change handler for clean reset on state transitions
+        self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)
+
+        while True:
+            chunk = await self._audio_queue.get()
+
+            if self.session.state != TurnState.SPEAKING:
+                self._speech_detected_at = 0.0
+                continue
+
+            # FIX 2: Use public API if available, fall back to private
+            speech_prob = self.vad.get_speech_probability(chunk)
+            await self._check_interrupt(speech_prob)
+
+    async def _check_interrupt(self, speech_prob: float) -> None:
+        """Analyze speech probability to detect sustained interruption."""
+        # FIX 1: Use time.monotonic() — immune to system clock adjustments
+        now = time.monotonic()
+
+        if speech_prob > self._interrupt_threshold:
+            if self._speech_detected_at == 0.0:
+                # First detection — start timing
+                self._speech_detected_at = now
+            else:
+                # Check duration of sustained speech
+                duration_ms = (now - self._speech_detected_at) * 1000
+                if duration_ms >= self._interrupt_duration_ms:
+                    # Confirmed interrupt
+                    await self.event_bus.publish(
+                        EventType.INTERRUPT_DETECTED,
+                        data={"speech_prob": speech_prob, "during_sentence": -1},
+                    )
+                    self._logger.info(
+                        f"INTERRUPT detected ({duration_ms:.0f}ms of speech during SPEAKING)"
+                    )
+                    self._speech_detected_at = 0.0
+                    await asyncio.sleep(0.1)  # Cooldown to prevent re-trigger
+        else:
+            # No speech detected — reset timer
+            self._speech_detected_at = 0.0
+
+    async def _handle_state_change(self, event) -> None:
+        """Handle STATE_CHANGED events to reset detection on state transitions."""
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+
+        if new_state == TurnState.SPEAKING:
+            # Entering SPEAKING — fresh start for detection
+            self._speech_detected_at = 0.0
+        elif old_state == TurnState.SPEAKING:
+            # Leaving SPEAKING — clean up
+            self._speech_detected_at = 0.0

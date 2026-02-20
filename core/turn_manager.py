@@ -196,3 +196,215 @@ EXPORTS:
     - TurnManager   (class)
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+"""
+VoxCore — core/turn_manager.py
+The 4-state machine — orchestrates all turn-taking logic.
+"""
+
+import asyncio
+import logging
+from typing import Optional
+
+from core.session import Session, TurnState
+from core.event_bus import EventBus, EventType
+
+from brain.llm_client import LLMClient
+from brain.prompt_builder import PromptBuilder
+from brain.response_parser import ResponseParser
+from brain.router import BrainRouter
+
+from safety.guard import SafetyGuard
+
+
+class TurnManager:
+    """State machine that drives the entire conversational flow."""
+
+    def __init__(
+        self,
+        session: Session,
+        event_bus: EventBus,
+        llm_client: LLMClient,
+        prompt_builder: PromptBuilder,
+        response_parser: ResponseParser,
+        brain_router: BrainRouter,
+        safety_guard: Optional[SafetyGuard] = None,
+        config: Optional[dict] = None,
+    ) -> None:
+        self.session = session
+        self.event_bus = event_bus
+        self.llm_client = llm_client
+        self.prompt_builder = prompt_builder
+        self.response_parser = response_parser
+        self.brain_router = brain_router
+        self.safety_guard = safety_guard
+        self._logger = logging.getLogger("TurnManager")
+
+        self._current_llm_task: Optional[asyncio.Task] = None
+        self._interrupted_content: str = ""
+
+        # Subscribe to relevant events
+        self._transcript_queue = event_bus.subscribe(EventType.TRANSCRIPT_READY)
+        self._interrupt_queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
+        self._playback_done_queue = event_bus.subscribe(EventType.PLAYBACK_DONE)
+        self._llm_done_queue = event_bus.subscribe(EventType.LLM_STREAM_DONE)
+        self._safety_queue = event_bus.subscribe(EventType.SAFETY_FLAGGED)
+
+    # ── main entry point ───────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        """Run all event handlers concurrently. Never returns."""
+        await asyncio.gather(
+            self._handle_transcripts(),
+            self._handle_interrupts(),
+            self._handle_playback_done(),
+            self._handle_safety_flags(),
+        )
+
+    # ── transcript handling ────────────────────────────────────────────────
+
+    async def _handle_transcripts(self) -> None:
+        while True:
+            event = await self._transcript_queue.get()
+            text: str = event.data.get("text", "")
+            if not text or not text.strip():
+                continue
+
+            self._logger.info("User said: %s", text)
+            await self.session.add_turn("user", text)
+
+            if self.safety_guard is not None:
+                asyncio.create_task(self.safety_guard.check_input(text))
+
+            await self._start_llm_response(text)
+
+    # ── LLM orchestration ─────────────────────────────────────────────────
+
+    async def _start_llm_response(self, user_text: str) -> None:
+        await self.session.set_state(TurnState.THINKING)
+
+        messages = self.prompt_builder.build(self.session)
+        model = self.brain_router.route(user_text, self.session)
+
+        self._current_llm_task = asyncio.create_task(
+            self._stream_and_parse(messages, model)
+        )
+
+    async def _stream_and_parse(self, messages: list[dict], model: str) -> None:
+        first_token_seen = False
+        full_text = ""
+        emotion: Optional[str] = None
+
+        try:
+            stream = self.llm_client.stream_response(messages, model)
+            async for parsed in self.response_parser.parse_stream(stream):
+                token_type = parsed.get("type")
+
+                if token_type == "speech":
+                    token_text = parsed.get("text", "")
+                    full_text += token_text
+
+                    if not first_token_seen:
+                        first_token_seen = True
+                        await self.session.set_state(TurnState.SPEAKING)
+
+                    await self.event_bus.publish(
+                        EventType.LLM_SPEECH_TOKEN, {"text": token_text}
+                    )
+
+                elif token_type == "emotion":
+                    emotion = parsed.get("emotion")
+
+                elif token_type == "agent":
+                    await self.event_bus.publish(
+                        EventType.LLM_AGENT_TAG, {"agent": parsed.get("agent")}
+                    )
+
+            # Stream complete — record assistant turn
+            agent_output = parsed.get("agent") if parsed and parsed.get("type") == "agent" else None
+            await self.session.add_turn(
+                "assistant",
+                full_text,
+                emotion=emotion,
+                agent_output=agent_output,
+            )
+
+            if self.safety_guard is not None:
+                asyncio.create_task(self.safety_guard.check_output(full_text))
+
+            await self.event_bus.publish(EventType.LLM_STREAM_DONE, {"text": full_text})
+
+        except asyncio.CancelledError:
+            # Interrupted — save what we had
+            self._interrupted_content = full_text
+            self._logger.info("LLM stream cancelled (interrupted), partial: %d chars", len(full_text))
+            raise
+
+        except Exception:
+            self._logger.exception("Error during LLM stream")
+
+    # ── interrupt handling ─────────────────────────────────────────────────
+
+    async def _handle_interrupts(self) -> None:
+        while True:
+            event = await self._interrupt_queue.get()
+
+            if self.session.state is not TurnState.SPEAKING:
+                continue
+
+            self._logger.info("INTERRUPT detected — killing TTS")
+            await self.session.set_state(TurnState.INTERRUPTED)
+
+            # Cancel the running LLM task
+            if self._current_llm_task is not None and not self._current_llm_task.done():
+                self._current_llm_task.cancel()
+                try:
+                    await self._current_llm_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Save partial output as interrupted assistant turn
+            if self._interrupted_content:
+                await self.session.add_turn(
+                    "assistant",
+                    self._interrupted_content,
+                    was_interrupted=True,
+                )
+                self._interrupted_content = ""
+
+            await self.session.set_state(TurnState.LISTENING)
+
+    # ── playback done handling ─────────────────────────────────────────────
+
+    async def _handle_playback_done(self) -> None:
+        while True:
+            await self._playback_done_queue.get()
+
+            if self.session.state is TurnState.SPEAKING:
+                await self.session.set_state(TurnState.LISTENING)
+                self._logger.info("Playback done → LISTENING")
+            # If INTERRUPTED, the interrupt handler already transitioned state
+
+    # ── safety flag handling ───────────────────────────────────────────────
+
+    async def _handle_safety_flags(self) -> None:
+        while True:
+            event = await self._safety_queue.get()
+            direction = event.data.get("direction", "")
+
+            if direction == "output":
+                self._logger.warning("Safety flagged output — cancelling LLM and sending refusal")
+                if self._current_llm_task is not None and not self._current_llm_task.done():
+                    self._current_llm_task.cancel()
+                    try:
+                        await self._current_llm_task
+                    except asyncio.CancelledError:
+                        pass
+
+                await self.event_bus.publish(
+                    EventType.LLM_SPEECH_TOKEN,
+                    {"text": "I'm sorry, I can't respond to that."},
+                )
+
+            elif direction == "input":
+                self._logger.warning("Safety flagged input: %s", event.data.get("reason", "unknown"))

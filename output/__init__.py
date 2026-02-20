@@ -17,6 +17,6 @@ USAGE:
     from output import TTSClient, AudioPlayer, VoiceProfile
 """
 
-# from output.tts_client import TTSClient
-# from output.audio_player import AudioPlayer
-# from output.voice_profile import VoiceProfile
+from output.tts_client import TTSClient
+from output.audio_player import AudioPlayer
+from output.voice_profile import VoiceProfile

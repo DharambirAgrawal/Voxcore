@@ -125,3 +125,119 @@ EXPORTS:
     - WebSearchTool   (class)
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+import logging
+import os
+from typing import Any
+
+import aiohttp
+
+from agent.tools.base_tool import BaseTool
+
+
+class WebSearchTool(BaseTool):
+    """Web search tool using a search API."""
+
+    name = "web_search"
+    description = "Search the web for current information"
+    required_params = ["query"]
+    optional_params = ["num_results", "search_depth"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.api_key: str = os.environ.get("TAVILY_API_KEY", "")
+        self._logger: logging.Logger = logging.getLogger("Tool.web_search")
+
+    async def execute(self, params: dict) -> str:
+        valid, err = self.validate_params(params)
+        if not valid:
+            return f"Error: {err}"
+
+        query = params["query"]
+        num_results = params.get("num_results", 5)
+        try:
+            num_results = int(num_results)
+        except (TypeError, ValueError):
+            num_results = 5
+
+        try:
+            if self.api_key:
+                results = await self._search_tavily(query, num_results)
+            else:
+                results = await self._search_duckduckgo(query, num_results)
+        except Exception as exc:
+            self._logger.error("Search failed: %s", exc, exc_info=True)
+            return f"Search error: {exc}"
+
+        return self._format_results(query, results)
+
+    async def _search_tavily(self, query: str, num_results: int) -> list[dict]:
+        url = "https://api.tavily.com/search"
+        payload = {
+            "api_key": self.api_key,
+            "query": query,
+            "max_results": num_results,
+            "search_depth": "basic",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        results: list[dict] = []
+        for item in data.get("results", []):
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "snippet": item.get("content", ""),
+                    "url": item.get("url", ""),
+                }
+            )
+        return results
+
+    async def _search_duckduckgo(self, query: str, num_results: int) -> list[dict]:
+        url = "https://api.duckduckgo.com/"
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+
+        results: list[dict] = []
+
+        # Abstract text (top result)
+        if data.get("AbstractText"):
+            results.append(
+                {
+                    "title": data.get("Heading", "Result"),
+                    "snippet": data["AbstractText"],
+                    "url": data.get("AbstractURL", ""),
+                }
+            )
+
+        # Related topics
+        for topic in data.get("RelatedTopics", []):
+            if len(results) >= num_results:
+                break
+            if "Text" in topic:
+                results.append(
+                    {
+                        "title": topic.get("Text", "")[:80],
+                        "snippet": topic.get("Text", ""),
+                        "url": topic.get("FirstURL", ""),
+                    }
+                )
+
+        return results[:num_results]
+
+    def _format_results(self, query: str, results: list[dict]) -> str:
+        if not results:
+            return f"No results found for '{query}'"
+
+        output = f"Search results for '{query}':\n"
+        for i, result in enumerate(results, 1):
+            output += f"{i}. {result['title']} — {result['snippet']}\n"
+            output += f"   URL: {result['url']}\n"
+        return output

@@ -99,5 +99,67 @@ CLASS: MemoryTool(BaseTool)
 ═══════════════════════════════════════════════════════════════════════════════════
 EXPORTS:
     - MemoryTool   (class)
-═══════════════════════════════════════════════════════════════════════════════════
+════════════════════════════════════════════a═══════════════════════════════════════
 """
+
+import logging
+from typing import Any, Optional
+
+from agent.tools.base_tool import BaseTool
+from memory.long_term import LongTermMemory
+
+
+class MemoryTool(BaseTool):
+    """Read/write long-term memory via ChromaDB."""
+
+    name = "memory"
+    description = "Store or retrieve information from long-term memory"
+    required_params = ["operation"]  # "read" or "write"
+    optional_params = ["content", "query", "top_k"]
+
+    def __init__(self, long_term_memory: LongTermMemory = None) -> None:
+        super().__init__()
+        self.memory: Optional[LongTermMemory] = long_term_memory
+        self._logger = logging.getLogger("Tool.memory")
+
+    def set_memory(self, memory: LongTermMemory) -> None:
+        """Attach the ChromaDB memory instance (may be wired after construction)."""
+        self.memory = memory
+
+    async def execute(self, params: dict) -> str:
+        if self.memory is None:
+            return "Memory system not initialized"
+
+        operation = params.get("operation")
+
+        if operation == "write":
+            content = params.get("content", "") or ""
+            if not content:
+                return "Error: 'content' required for write operation"
+            await self.memory.store(content, metadata={"source": "explicit_memory"})
+            truncated = content[:100]
+            return f"Stored in memory: '{truncated}...'"
+
+        if operation == "read":
+            query = params.get("query", "") or ""
+            if not query:
+                return "Error: 'query' required for read operation"
+            top_k = params.get("top_k", 5)
+            try:
+                top_k = int(top_k)
+            except (TypeError, ValueError):
+                top_k = 5
+            results = await self.memory.query(query, top_k=top_k)
+            return self._format_memories(results)
+
+        return f"Unknown operation: {operation}. Use 'read' or 'write'."
+
+    def _format_memories(self, results: list[dict]) -> str:
+        """Format ChromaDB query results into a human-readable string."""
+        if not results:
+            return "No relevant memories found."
+
+        output = "Retrieved memories:\n"
+        for i, r in enumerate(results, 1):
+            output += f"{i}. {r['content']}\n"
+        return output

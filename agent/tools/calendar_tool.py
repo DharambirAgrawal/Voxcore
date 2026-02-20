@@ -161,3 +161,144 @@ EXPORTS:
     - CalendarTool   (class)
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+
+from agent.tools.base_tool import BaseTool
+
+DEFAULT_DB_PATH = Path("data/calendar.db")
+
+CREATE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        event_time TEXT NOT NULL,   -- ISO 8601 format
+        created_at TEXT NOT NULL,   -- When the event was created
+        reminder_minutes INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active'   -- 'active' | 'cancelled'
+    )
+"""
+
+
+class CalendarTool(BaseTool):
+    """Manages local calendar events & reminders stored in SQLite."""
+
+    name = "calendar"
+    description = "Create, list, or delete calendar events and reminders"
+    required_params = ["action"]  # "create", "list", "delete"
+    optional_params = [
+        "title",
+        "description",
+        "event_time",
+        "event_id",
+        "hours_ahead",
+    ]
+
+    def __init__(self, db_path: str | Path = None) -> None:
+        super().__init__()
+        self.db_path: Path = Path(db_path) if db_path else DEFAULT_DB_PATH
+        self._initialized: bool = False
+        self._logger = logging.getLogger("Tool.calendar")
+
+    async def _ensure_db(self) -> None:
+        if self._initialized:
+            return
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(CREATE_TABLE_SQL)
+            await db.commit()
+
+        self._initialized = True
+
+    async def execute(self, params: dict) -> str:
+        if not self._initialized:
+            await self._ensure_db()
+
+        action = params.get("action")
+        if action == "create":
+            return await self._create_event(params)
+        if action == "list":
+            return await self._list_events(params)
+        if action == "delete":
+            return await self._delete_event(params)
+
+        return f"Unknown action: {action}. Use 'create', 'list', or 'delete'."
+
+    async def _create_event(self, params: dict) -> str:
+        title = params.get("title", "") or ""
+        if not title:
+            return "Error: 'title' required"
+
+        event_time = params.get("event_time", "") or ""
+        if not event_time:
+            return "Error: 'event_time' required (ISO 8601)"
+
+        # Validate ISO 8601 (accept common 'Z' suffix as UTC)
+        try:
+            _ = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+        except ValueError:
+            return "Error: 'event_time' must be valid ISO 8601 datetime"
+
+        description = params.get("description", "") or ""
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO events (title, description, event_time, created_at) VALUES (?, ?, ?, ?)",
+                (title, description, event_time, datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+            event_id = cursor.lastrowid
+
+        return f"Event #{event_id} created: '{title}' at {event_time}"
+
+    async def _list_events(self, params: dict) -> str:
+        hours_ahead = params.get("hours_ahead", 24)
+        try:
+            hours_ahead = int(hours_ahead)
+        except (TypeError, ValueError):
+            hours_ahead = 24
+
+        now = datetime.utcnow().isoformat()
+        cutoff = (datetime.utcnow() + timedelta(hours=hours_ahead)).isoformat()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM events WHERE event_time BETWEEN ? AND ? AND status='active' ORDER BY event_time",
+                (now, cutoff),
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return f"No upcoming events in the next {hours_ahead} hours."
+
+        lines = [f"#{row['id']} - {row['title']} at {row['event_time']}" for row in rows]
+        return "\n".join(lines)
+
+    async def _delete_event(self, params: dict) -> str:
+        event_id = params.get("event_id")
+        if event_id is None or event_id == "":
+            return "Error: 'event_id' required"
+
+        try:
+            event_id = int(event_id)
+        except (TypeError, ValueError):
+            return "Error: 'event_id' must be an integer"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE events SET status='cancelled' WHERE id=? AND status='active'",
+                (event_id,),
+            )
+            await db.commit()
+            if cursor.rowcount == 0:
+                return f"Event #{event_id} not found or already cancelled."
+
+        return f"Event #{event_id} cancelled."

@@ -142,3 +142,122 @@ USAGE PATTERN:
     )
     # Result automatically appears in the next turn's [CONTEXT] block
 """
+
+
+import asyncio
+import logging
+from typing import Optional
+
+from brain.llm_client import LLMClient
+from brain.router import BrainRouter
+from core.event_bus import EventBus
+from input.text_injector import TextInjector
+
+
+class SlowLLM:
+    """
+    Manages async calls to slower, more powerful LLMs.
+    Handles tasks that need more intelligence than the fast conversational model.
+    """
+
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        brain_router: BrainRouter,
+        text_injector: TextInjector,
+        event_bus: EventBus,
+    ) -> None:
+        self.llm_client: LLMClient = llm_client
+        self.brain_router: BrainRouter = brain_router
+        self.text_injector: TextInjector = text_injector
+        self.event_bus: EventBus = event_bus
+        self._active_tasks: list[asyncio.Task] = []
+        self._logger: logging.Logger = logging.getLogger("SlowLLM")
+
+    async def process_complex_task(
+        self, task_description: str, context: str, model: Optional[str] = None
+    ) -> str:
+        """
+        Execute a complex task using a specific or router-selected LLM.
+        Returns the raw result string.
+        """
+        if model is None:
+            model = self.brain_router.route_agent_task(task_description)
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a task execution assistant. Provide clear, concise results. No emotion tags.",
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nTask:\n{task_description}",
+            },
+        ]
+
+        self._logger.info(f"SlowLLM: processing task on {model}")
+
+        # Assuming complete() returns the full string response
+        result = await self.llm_client.complete(messages, model=model)
+
+        self._logger.info(f"SlowLLM: task completed ({len(result)} chars)")
+        return result
+
+    async def process_and_inject(
+        self,
+        task_description: str,
+        context: str,
+        action_name: str,
+        model: Optional[str] = None,
+    ) -> None:
+        """
+        Process a task and automatically inject the result into the text injector.
+        """
+        try:
+            result = await self.process_complex_task(task_description, context, model)
+            await self.text_injector.inject_tool_result(
+                action_name, result, success=True
+            )
+            self._logger.info(f"SlowLLM result injected for action '{action_name}'")
+        except Exception as e:
+            self._logger.error(
+                f"SlowLLM failed for action '{action_name}': {e}", exc_info=True
+            )
+            # Optionally inject the failure so the agent knows it failed
+            await self.text_injector.inject_tool_result(
+                action_name, f"Error processing task: {str(e)}", success=False
+            )
+
+    def launch_background_task(
+        self,
+        task_description: str,
+        context: str,
+        action_name: str,
+        model: Optional[str] = None,
+    ) -> asyncio.Task:
+        """
+        Fire-and-forget method to launch a slow LLM task in the background.
+        """
+        task = asyncio.create_task(
+            self.process_and_inject(task_description, context, action_name, model)
+        )
+        self._active_tasks.append(task)
+
+        # Remove task from list when done to prevent memory leaks
+        task.add_done_callback(
+            lambda t: self._active_tasks.remove(t) if t in self._active_tasks else None
+        )
+        return task
+
+    async def cancel_all(self) -> None:
+        """Cancel all currently running slow LLM tasks."""
+        for task in self._active_tasks:
+            if not task.done():
+                task.cancel()
+        self._active_tasks.clear()
+        self._logger.info("All slow LLM tasks cancelled")
+
+    @property
+    def active_task_count(self) -> int:
+        """Return the number of currently running slow LLM tasks."""
+        return len(self._active_tasks)

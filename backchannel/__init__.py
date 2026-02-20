@@ -19,6 +19,6 @@ USAGE:
     from backchannel import CueDetector, BackchannelSelector
 """
 
-# from backchannel.cue_detector import CueDetector
-# from backchannel.selector import BackchannelSelector
-# from backchannel.generator import ClipGenerator
+from backchannel.cue_detector import CueDetector
+from backchannel.selector import BackchannelSelector
+from backchannel.generator import ClipGenerator
