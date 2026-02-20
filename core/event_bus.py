@@ -232,6 +232,7 @@ class EventType(str, Enum):
     SPEECH_END = "speech_end"
     TRANSCRIPT_READY = "transcript_ready"
     TEXT_INJECTED = "text_injected"
+    AUDIO_CHUNK = "audio_chunk"
 
     # --- Brain Events ---
     LLM_SPEECH_TOKEN = "llm_speech_token"
@@ -283,11 +284,21 @@ class EventBus:
         ] = {}
         self._logger: logging.Logger = logging.getLogger("EventBus")
 
-    def subscribe(self, event_type: EventType) -> asyncio.Queue:
+    def subscribe(
+        self,
+        event_type: EventType,
+        callback: Callable[[Event], Awaitable[None]] | None = None,
+    ) -> asyncio.Queue | None:
         """
         Create and return a new queue that will receive all events of the
         given type. Each subscriber gets its own queue (fan-out).
+
+        If *callback* is provided, register it via ``on()`` instead of
+        creating a queue-based subscription (returns ``None``).
         """
+        if callback is not None:
+            self.on(event_type, callback)
+            return None
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self._subscribers.setdefault(event_type, []).append(queue)
         return queue
@@ -300,7 +311,7 @@ class EventBus:
         """Register an async callback to be invoked when *event_type* fires."""
         self._callbacks.setdefault(event_type, []).append(callback)
 
-    def publish(
+    async def publish(
         self,
         event_type: EventType,
         data: Any = None,

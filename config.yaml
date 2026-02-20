@@ -26,8 +26,8 @@ persona:
     When you need to perform a task, include ONLY in your output:
     <agent>{"action": "tool_name", "params": {...}}</agent>
     Do NOT describe the tool call in your speech. Just say 'On it' or 'Let me check'.
-  voice: "hannah"    # VALID Groq Orpheus voices: troy, hannah, austin, diana, daniel, autumn
-  language: "en"                     # "en" for English, "ar" for Arabic
+  voice: "af_heart"   # Kokoro-ONNX voice ID — see backchannel/generator.py for full list
+  language: "en"                     # "en" for English
 
 models:
   stt_primary: "whisper-large-v3-turbo"                          # Groq Whisper — primary STT
@@ -37,14 +37,14 @@ models:
   llm_agentic: "moonshotai/kimi-k2-instruct"                    # Agentic brain — tool use
   llm_deep: "qwen/qwen3-32b"                                    # Deep brain — summaries / analysis
   llm_power: "openai/gpt-oss-120b"                              # Power brain — max intelligence (rare)
-  tts: "canopylabs/orpheus-v1-english"                           # Orpheus TTS — English
-  tts_arabic: "canopylabs/orpheus-arabic-saudi"                  # Orpheus TTS — Arabic (optional)
+  tts_model: "models/kokoro-v1.0.onnx"                            # Kokoro-ONNX model file (local)
+  tts_voices: "models/voices-v1.0.bin"                            # Kokoro voice embeddings file (local)
   safety: "meta-llama/llama-guard-4-12b"                         # Llama Guard — safety filtering
 
 audio:
   sample_rate: 16000                 # STT input sample rate in Hz (16kHz mono)
-  output_sample_rate: 48000          # TTS output sample rate in Hz (Orpheus outputs 48kHz)
-  chunk_ms: 30                       # VAD chunk size in milliseconds
+  output_sample_rate: 24000          # TTS output sample rate in Hz (Kokoro-ONNX outputs 24kHz)
+  chunk_ms: 32                       # VAD chunk size in milliseconds (≥32ms for 16kHz Silero VAD)
   vad_speech_threshold: 0.5          # Silero VAD speech probability threshold (0.0–1.0)
   vad_silence_threshold: 0.7         # Silero VAD silence probability threshold for end-of-turn
   vad_silence_duration_ms: 400       # Milliseconds of silence before end-of-turn is declared
@@ -55,7 +55,7 @@ backchannel:
   min_pause_ms: 350                  # Phrase boundary detection: minimum pause in ms
   min_gap_between_s: 8               # Minimum seconds between consecutive backchannels
   min_user_speech_s: 2               # User must speak at least this many seconds before backchannel
-  clips_dir: "backchannel/clips/"    # Directory containing pre-generated WAV clips
+  clips_dir: "backchannel/clips/heart/"  # Directory containing pre-generated WAV clips (per-voice subdirectory)
   energy_threshold: 0.02             # RMS energy threshold for phrase boundary detection
   clips:                             # List of clip basenames (without .wav) to generate
     - uh_huh

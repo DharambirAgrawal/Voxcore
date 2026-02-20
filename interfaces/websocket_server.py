@@ -337,12 +337,12 @@ class WebSocketServer:
     # ── event subscriptions ──────────────────────────────────────────────────
 
     def _subscribe_events(self) -> None:
-        self._bus.subscribe(EventType.STATE_CHANGE, self._broadcast_state)
-        self._bus.subscribe(EventType.TRANSCRIPT, self._broadcast_transcript)
-        self._bus.subscribe(EventType.LLM_SENTENCE, self._broadcast_llm_sentence)
-        self._bus.subscribe(EventType.TTS_CHUNK, self._broadcast_audio)
-        self._bus.subscribe(EventType.SAFETY_FLAG, self._broadcast_safety)
-        self._bus.subscribe(EventType.INTERRUPT, self._broadcast_interrupt)
+        self._bus.subscribe(EventType.STATE_CHANGED, self._broadcast_state)
+        self._bus.subscribe(EventType.TRANSCRIPT_READY, self._broadcast_transcript)
+        self._bus.subscribe(EventType.LLM_STREAM_DONE, self._broadcast_llm_sentence)
+        self._bus.subscribe(EventType.TTS_CHUNK_READY, self._broadcast_audio)
+        self._bus.subscribe(EventType.SAFETY_FLAGGED, self._broadcast_safety)
+        self._bus.subscribe(EventType.INTERRUPT_DETECTED, self._broadcast_interrupt)
 
     # ── server start ─────────────────────────────────────────────────────────
 
@@ -442,7 +442,7 @@ class WebSocketServer:
             text = message.get("text", "").strip()
             if text:
                 await self._bus.publish(
-                    EventType.TRANSCRIPT,
+                    EventType.TRANSCRIPT_READY,
                     {
                         "text": text,
                         "is_final": True,
@@ -453,7 +453,7 @@ class WebSocketServer:
         elif msg_type == MSG_TYPE_CONTROL:
             action = message.get("action", "")
             if action == "interrupt":
-                await self._bus.publish(EventType.INTERRUPT, {"source": "websocket", "conn_id": conn_id})
+                await self._bus.publish(EventType.INTERRUPT_DETECTED, {"source": "websocket", "conn_id": conn_id})
             elif action == "mute":
                 if conn_id == self._active_connection:
                     self._active_connection = None

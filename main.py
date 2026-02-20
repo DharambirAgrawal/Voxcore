@@ -21,6 +21,7 @@ import asyncio                          # Core async event loop
 import argparse                         # CLI argument parsing
 import signal                           # Graceful shutdown on SIGINT/SIGTERM
 import sys                              # sys.exit
+import os                               # Environment variable access
 import logging                          # Structured logging for all modules
 
 from pathlib import Path                # Path operations for config file
@@ -290,3 +291,523 @@ EXECUTION:
     python main.py --no-mic --interface cli   # Testing mode without microphone
 ═══════════════════════════════════════════════════════════════════════════════════
 """
+
+
+
+
+
+
+
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                              VOXCORE — main.py                                  ║
+║                         ENTRY POINT — BOOTS ALL ASYNC TASKS                     ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import argparse
+import os
+import signal
+import sys
+import logging
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+import yaml
+
+# ── Internal module imports ──────────────────────────────────────────────────
+from core.session import Session
+from core.event_bus import EventBus
+from core.turn_manager import TurnManager
+
+from input.mic_stream import MicStream
+from input.vad import VADProcessor
+from input.stt import STTClient
+from input.text_injector import TextInjector
+from input.interruption_detector import InterruptionDetector
+
+from backchannel.cue_detector import CueDetector
+from backchannel.selector import BackchannelSelector
+
+from brain.llm_client import LLMClient
+from brain.prompt_builder import PromptBuilder
+from brain.response_parser import ResponseParser
+from brain.emotion_tagger import EmotionTagger
+from brain.router import BrainRouter
+
+from output.tts_client import TTSClient
+from output.audio_player import AudioPlayer
+from output.voice_profile import VoiceProfile
+
+from agent.text_out import TextOut
+from agent.tool_router import ToolRouter
+from agent.slow_llm import SlowLLM
+
+from memory.short_term import ShortTermMemory
+from memory.long_term import LongTermMemory
+from memory.compressor import MemoryCompressor
+
+from safety.guard import SafetyGuard
+
+from interfaces.cli import CLIInterface
+from interfaces.websocket_server import WebSocketServer
+from interfaces.api import APIServer
+
+logger = logging.getLogger("main")
+
+REQUIRED_CONFIG_KEYS = (
+    "persona", "models", "audio", "backchannel", "memory", "agent", "safety", "server"
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION & LOGGING
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+def load_config(config_path: str) -> dict:
+    """Load and validate the YAML configuration file."""
+    path = Path(config_path)
+    if not path.exists():
+        logging.error("Config file not found: %s", config_path)
+        sys.exit(1)
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+        config = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        logging.error("Failed to parse YAML config: %s", exc)
+        sys.exit(1)
+
+    if config is None:
+        logging.error("Config file is empty: %s", config_path)
+        sys.exit(1)
+
+    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in config]
+    if missing:
+        logging.error("Missing required config keys: %s", ", ".join(missing))
+        sys.exit(1)
+
+    return config
+
+
+def setup_logging(level: str = "INFO") -> None:
+    """Configure structured logging for all modules."""
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Quiet noisy third-party loggers
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("chromadb").setLevel(logging.WARNING)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="VoxCore — Full-Duplex Conversational AI"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default="config.yaml",
+        help="Path to config.yaml",
+    )
+    parser.add_argument(
+        "--interface", "-i",
+        type=str,
+        choices=["cli", "server", "both"],
+        default="cli",
+        help="Which interface to launch",
+    )
+    parser.add_argument(
+        "--log-level", "-l",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity",
+    )
+    parser.add_argument(
+        "--no-mic",
+        action="store_true",
+        help="Disable mic for headless/testing mode",
+    )
+    return parser.parse_args()
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# SYSTEM INITIALIZATION
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+async def initialize_system(
+    config: dict, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Instantiate every module in dependency order and return a dict of them."""
+
+    logger.info("Initializing VoxCore system...")
+
+    # ── Core ─────────────────────────────────────────────────────────────────
+    event_bus = EventBus()
+    session = Session(config=config["persona"], event_bus=event_bus)
+    voice_profile = VoiceProfile(config=config)
+
+    # ── Input ────────────────────────────────────────────────────────────────
+    mic_stream = MicStream(
+        event_bus=event_bus,
+        config=config["audio"],
+    )
+    vad = VADProcessor(
+        event_bus=event_bus, mic_stream=mic_stream, config=config["audio"]
+    )
+    stt = STTClient(event_bus=event_bus, config=config["models"])
+    text_injector = TextInjector(session=session, event_bus=event_bus)
+    interruption_detector = InterruptionDetector(
+        session=session,
+        event_bus=event_bus,
+        mic_stream=mic_stream,
+        vad=vad,
+        config=config["audio"],
+    )
+
+    # ── Brain ────────────────────────────────────────────────────────────────
+    llm_client = LLMClient(event_bus=event_bus, config=config["models"])
+    prompt_builder = PromptBuilder(config=config["persona"])
+    response_parser = ResponseParser(event_bus=event_bus)
+    emotion_tagger = EmotionTagger()
+    brain_router = BrainRouter(config=config["models"])
+
+    # ── Output ───────────────────────────────────────────────────────────────
+    tts_client = TTSClient(
+        event_bus=event_bus,
+        voice_profile=voice_profile,
+        config=config["models"],
+    )
+    audio_player = AudioPlayer(
+        session=session, event_bus=event_bus, config=config["audio"]
+    )
+
+    # ── Agent ────────────────────────────────────────────────────────────────
+    text_out = TextOut(
+        session=session, event_bus=event_bus, config=config.get("agent", {})
+    )
+    slow_llm = SlowLLM(
+        llm_client=llm_client,
+        brain_router=brain_router,
+        text_injector=text_injector,
+        event_bus=event_bus,
+    )
+    tool_router = ToolRouter(
+        event_bus=event_bus,
+        text_injector=text_injector,
+        config=config.get("agent", {}),
+    )
+
+    # ── Memory ───────────────────────────────────────────────────────────────
+    short_term_memory = ShortTermMemory(
+        event_bus=event_bus,
+        max_turns=config.get("memory", {}).get("short_term_turns", 20),
+    )
+    long_term_memory = LongTermMemory(
+        event_bus=event_bus, config=config.get("memory")
+    )
+    compressor = MemoryCompressor(
+        event_bus=event_bus, llm_client=llm_client
+    )
+
+    # ── Safety ───────────────────────────────────────────────────────────────
+    safety_guard = SafetyGuard(
+        event_bus=event_bus,
+        api_key=os.environ.get("GROQ_API_KEY", ""),
+        enabled=config.get("safety", {}).get("enabled", True),
+    )
+
+    # ── Backchannel ──────────────────────────────────────────────────────────
+    cue_detector = CueDetector(
+        session=session,
+        event_bus=event_bus,
+        mic_stream=mic_stream,
+        config=config.get("backchannel", {}),
+    )
+    backchannel_selector = BackchannelSelector(
+        session=session,
+        event_bus=event_bus,
+        config=config.get("backchannel", {}),
+    )
+
+    # ── Turn Manager (last — orchestrates everything) ────────────────────────
+    turn_manager = TurnManager(
+        session=session,
+        event_bus=event_bus,
+        llm_client=llm_client,
+        prompt_builder=prompt_builder,
+        response_parser=response_parser,
+        brain_router=brain_router,
+        safety_guard=safety_guard,
+        config=config,
+    )
+
+    # ── Long-term memory: restore context ────────────────────────────────────
+    mem_cfg = config.get("memory", {})
+    if mem_cfg.get("long_term_enabled", False):
+        try:
+            await long_term_memory.initialize()
+            past = await long_term_memory.query(
+                "session context", top_k=3
+            )
+            if past:
+                logger.info(
+                    "Restored %d context items from long-term memory", len(past)
+                )
+        except Exception as exc:
+            logger.warning("Could not restore long-term context: %s", exc)
+
+    logger.info("All modules initialized.")
+
+    return {
+        "event_bus": event_bus,
+        "session": session,
+        "turn_manager": turn_manager,
+        "mic_stream": mic_stream,
+        "vad": vad,
+        "stt": stt,
+        "text_injector": text_injector,
+        "interruption_detector": interruption_detector,
+        "cue_detector": cue_detector,
+        "backchannel_selector": backchannel_selector,
+        "llm_client": llm_client,
+        "prompt_builder": prompt_builder,
+        "response_parser": response_parser,
+        "emotion_tagger": emotion_tagger,
+        "brain_router": brain_router,
+        "tts_client": tts_client,
+        "audio_player": audio_player,
+        "voice_profile": voice_profile,
+        "text_out": text_out,
+        "tool_router": tool_router,
+        "slow_llm": slow_llm,
+        "short_term_memory": short_term_memory,
+        "long_term_memory": long_term_memory,
+        "compressor": compressor,
+        "safety_guard": safety_guard,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PIPELINE RUNNER
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+async def run_pipeline(
+    modules: dict[str, Any],
+    config: dict,
+    args: argparse.Namespace,
+) -> None:
+    """Launch all concurrent async tasks in a supervised task group."""
+
+    tasks: list[asyncio.Task] = []
+
+    # ── Core pipeline tasks ──────────────────────────────────────────────────
+    tasks.append(asyncio.create_task(modules["mic_stream"].run(), name="mic_stream"))
+    tasks.append(asyncio.create_task(modules["vad"].run(), name="vad"))
+    tasks.append(asyncio.create_task(modules["stt"].run(), name="stt"))
+    tasks.append(asyncio.create_task(modules["turn_manager"].run(), name="turn_manager"))
+    tasks.append(asyncio.create_task(modules["audio_player"].run(), name="audio_player"))
+    tasks.append(asyncio.create_task(
+        modules["interruption_detector"].run(), name="interruption_detector"
+    ))
+    tasks.append(asyncio.create_task(modules["text_out"].run(), name="text_out"))
+    tasks.append(asyncio.create_task(modules["tool_router"].run(), name="tool_router"))
+    tasks.append(asyncio.create_task(modules["safety_guard"].run(), name="safety_guard"))
+
+    # ── Backchannel (conditional) ────────────────────────────────────────────
+    bc_cfg = config.get("backchannel", {})
+    if bc_cfg.get("enabled", True):
+        tasks.append(asyncio.create_task(
+            modules["cue_detector"].run(), name="cue_detector"
+        ))
+        tasks.append(asyncio.create_task(
+            modules["backchannel_selector"].run(), name="backchannel_selector"
+        ))
+
+    # ── Interfaces ───────────────────────────────────────────────────────────
+    if args.interface in ("cli", "both"):
+        cli = CLIInterface(
+            event_bus=modules["event_bus"],
+            session=modules["session"],
+            text_mode=args.no_mic,
+            verbose=args.log_level == "DEBUG",
+        )
+        modules["cli"] = cli
+        tasks.append(asyncio.create_task(cli.run(), name="cli"))
+
+    if args.interface in ("server", "both"):
+        from fastapi import FastAPI
+
+        app = FastAPI(title="VoxCore", version="0.1.0")
+
+        ws_server = WebSocketServer(
+            event_bus=modules["event_bus"],
+            session=modules["session"],
+            app=app,
+        )
+        api_server = APIServer(
+            event_bus=modules["event_bus"],
+            session=modules["session"],
+            short_term=modules["short_term_memory"],
+            long_term=modules["long_term_memory"],
+            safety=modules["safety_guard"],
+            voice_profile=modules["voice_profile"],
+            app=app,
+        )
+        modules["ws_server"] = ws_server
+        modules["api_server"] = api_server
+
+        # Setup API routes (WebSocket routes set up inside start)
+        api_server.setup_routes()
+        ws_server.setup_routes()
+
+        srv_cfg = config.get("server", {})
+        host = srv_cfg.get("host", "0.0.0.0")
+        port = srv_cfg.get("port", 8765)
+
+        import uvicorn
+
+        uvi_config = uvicorn.Config(
+            app, host=host, port=port, log_level="info"
+        )
+        server = uvicorn.Server(uvi_config)
+        tasks.append(asyncio.create_task(server.serve(), name="uvicorn"))
+
+    logger.info("Pipeline running with %d tasks.", len(tasks))
+
+    # ── Wait for first failure or forever ────────────────────────────────────
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+
+    # Check for exceptions
+    for task in done:
+        if task.exception():
+            logger.error(
+                "Task '%s' raised: %s", task.get_name(), task.exception()
+            )
+
+    # Cancel remaining tasks
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# SHUTDOWN
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+async def shutdown(modules: dict[str, Any]) -> None:
+    """Gracefully shut down all modules and release resources."""
+    logger.info("Shutting down VoxCore...")
+
+    # Persist session state
+    try:
+        if hasattr(modules.get("session"), "save"):
+            await modules["session"].save() if asyncio.iscoroutinefunction(
+                getattr(modules["session"], "save", None)
+            ) else modules["session"].save()
+    except Exception as exc:
+        logger.warning("Session save error: %s", exc)
+
+    # Save to long-term memory
+    try:
+        ltm = modules.get("long_term_memory")
+        if ltm and hasattr(ltm, "save_session"):
+            await ltm.save_session()
+    except Exception as exc:
+        logger.warning("Long-term memory save error: %s", exc)
+
+    # Close mic stream
+    try:
+        mic = modules.get("mic_stream")
+        if mic and hasattr(mic, "close"):
+            mic.close() if not asyncio.iscoroutinefunction(mic.close) else await mic.close()
+    except Exception as exc:
+        logger.warning("Mic close error: %s", exc)
+
+    # Close WebSocket connections
+    try:
+        ws = modules.get("ws_server")
+        if ws and hasattr(ws, "_connections"):
+            for conn_id, websocket in list(ws._connections.items()):
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+            ws._connections.clear()
+    except Exception as exc:
+        logger.warning("WebSocket close error: %s", exc)
+
+    # Cancel all remaining tasks
+    for task in asyncio.all_tasks():
+        if task is not asyncio.current_task():
+            task.cancel()
+
+    logger.info("VoxCore shutdown complete.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# ASYNC MAIN & ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════════
+
+
+async def async_main(config: dict, args: argparse.Namespace) -> None:
+    """Top-level async orchestrator: init → run → shutdown."""
+    modules: dict[str, Any] = {}
+    try:
+        modules = await initialize_system(config, args)
+        await run_pipeline(modules, config, args)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Received shutdown signal.")
+    except Exception:
+        logger.exception("Unexpected error in pipeline")
+    finally:
+        if modules:
+            await shutdown(modules)
+
+
+def main() -> None:
+    """Entry point for VoxCore."""
+    load_dotenv()
+    args = parse_args()
+    setup_logging(args.log_level)
+    config = load_config(args.config)
+
+    logger.info("VoxCore starting...")
+    logger.info("Interface: %s | Mic: %s | Log level: %s",
+                args.interface, "disabled" if args.no_mic else "enabled", args.log_level)
+
+    # Register signal handlers for graceful shutdown
+    loop = asyncio.new_event_loop()
+
+    def _signal_handler() -> None:
+        logger.info("Signal received, shutting down...")
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            signal.signal(sig, lambda s, f: _signal_handler())
+
+    try:
+        loop.run_until_complete(async_main(config, args))
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

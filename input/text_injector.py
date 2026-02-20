@@ -168,7 +168,7 @@ class TextInjector:
 
         await self.session.inject_text(content, priority, source)
 
-        self.event_bus.publish(
+        await self.event_bus.publish(
             EventType.TEXT_INJECTED,
             {
                 "content": content,

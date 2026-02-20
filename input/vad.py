@@ -287,7 +287,7 @@ class VADProcessor:
                 self._audio_buffer = []
                 self._audio_buffer.append(chunk)
                 self._silence_start_time = 0.0
-                self.event_bus.publish(EventType.SPEECH_START, {})
+                await self.event_bus.publish(EventType.SPEECH_START, {})
                 self._logger.info("Speech started")
         else:
             # ── Currently in a speech segment ──
@@ -308,7 +308,7 @@ class VADProcessor:
                     audio_bytes = self._buffer_to_bytes()
                     duration = time.time() - self._speech_start_time
 
-                    self.event_bus.publish(
+                    await self.event_bus.publish(
                         EventType.SPEECH_END,
                         {
                             "audio_buffer": audio_bytes,

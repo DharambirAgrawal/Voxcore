@@ -182,7 +182,7 @@ class InterruptionDetector:
         """Main loop: consume audio, check state, run VAD, check for interrupt."""
         self._audio_queue = self.mic_stream.add_consumer()
         # Wire up state change handler for clean reset on state transitions
-        self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)
+        self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)  # callback-style
 
         while True:
             chunk = await self._audio_queue.get()

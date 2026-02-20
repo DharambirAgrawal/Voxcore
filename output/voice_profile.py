@@ -8,8 +8,11 @@ PURPOSE:
     Simple configuration holder for the TTS voice settings. Loaded from
     config.yaml at startup and referenced by TTSClient and ClipGenerator.
 
-    Contains: chosen Orpheus voice name, default emotion tag, sample rates,
-    response format, and any voice-specific settings.
+    Contains: chosen Kokoro-ONNX voice ID, default emotion tag (for LLM prompt),
+    sample rate (24kHz for Kokoro), response format, and any voice-specific settings.
+
+    Voice clips are stored per-voice in backchannel/clips/<voice_shortname>/
+    (e.g. backchannel/clips/heart/ for af_heart).
 
 ═══════════════════════════════════════════════════════════════════════════════════
 IMPORTS REQUIRED:
@@ -22,9 +25,24 @@ import logging                          # Module logger
 CONSTANTS:
 ═══════════════════════════════════════════════════════════════════════════════════
 
-AVAILABLE_VOICES_EN = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
-AVAILABLE_VOICES_AR = ["fahad", "sultan", "lulwa", "noura"]
+# Kokoro-ONNX voice IDs — organized by accent/gender prefix
+AVAILABLE_VOICES = [
+    # American Female
+    "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
+    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+    # American Male
+    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+    "am_michael", "am_onyx", "am_puck",
+    # British Female
+    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+    # British Male
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+]
 
+DEFAULT_VOICE = "af_heart"
+
+# Emotion tags are still used in LLM prompts for context,
+# but are STRIPPED before passing text to Kokoro TTS
 VALID_EMOTIONS = [
     "cheerful", "calm", "concerned", "excited", "empathetic",
     "curious", "surprised", "sad", "angry", "whisper", "laugh"
@@ -42,22 +60,26 @@ CLASS: VoiceProfile
     CONSTRUCTOR: __init__(self, config: dict)
     ─────────────────────────────────────────────────────────────
         INPUTS:
-            - config: dict — The "persona" section from config.yaml:
-                - voice: str ("tara")
+            - config: dict — Full config.yaml dict containing:
+              persona:
+                - voice: str ("af_heart")
                 - language: str ("en")
-              AND the "audio" section:
-                - output_sample_rate: int (48000)
-        
+              audio:
+                - output_sample_rate: int (24000)
+              models:
+                - tts_model: str ("models/kokoro-v1.0.onnx")
+                - tts_voices: str ("models/voices-v1.0.bin")
+
         INITIALIZES:
-            self.voice_name: str         = config["persona"].get("voice", "tara")
+            self.voice_name: str         = config["persona"].get("voice", "af_heart")
             self.language: str           = config["persona"].get("language", "en")
-            self.sample_rate: int        = config["audio"].get("output_sample_rate", 48000)
-            self.response_format: str    = "wav"          # Orpheus output format
-            self.default_emotion: str    = "calm"         # Default emotion when none specified
-            
+            self.sample_rate: int        = config["audio"].get("output_sample_rate", 24000)
+            self.response_format: str    = "wav"
+            self.default_emotion: str    = "calm"
+            self.tts_model_path: str     = config.get("models", {}).get("tts_model", "models/kokoro-v1.0.onnx")
+            self.tts_voices_path: str    = config.get("models", {}).get("tts_voices", "models/voices-v1.0.bin")
+
             self._logger: logging.Logger = logging.getLogger("VoiceProfile")
-            
-            # Validate voice name
             self._validate()
 
     METHODS:
@@ -65,24 +87,18 @@ CLASS: VoiceProfile
 
     def _validate(self) -> None
         INPUTS: None
-        OUTPUT: None (raises ValueError on invalid config)
+        OUTPUT: None
         WHAT IT DOES:
-            1. If self.language == "en":
-               If self.voice_name not in AVAILABLE_VOICES_EN:
-                   Log warning: "Unknown voice '{voice}'. Available: {AVAILABLE_VOICES_EN}"
-                   self.voice_name = "tara"  # Fall back to default
-            2. If self.language == "ar":
-               If self.voice_name not in AVAILABLE_VOICES_AR:
-                   Log warning: "Unknown Arabic voice. Available: {AVAILABLE_VOICES_AR}"
-                   self.voice_name = "fahad"
+            1. If self.voice_name not in AVAILABLE_VOICES:
+               Log warning: "Unknown Kokoro voice '{voice}'. Available: {AVAILABLE_VOICES}"
+               self.voice_name = DEFAULT_VOICE
 
-    def get_tts_model(self) -> str
+    def get_clips_subdir(self) -> str
         INPUTS: None
-        OUTPUT: str — The appropriate Orpheus model for the language
+        OUTPUT: str — The voice short-name for clips subdirectory
         WHAT IT DOES:
-            If self.language == "ar":
-                return "canopylabs/orpheus-arabic-saudi"
-            return "canopylabs/orpheus-v1-english"
+            Extract short name from voice ID (e.g. "af_heart" → "heart")
+            return self.voice_name.split("_", 1)[1] if "_" in self.voice_name else self.voice_name
 
     def to_dict(self) -> dict
         INPUTS: None
@@ -94,15 +110,17 @@ CLASS: VoiceProfile
                 "sample_rate": self.sample_rate,
                 "response_format": self.response_format,
                 "default_emotion": self.default_emotion,
-                "tts_model": self.get_tts_model(),
+                "tts_engine": "kokoro-onnx",
+                "tts_model_path": self.tts_model_path,
+                "clips_subdir": self.get_clips_subdir(),
             }
 
-    def update(self, voice: str = None, language: str = None, 
+    def update(self, voice: str = None, language: str = None,
                default_emotion: str = None) -> None
         INPUTS:
-            - voice: str — New voice name (optional)
+            - voice: str — New Kokoro voice ID (optional)
             - language: str — New language (optional)
-            - default_emotion: str — New default emotion (optional)
+            - default_emotion: str — New default emotion for LLM prompts (optional)
         OUTPUT: None
         WHAT IT DOES:
             1. If voice: self.voice_name = voice
@@ -110,16 +128,22 @@ CLASS: VoiceProfile
             3. If default_emotion and default_emotion in VALID_EMOTIONS:
                self.default_emotion = default_emotion
             4. self._validate()
-        
-        Used for hot-reloading voice settings via the API endpoint.
 
 ═══════════════════════════════════════════════════════════════════════════════════
 EXPORTS:
-    - VoiceProfile          (class)
-    - AVAILABLE_VOICES_EN   (list constant)
-    - AVAILABLE_VOICES_AR   (list constant)
-    - VALID_EMOTIONS        (list constant)
+    - VoiceProfile       (class)
+    - AVAILABLE_VOICES   (list constant)
+    - DEFAULT_VOICE      (str constant)
+    - VALID_EMOTIONS     (list constant)
 ═══════════════════════════════════════════════════════════════════════════════════
+
+NOTES:
+    - Kokoro-ONNX outputs 24kHz WAV audio (not 48kHz like Groq Orpheus)
+    - Clips are stored per-voice: backchannel/clips/<voice_shortname>/
+      e.g. backchannel/clips/heart/ for af_heart
+    - Switching voices requires re-running backchannel/generator.py
+    - Download model files from:
+      https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files
 """
 
 
@@ -128,8 +152,20 @@ from typing import Optional
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-AVAILABLE_VOICES_EN = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
-AVAILABLE_VOICES_AR = ["fahad", "sultan", "lulwa", "noura"]
+AVAILABLE_VOICES = [
+    # American Female
+    "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
+    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+    # American Male
+    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+    "am_michael", "am_onyx", "am_puck",
+    # British Female
+    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+    # British Male
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+]
+
+DEFAULT_VOICE = "af_heart"
 
 VALID_EMOTIONS = [
     "cheerful", "calm", "concerned", "excited", "empathetic",
@@ -141,36 +177,32 @@ class VoiceProfile:
     """Holds all voice-related configuration for the current persona."""
 
     def __init__(self, config: dict) -> None:
-        self.voice_name: str = config.get("persona", {}).get("voice", "tara")
+        self.voice_name: str = config.get("persona", {}).get("voice", DEFAULT_VOICE)
         self.language: str = config.get("persona", {}).get("language", "en")
-        self.sample_rate: int = config.get("audio", {}).get("output_sample_rate", 48000)
+        self.sample_rate: int = config.get("audio", {}).get("output_sample_rate", 24000)
         self.response_format: str = "wav"
         self.default_emotion: str = "calm"
+        self.tts_model_path: str = config.get("models", {}).get("tts_model", "models/kokoro-v1.0.onnx")
+        self.tts_voices_path: str = config.get("models", {}).get("tts_voices", "models/voices-v1.0.bin")
 
         self._logger: logging.Logger = logging.getLogger("VoiceProfile")
 
         self._validate()
 
     def _validate(self) -> None:
-        """Validate voice name against available voices for the selected language."""
-        if self.language == "en":
-            if self.voice_name not in AVAILABLE_VOICES_EN:
-                self._logger.warning(
-                    "Unknown voice '%s'. Available: %s", self.voice_name, AVAILABLE_VOICES_EN
-                )
-                self.voice_name = "tara"
-        elif self.language == "ar":
-            if self.voice_name not in AVAILABLE_VOICES_AR:
-                self._logger.warning(
-                    "Unknown Arabic voice '%s'. Available: %s", self.voice_name, AVAILABLE_VOICES_AR
-                )
-                self.voice_name = "fahad"
+        """Validate voice name against available Kokoro voices."""
+        if self.voice_name not in AVAILABLE_VOICES:
+            self._logger.warning(
+                "Unknown Kokoro voice '%s'. Available: %s. Falling back to '%s'.",
+                self.voice_name, AVAILABLE_VOICES, DEFAULT_VOICE,
+            )
+            self.voice_name = DEFAULT_VOICE
 
-    def get_tts_model(self) -> str:
-        """Return the appropriate Orpheus model for the configured language."""
-        if self.language == "ar":
-            return "canopylabs/orpheus-arabic-saudi"
-        return "canopylabs/orpheus-v1-english"
+    def get_clips_subdir(self) -> str:
+        """Return voice short-name for clips subdirectory (e.g. 'heart' from 'af_heart')."""
+        if "_" in self.voice_name:
+            return self.voice_name.split("_", 1)[1]
+        return self.voice_name
 
     def to_dict(self) -> dict:
         """Return all voice settings as a dictionary."""
@@ -180,7 +212,9 @@ class VoiceProfile:
             "sample_rate": self.sample_rate,
             "response_format": self.response_format,
             "default_emotion": self.default_emotion,
-            "tts_model": self.get_tts_model(),
+            "tts_engine": "kokoro-onnx",
+            "tts_model_path": self.tts_model_path,
+            "clips_subdir": self.get_clips_subdir(),
         }
 
     def update(

@@ -4,7 +4,7 @@
 VOXCORE
 Full-Duplex Conversational AI System
 
-PersonaPlex-Inspired Architecture Using 100% Groq APIs
+PersonaPlex-Inspired Architecture Using Groq APIs + Local Kokoro-ONNX TTS
 
 
 Complete Engineering Blueprint  |  February 2026
@@ -28,8 +28,8 @@ Agentic JSON output	❌	✅
 Text-in injection	❌	✅
 Tool calling / agent tasks	❌	✅
 Memory across sessions	❌	✅
-Free to run	❌ (7B GPU required)	✅ (Groq free tier)
-Emotional TTS tags	Native	Via [cheerful] / [sad] tags
+Free to run	❌ (7B GPU required)	✅ (Groq free tier + local Kokoro TTS)
+Emotional TTS tags	Native	Via punctuation & voice style (Kokoro)
 
 
  2. Your Groq Resources & How We Use Each
@@ -55,12 +55,14 @@ meta-llama/llama-guard-4-12b	SAFETY LAYER — Input/output filtering	Runs async 
 LLM Routing Strategy
 The Fast Brain (llama-3.1-8b) handles ALL real-time speech responses — it's the only model in the hot path. When it detects a task in its output (<agent> tag), it routes to Kimi-K2 for tool execution. Complex reasoning goes to Scout-17B. The user never waits for the slower models — they run asynchronously and inject results back via text-in.
 
-2.3 Text-to-Speech (TTS)
-Model	Role in VoxCore	Details
-canopylabs/orpheus-v1-english	PRIMARY TTS — All English speech output	Supports [cheerful] [sad] [excited] etc. emotion tags. ~100 chars/sec. Sub-200ms TTFB. Voices: tara, leah, jess, leo, dan, mia, zac, zoe
-canopylabs/orpheus-arabic-saudi	ARABIC TTS — If Arabic persona needed	Authentic Saudi dialect. Voices: fahad, sultan, lulwa, noura
+2.3 Text-to-Speech (TTS) — Local Kokoro-ONNX
+Engine	Role in VoxCore	Details
+Kokoro-ONNX (local)	PRIMARY TTS — All speech output	Free, no API key, runs locally on CPU. 24kHz WAV output. 28 voices available. Model: kokoro-v1.0.onnx + voices-v1.0.bin
 
-Orpheus on Groq supports vocal direction tags inline. Example: "[excited] I found it! [calm] Let me explain what happened." This is how we fake emotional prosody without a joint model.
+Kokoro-ONNX is a local ONNX-based TTS engine. Unlike cloud APIs, it runs entirely on your machine with zero cost and no rate limits. It does NOT use bracket-style emotion tags ([cheerful] etc.) — instead, it infers prosody naturally from punctuation, phrasing, and the selected voice style. The LLM still generates emotion tags for analytics/logging, but TTSClient strips them before synthesis.
+
+Available voices: af_heart (default), af_bella, af_nicole, af_sarah, af_sky, am_adam, am_michael, bf_emma, bm_george, and 19 more.
+Download models from: https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files
 
 
  3. Full System Architecture
@@ -82,7 +84,7 @@ PIPELINE
                                          ↙            ↘
                              <speech text>      <agent JSON>
                                   │                   │
-                         [Orpheus TTS]         [Tool Router]
+                        [Kokoro-ONNX TTS]      [Tool Router]
 
 OUTPUTS
   🔊  Voice-Out   ◄──  [Streaming audio, sentence-by-sentence]
@@ -103,18 +105,18 @@ This is how we fake the "uh-huh" behavior from PersonaPlex without a joint model
 •	Cue Detector: A secondary audio analysis loop watches the user mic stream continuously
 •	Trigger Condition: When energy drops for 300-400ms mid-sentence (natural phrase boundary), it fires a backchannel event
 •	Selector: The Selector picks a context-appropriate clip based on conversation state — e.g. "mm-hmm" vs "oh interesting" vs "go on"
-•	Clips Bank: Pre-generated WAV clips using Orpheus TTS with your chosen persona voice, stored locally. Zero API calls needed at runtime.
+•	Clips Bank: Pre-generated WAV clips using Kokoro-ONNX with your chosen persona voice, stored locally per-voice in backchannel/clips/<voice_shortname>/. Zero API calls needed at runtime.
 •	Guard Conditions: Clips only fire if: agent is NOT speaking, user has been talking > 2 seconds, last backchannel was > 8 seconds ago
 
 Backchannel Clip Generation (One-Time Setup)
-Run the clip generator script once at startup/config time. It calls Groq Orpheus TTS to generate 15-20 short clips ("uh-huh", "yeah", "I see", "right", "okay go on", "interesting", "mm-hmm") in your chosen persona voice and saves them as WAV files. These play locally forever after at zero cost and zero latency.
+Run the clip generator script once at startup/config time. It uses local Kokoro-ONNX to generate 15-20 short clips ("uh-huh", "yeah", "I see", "right", "okay go on", "interesting", "mm-hmm") in your chosen persona voice and saves them as WAV files in backchannel/clips/<voice_shortname>/. Completely free, no API calls, no rate limits.
 
 3.4 Emotion-Aware TTS
-Orpheus supports inline vocal direction tags. VoxCore's LLM prompt instructs the fast brain to prefix emotional context to its speech output. Example LLM output:
+VoxCore's LLM prompt instructs the fast brain to prefix emotional context to its speech output. Example LLM output:
 
 [concerned] I see what you mean, that does sound frustrating. [calm] Let me check that for you right now.
 
-The response parser strips these tags and passes them to Orpheus as-is. No extra model needed — the fast brain handles emotion detection as part of its response generation.
+The TTSClient strips these bracket tags before passing text to Kokoro-ONNX (Kokoro does not use inline emotion tags). Kokoro infers prosody naturally from punctuation and voice style. The tags are still useful for logging, analytics, and the EmotionTagger fallback system.
 
 
  4. Complete Folder Structure
@@ -144,15 +146,16 @@ voxcore/
 │   ├── __init__.py
 │   ├── cue_detector.py             # Phrase boundary detection (energy + pause)
 │   ├── selector.py                 # Picks clip by context (agreement/surprise/filler)
-│   ├── generator.py                # One-time Orpheus TTS clip generation script
-│   └── clips/                      # Pre-generated WAV files (persona voice)
-│       ├── uh_huh.wav
-│       ├── yeah.wav
-│       ├── i_see.wav
-│       ├── go_on.wav
-│       ├── interesting.wav
-│       ├── right.wav
-│       └── mm_hmm.wav
+│   ├── generator.py                # One-time Kokoro-ONNX clip generation script
+│   └── clips/                      # Pre-generated WAV files (per-voice subdirs)
+│       └── heart/                  # Clips for af_heart voice
+│           ├── uh_huh.wav
+│           ├── yeah.wav
+│           ├── i_see.wav
+│           ├── go_on.wav
+│           ├── interesting.wav
+│           ├── right.wav
+│           └── mm_hmm.wav
 │
 ├── brain/
 │   ├── __init__.py
@@ -164,9 +167,9 @@ voxcore/
 │
 ├── output/
 │   ├── __init__.py
-│   ├── tts_client.py               # Groq Orpheus streaming TTS client
+│   ├── tts_client.py               # Kokoro-ONNX local TTS client
 │   ├── audio_player.py             # Streams WAV chunks to speaker (interruptible)
-│   └── voice_profile.py            # Holds voice name, emotion defaults, sample rate
+│   └── voice_profile.py            # Holds Kokoro voice ID, emotion defaults, sample rate
 │
 ├── agent/
 │   ├── __init__.py
@@ -224,7 +227,7 @@ Runs a secondary energy analysis on the raw mic stream (not STT transcripts — 
 backchannel/selector.py
 Subscribes to BACKCHANNEL_OPPORTUNITY. Uses a weighted random selection to pick from the clips bank based on context: after a question → "mm-hmm" or "right", after surprising info → "oh interesting" or "wow", during long monologue → "yeah" or "go on", general filler → "uh-huh" or "I see". Guards: minimum 8s between backchannels, never during SPEAKING or THINKING, never in first 2 seconds of user speech.
 backchannel/generator.py
-A one-time setup script. Calls Groq Orpheus TTS with the configured persona voice to generate all 15-20 backchannel clips. Saves them as WAV files in backchannel/clips/. Re-run if you change the persona voice. This script is not part of the runtime — it just populates the clips directory.
+A one-time setup script. Uses local Kokoro-ONNX with the configured persona voice to generate all 15-20 backchannel clips. Saves them as WAV files in backchannel/clips/<voice_shortname>/ (e.g. clips/heart/ for af_heart). Re-run if you change the persona voice. This script is not part of the runtime — it just populates the clips directory. Free, no API calls, no rate limits.
 
 brain/ — The Mind
 brain/llm_client.py
@@ -234,17 +237,17 @@ Assembles the full message array for every LLM call. Structure: (1) System messa
 brain/response_parser.py
 Consumes the streaming token output from llm_client. Maintains two output buffers simultaneously. Speech buffer: accumulates tokens for TTS, fires LLM_SPEECH_TOKEN events sentence-by-sentence (split on . ? !). Agent buffer: watches for <agent> opening tag, captures everything until </agent>, parses as JSON, fires LLM_AGENT_TAG event. Both buffers are flushed in real-time — TTS starts before the LLM finishes.
 brain/emotion_tagger.py
-A lightweight post-processor on speech tokens. If the LLM output does not contain an emotion tag in the first sentence, infers one based on content keywords and appends it. Example: "I'm sorry to hear that" → prepend "[empathetic]". This ensures Orpheus always gets emotional context even when the LLM forgets to include it.
+A lightweight post-processor on speech tokens. If the LLM output does not contain an emotion tag in the first sentence, infers one based on content keywords and appends it. Example: "I'm sorry to hear that" → prepend "[empathetic]". Note: Kokoro-ONNX does not process these tags — TTSClient strips them before synthesis. The tags are still useful for analytics and logging.
 brain/router.py
 Decides which LLM to use based on the detected task type. Conversational reply → llama-3.1-8b-instant (always). Tool execution → kimi-k2-instruct (via agent/slow_llm.py, async). Multi-step reasoning → llama-4-scout-17b. Long document analysis → qwen3-32b. Maximum intelligence → gpt-oss-120b (rate-limited, reserved). The fast brain always responds first with a brief spoken acknowledgment; heavy tasks run in background.
 
 output/ — The Voice
 output/tts_client.py
-Calls Groq Orpheus TTS API. On each LLM_SPEECH_TOKEN event (one sentence at a time), submits the sentence with emotion tag to Orpheus. Uses response streaming to start playing audio before the full sentence is synthesized. Manages a WebSocket connection pool to avoid repeated TLS handshakes (key for low latency). Target: < 200ms time-to-first-audio-byte.
+Local Kokoro-ONNX TTS client. On each LLM_SPEECH_TOKEN event (one sentence at a time), strips any bracket emotion tags with regex, then synthesizes via Kokoro locally. Uses asyncio.run_in_executor() for CPU-bound synthesis to avoid blocking the event loop. Outputs 24kHz WAV audio. No API calls, no rate limits, no network latency.
 output/audio_player.py
 An asyncio-driven audio player using sounddevice output stream. Consumes WAV chunks from tts_client as they arrive. Maintains a play queue. Critical: subscribes to INTERRUPT_DETECTED events — on interrupt, immediately empties the play queue and cancels the current chunk. Does NOT kill mid-word; waits for the current 20ms audio frame to finish for clean cutoff.
 output/voice_profile.py
-Simple config holder: chosen Orpheus voice name (e.g. "tara"), default emotion if none provided, sample rate (48kHz for Groq Orpheus), response format ("wav"), and any voice-specific quirks. Load from config.yaml at startup.
+Simple config holder: chosen Kokoro voice ID (e.g. "af_heart"), default emotion for LLM prompts, sample rate (24kHz for Kokoro-ONNX), response format ("wav"), model/voices file paths. Load from config.yaml at startup.
 
 agent/ — The Hands
 agent/text_out.py
@@ -287,8 +290,8 @@ persona:
     When you need to perform a task, include ONLY in your output:
     <agent>{"action": "tool_name", "params": {...}}</agent>
     Do NOT describe the tool call in your speech. Just say 'On it' or 'Let me check'.
-  voice: "tara"                    # Orpheus voice: tara/leah/jess/leo/dan/mia/zac/zoe
-  language: "en"                   # en or ar
+  voice: "af_heart"                # Kokoro voice ID (af_heart, af_bella, am_adam, etc.)
+  language: "en"
 
 models:
   stt_primary: "whisper-large-v3-turbo"
@@ -298,7 +301,8 @@ models:
   llm_agentic: "moonshotai/kimi-k2-instruct"
   llm_deep: "qwen/qwen3-32b"
   llm_power: "openai/gpt-oss-120b"
-  tts: "canopylabs/orpheus-v1-english"
+  tts_model: "models/kokoro-v1.0.onnx"       # Local Kokoro-ONNX model
+  tts_voices: "models/voices-v1.0.bin"        # Kokoro voice embeddings
   safety: "meta-llama/llama-guard-4-12b"
 
 audio:
@@ -313,7 +317,7 @@ backchannel:
   min_pause_ms: 350               # Phrase boundary detection sensitivity
   min_gap_between_s: 8            # Minimum seconds between backchannels
   min_user_speech_s: 2            # User must speak this long before backchannel fires
-  clips_dir: "backchannel/clips/"
+  clips_dir: "backchannel/clips/heart/"   # Per-voice subdirectory
 
 memory:
   short_term_turns: 20
@@ -343,7 +347,9 @@ server:
  7. Dependencies & Installation
 
 Package	Version	Purpose
-groq	latest	Groq SDK — STT, LLM, TTS all in one
+groq	latest	Groq SDK — STT + LLM (not TTS)
+kokoro-onnx	0.4+	Local ONNX-based TTS engine (free, no API key)
+soundfile	0.12+	WAV file I/O for Kokoro TTS output
 sounddevice	0.4.x	Mic capture and audio playback
 silero-vad / pysilero-vad	latest	Voice activity detection (CPU, <1ms/frame)
 librosa	0.10.x	Audio analysis for backchannel cue detection
@@ -374,7 +380,7 @@ VAD end-of-turn detection	Silero VAD (local)	~400ms (silence window)
 STT transcription	Groq whisper-turbo	~200ms (Groq is fast)
 LLM first token	llama-3.1-8b-instant on Groq	~100-200ms TTFT
 First sentence buffer	response_parser.py	~50ms (5-8 words)
-TTS first audio byte	Groq Orpheus	~150-200ms TTFB
+TTS synthesis	Kokoro-ONNX (local)	~50-100ms (no network)
 Audio playback start	sounddevice	~10ms
 TOTAL end-to-end	Full pipeline	~910-1060ms
 
@@ -387,7 +393,7 @@ This is the flow when VoxCore needs to perform a task rather than just talk:
 Step	What Happens	Model Used
 1. User speaks	"What's the weather like in London?"	STT: whisper-turbo
 2. Fast brain responds	Speaks: "[curious] Sure, let me check that for you." Outputs: <agent>{"action": "web_search", "query": "London weather today"}</agent>	llama-3.1-8b-instant
-3. TTS plays acknowledgment	User hears response immediately, no waiting	Orpheus TTS
+3. TTS plays acknowledgment	User hears response immediately, no waiting	Kokoro-ONNX TTS (local)
 4. Tool executes async	tool_router.py calls web_search.py in background	N/A
 5. Result injected	text_injector.inject("London: 12°C, cloudy, light rain", priority='high')	N/A
 6. Next turn picks it up	Fast brain gets the context and speaks the result naturally	llama-3.1-8b-instant

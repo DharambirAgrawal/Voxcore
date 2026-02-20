@@ -335,8 +335,8 @@ class SafetyGuard:
             self._logger.info("SafetyGuard disabled")
             return
 
-        transcript_queue: asyncio.Queue = self._bus.subscribe(EventType.TRANSCRIPT)
-        llm_sentence_queue: asyncio.Queue = self._bus.subscribe(EventType.LLM_SENTENCE)
+        transcript_queue: asyncio.Queue = self._bus.subscribe(EventType.TRANSCRIPT_READY)
+        llm_sentence_queue: asyncio.Queue = self._bus.subscribe(EventType.LLM_STREAM_DONE)
 
         self._logger.info("SafetyGuard active with Llama Guard 4")
 
@@ -358,7 +358,7 @@ class SafetyGuard:
         result = await self.check(text, direction="input")
         if result.verdict == SafetyVerdict.UNSAFE:
             await self._bus.publish(
-                EventType.SAFETY_FLAG,
+                EventType.SAFETY_FLAGGED,
                 {
                     "direction": "input",
                     "text": text,
@@ -374,7 +374,7 @@ class SafetyGuard:
         result = await self.check(text, direction="output")
         if result.verdict == SafetyVerdict.UNSAFE:
             await self._bus.publish(
-                EventType.SAFETY_FLAG,
+                EventType.SAFETY_FLAGGED,
                 {
                     "direction": "output",
                     "text": text,

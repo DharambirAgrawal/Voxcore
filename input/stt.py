@@ -272,7 +272,7 @@ class STTClient:
             if not transcript or not transcript.strip():
                 continue
 
-            self.event_bus.publish(
+            await self.event_bus.publish(
                 EventType.TRANSCRIPT_READY,
                 {
                     "text": transcript,

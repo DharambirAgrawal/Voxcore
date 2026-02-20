@@ -84,7 +84,7 @@ CLASS: Session
             - config: dict — The "persona" section from config.yaml containing:
                 - name: str (persona name)
                 - system_prompt: str (full system prompt)
-                - voice: str (Orpheus voice name)
+                - voice: str (Kokoro voice ID, e.g. "af_heart")
                 - language: str ("en" or "ar")
             - event_bus: EventBus — The shared event bus instance
         
@@ -215,7 +215,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Any
 
-from core.event_bus import EventBus
+from core.event_bus import EventBus, EventType
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,11 @@ class Session:
         async with self._lock:
             old = self.state
             self.state = new_state
-        await self.event_bus.publish("STATE_CHANGED", {"state": new_state.value})
+        await self.event_bus.publish(EventType.STATE_CHANGED, {
+            "state": new_state.value,
+            "old_state": old.value,
+            "new_state": new_state.value,
+        })
         logger.info("State: %s → %s", old.value, new_state.value)
 
     # ── history management ─────────────────────────────────────────────────
@@ -323,7 +327,7 @@ class Session:
             timestamp=time.time(),
         )
         self.text_in_queue.append(entry)
-        await self.event_bus.publish("TEXT_INJECTED", {"source": source})
+        await self.event_bus.publish(EventType.TEXT_INJECTED, {"source": source})
 
     def flush_text_in(self) -> list[TextInEntry]:
         entries = list(self.text_in_queue)

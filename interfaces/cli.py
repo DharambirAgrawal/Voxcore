@@ -283,17 +283,17 @@ class CLIInterface:
         print(_BANNER)
 
         # 2. Subscribe to key events
-        self._bus.subscribe(EventType.STATE_CHANGE, self._on_state_change)
-        self._bus.subscribe(EventType.TRANSCRIPT, self._on_transcript)
-        self._bus.subscribe(EventType.LLM_SENTENCE, self._on_llm_sentence)
+        self._bus.subscribe(EventType.STATE_CHANGED, self._on_state_change)
+        self._bus.subscribe(EventType.TRANSCRIPT_READY, self._on_transcript)
+        self._bus.subscribe(EventType.LLM_STREAM_DONE, self._on_llm_sentence)
         if self._verbose:
-            self._bus.subscribe(EventType.LLM_TOKEN, self._on_llm_token)
-            self._bus.subscribe(EventType.TTS_CHUNK, self._on_tts_chunk)
-        self._bus.subscribe(EventType.SAFETY_FLAG, self._on_safety_flag)
-        self._bus.subscribe(EventType.INTERRUPT, self._on_interrupt)
-        self._bus.subscribe(EventType.BACKCHANNEL_CUE, self._on_backchannel)
-        self._bus.subscribe(EventType.AGENT_ACTION, self._on_agent_action)
-        self._bus.subscribe(EventType.TOOL_RESULT, self._on_tool_result)
+            self._bus.subscribe(EventType.LLM_SPEECH_TOKEN, self._on_llm_token)
+            self._bus.subscribe(EventType.TTS_CHUNK_READY, self._on_tts_chunk)
+        self._bus.subscribe(EventType.SAFETY_FLAGGED, self._on_safety_flag)
+        self._bus.subscribe(EventType.INTERRUPT_DETECTED, self._on_interrupt)
+        self._bus.subscribe(EventType.BACKCHANNEL_FIRE, self._on_backchannel)
+        self._bus.subscribe(EventType.AGENT_JSON_OUT, self._on_agent_action)
+        self._bus.subscribe(EventType.TOOL_RESULT_READY, self._on_tool_result)
 
         # 3. Optional text-input loop
         if self._text_mode:
@@ -330,7 +330,7 @@ class CLIInterface:
                     continue
                 # Normal text → publish as transcript
                 await self._bus.publish(
-                    EventType.TRANSCRIPT,
+                    EventType.TRANSCRIPT_READY,
                     {"text": line, "is_final": True, "source": "cli"},
                 )
         except Exception as exc:
@@ -341,10 +341,10 @@ class CLIInterface:
 
     async def _on_state_change(self, event) -> None:
         self._event_count += 1
-        old = event.data["old_state"]
-        new = event.data["new_state"]
+        old = event.data.get("old_state", "?")
+        new = event.data.get("new_state", event.data.get("state", "?"))
         color_name = STATE_COLORS.get(new, "RESET")
-        color = COLORS[color_name]
+        color = COLORS.get(color_name, COLORS["RESET"])
         old_val = old.value if hasattr(old, "value") else str(old)
         new_val = new.value if hasattr(new, "value") else str(new)
         print(f"{color}[STATE] {old_val} → {new_val}{COLORS['RESET']}")

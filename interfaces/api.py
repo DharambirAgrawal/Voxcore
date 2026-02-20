@@ -440,7 +440,7 @@ class APIServer:
         if not text:
             raise HTTPException(status_code=400, detail="Empty text")
         await self._bus.publish(
-            EventType.TRANSCRIPT,
+            EventType.TRANSCRIPT_READY,
             {"text": text, "is_final": True, "source": request.source},
         )
         return TextInjectResponse(success=True, message=f"Injected {len(text)} chars")

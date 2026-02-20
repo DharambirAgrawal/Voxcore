@@ -86,14 +86,14 @@ CLASS: BackchannelSelector
             - session: Session — For checking TurnState
             - event_bus: EventBus — Subscribe to BACKCHANNEL_OPPORTUNITY, publish BACKCHANNEL_FIRE
             - config: dict — The "backchannel" section from config.yaml:
-                - clips_dir: str ("backchannel/clips/")
+                - clips_dir: str ("backchannel/clips/heart/")
                 - min_gap_between_s: int (8)
                 - min_user_speech_s: int (2)
         
         INITIALIZES:
             self.session: Session                = session
             self.event_bus: EventBus             = event_bus
-            self.clips_dir: Path                 = Path(config["backchannel"].get("clips_dir", "backchannel/clips/"))
+            self.clips_dir: Path                 = Path(config["backchannel"].get("clips_dir", "backchannel/clips/heart/"))
             self.min_gap_between_s: int          = config["backchannel"].get("min_gap_between_s", 8)
             self.min_user_speech_s: int          = config["backchannel"].get("min_user_speech_s", 2)
             
@@ -256,7 +256,7 @@ class BackchannelSelector:
         self.event_bus: EventBus = event_bus
 
         bc_cfg = config.get("backchannel", {})
-        self.clips_dir: Path = Path(bc_cfg.get("clips_dir", "backchannel/clips/"))
+        self.clips_dir: Path = Path(bc_cfg.get("clips_dir", "backchannel/clips/heart/"))
         self.min_gap_between_s: int = bc_cfg.get("min_gap_between_s", 8)
         self.min_user_speech_s: int = bc_cfg.get("min_user_speech_s", 2)
 
@@ -271,7 +271,7 @@ class BackchannelSelector:
         self._scan_clips()
 
         # Subscribe to backchannel opportunity events
-        queue = await self.event_bus.subscribe(EventType.BACKCHANNEL_OPPORTUNITY)
+        queue = self.event_bus.subscribe(EventType.BACKCHANNEL_OPPORTUNITY)
 
         self._logger.info("BackchannelSelector running")
 

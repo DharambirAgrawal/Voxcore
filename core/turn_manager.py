@@ -274,7 +274,7 @@ class TurnManager:
             await self.session.add_turn("user", text)
 
             if self.safety_guard is not None:
-                asyncio.create_task(self.safety_guard.check_input(text))
+                asyncio.create_task(self.safety_guard.check(text, direction="input"))
 
             await self._start_llm_response(text)
 
@@ -291,46 +291,21 @@ class TurnManager:
         )
 
     async def _stream_and_parse(self, messages: list[dict], model: str) -> None:
-        first_token_seen = False
         full_text = ""
-        emotion: Optional[str] = None
 
         try:
+            # Transition to SPEAKING once the stream starts (parse_stream
+            # publishes LLM_SPEECH_TOKEN events internally).
+            await self.session.set_state(TurnState.SPEAKING)
+
             stream = self.llm_client.stream_response(messages, model)
-            async for parsed in self.response_parser.parse_stream(stream):
-                token_type = parsed.get("type")
-
-                if token_type == "speech":
-                    token_text = parsed.get("text", "")
-                    full_text += token_text
-
-                    if not first_token_seen:
-                        first_token_seen = True
-                        await self.session.set_state(TurnState.SPEAKING)
-
-                    await self.event_bus.publish(
-                        EventType.LLM_SPEECH_TOKEN, {"text": token_text}
-                    )
-
-                elif token_type == "emotion":
-                    emotion = parsed.get("emotion")
-
-                elif token_type == "agent":
-                    await self.event_bus.publish(
-                        EventType.LLM_AGENT_TAG, {"agent": parsed.get("agent")}
-                    )
+            full_text = await self.response_parser.parse_stream(stream)
 
             # Stream complete — record assistant turn
-            agent_output = parsed.get("agent") if parsed and parsed.get("type") == "agent" else None
-            await self.session.add_turn(
-                "assistant",
-                full_text,
-                emotion=emotion,
-                agent_output=agent_output,
-            )
+            await self.session.add_turn("assistant", full_text)
 
             if self.safety_guard is not None:
-                asyncio.create_task(self.safety_guard.check_output(full_text))
+                asyncio.create_task(self.safety_guard.check(full_text, direction="output"))
 
             await self.event_bus.publish(EventType.LLM_STREAM_DONE, {"text": full_text})
 

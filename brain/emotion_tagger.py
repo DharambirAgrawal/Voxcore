@@ -9,9 +9,10 @@ PURPOSE:
     contain an emotion tag in a sentence, this module infers one based on
     content keywords and prepends it.
 
-    This ensures Orpheus TTS ALWAYS gets emotional context even when the LLM
-    forgets to include a tag. Without emotion tags, Orpheus defaults to a
-    flat monotone — the tags are what give the voice personality.
+    This ensures the LLM response ALWAYS has emotional context tags even when
+    the LLM forgets to include one. The tags are used for logging/analytics.
+    Note: Kokoro-ONNX TTS does NOT use bracket emotion tags — TTSClient strips
+    them before synthesis. Kokoro infers prosody from punctuation and voice style.
 
     Examples:
         "I'm sorry to hear that" → "[empathetic] I'm sorry to hear that"
@@ -146,13 +147,14 @@ EXPORTS:
     - DEFAULT_EMOTION     (str constant)
 ═══════════════════════════════════════════════════════════════════════════════════
 
-ORPHEUS EMOTION TAGS REFERENCE:
-    Orpheus TTS supports these inline vocal direction tags:
+EMOTION TAGS REFERENCE:
+    The LLM generates these inline tags for context:
     [cheerful] [calm] [concerned] [excited] [empathetic] [curious]
     [surprised] [sad] [angry] [whisper] [laugh]
-    
-    Tags affect prosody, pitch, and speaking rate. They can appear
-    anywhere in the text but work best at the start of a phrase.
+
+    NOTE: Kokoro-ONNX does NOT process these tags directly. TTSClient
+    strips them with regex before synthesis. Kokoro infers prosody from
+    punctuation, phrasing, and the chosen voice style instead.
 """
 
 

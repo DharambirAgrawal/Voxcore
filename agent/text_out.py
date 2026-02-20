@@ -202,7 +202,7 @@ class TextOut:
                 continue
 
             self._output_log.append(validated)
-            self.event_bus.publish(EventType.AGENT_JSON_OUT, data=validated)
+            await self.event_bus.publish(EventType.AGENT_JSON_OUT, data=validated)
             await self._distribute(validated)
 
     def _validate_and_enrich(self, agent_data: dict) -> Optional[dict]:

@@ -244,7 +244,7 @@ class CueDetector:
         self._audio_queue = self.mic_stream.add_consumer()
 
         # Register for speech start events
-        await self.event_bus.subscribe(EventType.SPEECH_START, self._on_speech_start_event)
+        self.event_bus.subscribe(EventType.SPEECH_START, self._on_speech_start_event)
 
         self._logger.info("CueDetector running")
 

@@ -230,7 +230,7 @@ class LongTermMemory:
         self._logger.info(
             f"LongTermMemory initialized with {self._collection.count()} documents"
         )
-        self._bus.subscribe(EventType.MEMORY_COMPRESS, self._on_compress)
+        self._bus.subscribe(EventType.MEMORY_COMPRESSED, self._on_compress)
 
     async def store(self, text: str, metadata: dict = None) -> str:
         """Embed and store a text document, returning its hash-based ID."""
