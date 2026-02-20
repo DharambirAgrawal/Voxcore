@@ -260,7 +260,12 @@ class EventType(str, Enum):
     # --- Safety Events ---
     SAFETY_FLAGGED = "safety_flagged"
 
+    # --- Turn Events ---
+    TURN_COMPLETE = "turn_complete"
+    SESSION_RESET = "session_reset"
+
     # --- Memory Events ---
+    MEMORY_COMPRESS = "memory_compress"
     MEMORY_COMPRESSED = "memory_compressed"
 
 

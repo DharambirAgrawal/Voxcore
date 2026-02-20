@@ -285,9 +285,8 @@ class CLIInterface:
         # 2. Subscribe to key events
         self._bus.subscribe(EventType.STATE_CHANGED, self._on_state_change)
         self._bus.subscribe(EventType.TRANSCRIPT_READY, self._on_transcript)
-        self._bus.subscribe(EventType.LLM_STREAM_DONE, self._on_llm_sentence)
+        self._bus.subscribe(EventType.LLM_SPEECH_TOKEN, self._on_llm_sentence)
         if self._verbose:
-            self._bus.subscribe(EventType.LLM_SPEECH_TOKEN, self._on_llm_token)
             self._bus.subscribe(EventType.TTS_CHUNK_READY, self._on_tts_chunk)
         self._bus.subscribe(EventType.SAFETY_FLAGGED, self._on_safety_flag)
         self._bus.subscribe(EventType.INTERRUPT_DETECTED, self._on_interrupt)
@@ -363,10 +362,7 @@ class CLIInterface:
         self._event_count += 1
         print(f"{COLORS['CYAN']}[AI] {event.data['text']}{COLORS['RESET']}")
 
-    async def _on_llm_token(self, event) -> None:
-        self._event_count += 1
-        sys.stdout.write(event.data["token"])
-        sys.stdout.flush()
+
 
     async def _on_tts_chunk(self, event) -> None:
         self._event_count += 1
@@ -390,14 +386,15 @@ class CLIInterface:
 
     async def _on_agent_action(self, event) -> None:
         self._event_count += 1
-        tool = event.data["tool"]
-        params = event.data["params"]
-        print(f"{COLORS['BLUE']}[AGENT] Tool: {tool} | Params: {params}{COLORS['RESET']}")
+        action = event.data.get("action", event.data.get("tool", "?"))
+        params = event.data.get("params", {})
+        print(f"{COLORS['BLUE']}[AGENT] Action: {action} | Params: {params}{COLORS['RESET']}")
 
     async def _on_tool_result(self, event) -> None:
         self._event_count += 1
-        tool = event.data["tool"]
-        result_preview = str(event.data["result"])[:200]
+        tool = event.data.get("tool", event.data.get("action", "?"))
+        res_str = str(event.data.get("result", ""))
+        result_preview = res_str[:200]
         print(f"{COLORS['BLUE']}[TOOL RESULT] {tool}: {result_preview}{COLORS['RESET']}")
 
     # ── helper commands ──────────────────────────────────────────────────────
@@ -430,8 +427,8 @@ class CLIInterface:
             return
         print(f"{COLORS['BOLD']}── LAST {len(history)} TURNS ──{COLORS['RESET']}")
         for i, turn in enumerate(history):
-            role = turn.get("role", "?")
-            text = turn.get("text", turn.get("content", ""))[:120]
+            role = getattr(turn, "role", "?")
+            text = getattr(turn, "content", "")[:120]
             print(f"  {i + 1}. [{role}] {text}")
         print(f"{COLORS['BOLD']}───────────────────────────{COLORS['RESET']}")
 

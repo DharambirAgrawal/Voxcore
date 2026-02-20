@@ -195,7 +195,6 @@ class MicStream:
         self.chunk_samples: int = int(self.sample_rate * self.chunk_ms / 1000)
         self.calibration_duration: float = config.get("noise_floor_calibration_s", 0.5)
         self.noise_floor: float = 0.0
-        self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._consumer_queues: List[asyncio.Queue] = []
         self._stream: Optional[sd.InputStream] = None
         self._running: bool = False
@@ -215,7 +214,9 @@ class MicStream:
             blocksize=self.chunk_samples,
             callback=self._audio_callback,
         )
-        self._stream.start()
+        stream = self._stream
+        assert stream is not None, "Stream could not be initialized"
+        stream.start()
         self._running = True
         self._logger.info(
             "Mic stream started (16kHz, mono, %dms chunks)", self.chunk_ms
@@ -242,17 +243,9 @@ class MicStream:
         chunk: np.ndarray = indata[:, 0].copy()
         chunk_f32: np.ndarray = chunk.astype(np.float32) / 32768.0
 
-        if self._loop is None:
+        loop = self._loop
+        if loop is None:
             return
-
-        # Push to the main audio_queue
-        def _enqueue_main() -> None:
-            try:
-                self.audio_queue.put_nowait(chunk_f32)
-            except asyncio.QueueFull:
-                self._logger.warning("Main audio queue full — dropping chunk")
-
-        self._loop.call_soon_threadsafe(_enqueue_main)
 
         # Fan-out to every registered consumer queue
         for q in self._consumer_queues:
@@ -263,7 +256,7 @@ class MicStream:
                 except asyncio.QueueFull:
                     self._logger.warning("Consumer audio queue full — dropping chunk")
 
-            self._loop.call_soon_threadsafe(_enqueue_consumer)
+            loop.call_soon_threadsafe(_enqueue_consumer)
 
     async def _calibrate_noise_floor(self) -> None:
         """Record a short silence segment to estimate ambient noise RMS."""
@@ -283,12 +276,15 @@ class MicStream:
 
         audio_f32 = audio.astype(np.float32) / 32768.0
         rms_energy: float = float(np.sqrt(np.mean(audio_f32 ** 2)))
-        self.noise_floor = rms_energy * 1.5
-        self._logger.info("Noise floor set to %.6f", self.noise_floor)
+        # Use 2.5× ambient RMS as noise floor — generous margin to reject
+        # background noise while still catching real speech.
+        self.noise_floor = rms_energy * 2.5
+        self._logger.info("Noise floor set to %.6f (ambient RMS=%.6f)", self.noise_floor, rms_energy)
 
     async def get_chunk(self) -> np.ndarray:
-        """Await and return the next audio chunk from the main queue."""
-        return await self.audio_queue.get()
+        """Await and return the next audio chunk from the first consumer queue... wait, removed main eq.
+        This method should not be used anymore since consumers add their own queues."""
+        raise NotImplementedError("Use add_consumer() instead of get_chunk()")
 
     def add_consumer(self) -> asyncio.Queue:
         """
@@ -302,9 +298,10 @@ class MicStream:
     async def stop(self) -> None:
         """Stop and close the microphone stream."""
         self._running = False
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+        stream = self._stream
+        if stream is not None:
+            stream.stop()
+            stream.close()
         self._logger.info("Mic stream stopped")
 
     @property

@@ -197,7 +197,7 @@ class ShortTermMemory:
     def get_context_string(self, n: int = None) -> str:
         """Return formatted conversation history as a single string."""
         turns = self.get_recent(n)
-        return "\n".join(f"{turn.role}: {turn.text}" for turn in turns)
+        return "\n".join(f"{turn.role}: {turn.content}" for turn in turns)
 
     def clear(self, event=None) -> None:
         """Clear the rolling window and overflow buffer."""

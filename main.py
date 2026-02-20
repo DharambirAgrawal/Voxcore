@@ -462,7 +462,8 @@ async def initialize_system(
         config=config["audio"],
     )
     vad = VADProcessor(
-        event_bus=event_bus, mic_stream=mic_stream, config=config["audio"]
+        event_bus=event_bus, mic_stream=mic_stream, config=config["audio"],
+        session=session,
     )
     stt = STTClient(event_bus=event_bus, config=config["models"])
     text_injector = TextInjector(session=session, event_bus=event_bus)
@@ -551,20 +552,21 @@ async def initialize_system(
         config=config,
     )
 
-    # ── Long-term memory: restore context ────────────────────────────────────
-    mem_cfg = config.get("memory", {})
-    if mem_cfg.get("long_term_enabled", False):
-        try:
-            await long_term_memory.initialize()
-            past = await long_term_memory.query(
-                "session context", top_k=3
-            )
+    # ── Long-term memory: always initialize for MEMORY_COMPRESSED subscription ──
+    try:
+        await long_term_memory.initialize()
+        mem_cfg = config.get("memory", {})
+        if mem_cfg.get("long_term_enabled", False):
+            past = await long_term_memory.query("session context", top_k=3)
             if past:
+                # Inject restored context into session compressed_summary
+                restored = "\n".join(item["content"] for item in past)
+                session.compressed_summary = restored
                 logger.info(
                     "Restored %d context items from long-term memory", len(past)
                 )
-        except Exception as exc:
-            logger.warning("Could not restore long-term context: %s", exc)
+    except Exception as exc:
+        logger.warning("Could not initialize long-term memory: %s", exc)
 
     logger.info("All modules initialized.")
 
@@ -616,6 +618,7 @@ async def run_pipeline(
     tasks.append(asyncio.create_task(modules["vad"].run(), name="vad"))
     tasks.append(asyncio.create_task(modules["stt"].run(), name="stt"))
     tasks.append(asyncio.create_task(modules["turn_manager"].run(), name="turn_manager"))
+    tasks.append(asyncio.create_task(modules["tts_client"].run(), name="tts_client"))
     tasks.append(asyncio.create_task(modules["audio_player"].run(), name="audio_player"))
     tasks.append(asyncio.create_task(
         modules["interruption_detector"].run(), name="interruption_detector"
@@ -623,6 +626,8 @@ async def run_pipeline(
     tasks.append(asyncio.create_task(modules["text_out"].run(), name="text_out"))
     tasks.append(asyncio.create_task(modules["tool_router"].run(), name="tool_router"))
     tasks.append(asyncio.create_task(modules["safety_guard"].run(), name="safety_guard"))
+    tasks.append(asyncio.create_task(modules["short_term_memory"].run(), name="short_term_memory"))
+    tasks.append(asyncio.create_task(modules["compressor"].run(), name="compressor"))
 
     # ── Backchannel (conditional) ────────────────────────────────────────────
     bc_cfg = config.get("backchannel", {})

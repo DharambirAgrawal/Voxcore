@@ -213,6 +213,7 @@ import numpy as np
 import torch
 
 from core.event_bus import EventBus, EventType
+from core.session import Session, TurnState
 from input.mic_stream import MicStream
 
 
@@ -220,10 +221,12 @@ class VADProcessor:
     """Silero VAD wrapper that processes audio chunks and fires speech events."""
 
     def __init__(
-        self, event_bus: EventBus, mic_stream: MicStream, config: dict
+        self, event_bus: EventBus, mic_stream: MicStream, config: dict,
+        session: Session = None,
     ) -> None:
         self.event_bus: EventBus = event_bus
         self.mic_stream: MicStream = mic_stream
+        self.session: Optional[Session] = session
         self.sample_rate: int = config.get("sample_rate", 16000)
         self.speech_threshold: float = config.get("vad_speech_threshold", 0.5)
         self.silence_threshold: float = config.get("vad_silence_threshold", 0.7)
@@ -263,13 +266,31 @@ class VADProcessor:
         """Process audio chunks forever, firing speech start/end events."""
         self._load_model()
         self._audio_queue = self.mic_stream.add_consumer()
+        audio_queue = self._audio_queue
+        assert audio_queue is not None, "Audio queue not initialized"
 
         while True:
-            chunk: np.ndarray = await self._audio_queue.get()
-            speech_prob = self._get_speech_probability(chunk)
+            chunk: np.ndarray = await audio_queue.get()
+
+            # ── Echo suppression: ignore mic input while AI is speaking ──
+            # Without hardware AEC, the mic picks up TTS audio from speakers.
+            # Suppress VAD entirely during SPEAKING to avoid false triggers.
+            if self.session is not None and self.session.state == TurnState.SPEAKING:
+                # Don't process audio while AI is talking — the
+                # InterruptionDetector handles interrupt detection separately
+                # with a higher threshold specifically designed for echo.
+                continue
+
+            speech_prob = self.get_speech_probability(chunk)
+            
+            # Prevent false starts from pure background noise
+            rms = float(np.sqrt(np.mean(chunk**2)))
+            if rms < self.mic_stream.noise_floor:
+                speech_prob = 0.0
+                
             await self._process_probability(speech_prob, chunk)
 
-    def _get_speech_probability(self, chunk: np.ndarray) -> float:
+    def get_speech_probability(self, chunk: np.ndarray) -> float:
         """Run Silero VAD inference on a single audio chunk."""
         tensor = torch.from_numpy(chunk).float()
         prob: float = self._model(tensor, self.sample_rate).item()  # type: ignore[union-attr]
@@ -293,7 +314,10 @@ class VADProcessor:
             # ── Currently in a speech segment ──
             self._audio_buffer.append(chunk)
 
-            if speech_prob < (1.0 - self.silence_threshold):
+            # If we were doing 1.0 - 0.7 = 0.3, it's very hard to hit if there's noise.
+            # So let's use a fixed threshold of 0.35, or max(0.35, 1.0 - self.silence_threshold)
+            effective_silence_prob = max(0.35, 1.0 - self.silence_threshold)
+            if speech_prob < effective_silence_prob:
                 # This chunk is silence
                 if self._silence_start_time == 0.0:
                     self._silence_start_time = time.time()
@@ -347,6 +371,7 @@ class VADProcessor:
         self._audio_buffer = []
         self._silence_start_time = 0.0
         self._speech_start_time = 0.0
-        if self._model is not None:
-            self._model.reset_states()
+        model = self._model
+        if model is not None:
+            model.reset_states()
         self._logger.debug("VAD state reset")

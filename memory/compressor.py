@@ -223,17 +223,20 @@ class MemoryCompressor:
         formatted = self._format_turns(turns)
 
         try:
+            messages = [
+                {"role": "system", "content": COMPRESS_SYSTEM_PROMPT},
+                {"role": "user", "content": formatted},
+            ]
             summary = await self._llm.complete(
+                messages=messages,
                 model=COMPRESS_MODEL,
-                system_prompt=COMPRESS_SYSTEM_PROMPT,
-                user_prompt=formatted,
                 max_tokens=MAX_SUMMARY_TOKENS,
                 temperature=0.3,
             )
 
             if summary and summary.strip():
                 await self._bus.publish(
-                    EventType.MEMORY_STORE,
+                    EventType.MEMORY_COMPRESSED,
                     {
                         "summary": summary.strip(),
                         "turns": turns,
@@ -259,7 +262,7 @@ class MemoryCompressor:
         """Format turns into a readable conversation transcript for the LLM."""
         lines: list[str] = []
         for turn in turns:
-            lines.append(f"[{turn.role}]: {turn.text}")
+            lines.append(f"[{turn.role}]: {turn.content}")
         return "\n".join(lines)
 
     def get_pending_count(self) -> int:

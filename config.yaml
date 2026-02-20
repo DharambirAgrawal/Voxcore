@@ -45,9 +45,10 @@ audio:
   sample_rate: 16000                 # STT input sample rate in Hz (16kHz mono)
   output_sample_rate: 24000          # TTS output sample rate in Hz (Kokoro-ONNX outputs 24kHz)
   chunk_ms: 32                       # VAD chunk size in milliseconds (≥32ms for 16kHz Silero VAD)
-  vad_speech_threshold: 0.5          # Silero VAD speech probability threshold (0.0–1.0)
-  vad_silence_threshold: 0.7         # Silero VAD silence probability threshold for end-of-turn
-  vad_silence_duration_ms: 400       # Milliseconds of silence before end-of-turn is declared
+  vad_speech_threshold: 0.65         # Silero VAD speech probability threshold (0.0–1.0) — higher = less sensitive
+  vad_silence_threshold: 0.6         # Silero VAD silence probability threshold for end-of-turn
+  vad_silence_duration_ms: 500       # Milliseconds of silence before end-of-turn is declared
+  noise_floor_calibration_s: 1.0     # Seconds to sample ambient noise on startup
   noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
 
 backchannel:

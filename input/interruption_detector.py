@@ -149,6 +149,8 @@ import asyncio
 import logging
 import time
 
+import numpy as np
+
 from core.session import Session, TurnState
 from core.event_bus import EventBus, EventType
 from input.mic_stream import MicStream
@@ -156,7 +158,18 @@ from input.vad import VADProcessor
 
 
 class InterruptionDetector:
-    """Monitors audio input during SPEAKING state to detect user interruptions."""
+    """Monitors audio input during SPEAKING state to detect user interruptions.
+
+    Without hardware AEC, the mic picks up TTS audio from speakers.
+    We use three defenses:
+      1. High VAD threshold (0.85) — speaker bleed rarely reaches this.
+      2. Long sustained-speech window (800ms) — bleed is bursty, not sustained.
+      3. RMS energy gate — the chunk must be significantly louder than the
+         calibrated ambient noise floor (the user's voice is much closer to
+         the mic than the speakers).
+      4. Cooldown after state transitions — ignore the first 500ms after
+         entering SPEAKING, which is when TTS audio starts hitting the mic.
+    """
 
     def __init__(
         self,
@@ -171,9 +184,15 @@ class InterruptionDetector:
         self.mic_stream = mic_stream
         self.vad = vad
 
-        self._interrupt_threshold: float = config.get("interrupt_threshold", 0.6)
-        self._interrupt_duration_ms: int = config.get("interrupt_duration_ms", 300)
+        # Tuning knobs — intentionally strict to avoid false interrupts
+        self._interrupt_threshold: float = config.get("interrupt_threshold", 0.85)
+        self._interrupt_duration_ms: int = config.get("interrupt_duration_ms", 800)
+        # RMS must exceed noise_floor × this multiplier to be considered
+        self._energy_multiplier: float = config.get("interrupt_energy_multiplier", 5.0)
+
         self._speech_detected_at: float = 0.0
+        self._speaking_since: float = 0.0  # When we entered SPEAKING state
+        self._state_cooldown_ms: float = 500.0  # Ignore first 500ms of SPEAKING
         self._audio_queue: asyncio.Queue = None
 
         self._logger = logging.getLogger("InterruptionDetector")
@@ -181,8 +200,7 @@ class InterruptionDetector:
     async def run(self) -> None:
         """Main loop: consume audio, check state, run VAD, check for interrupt."""
         self._audio_queue = self.mic_stream.add_consumer()
-        # Wire up state change handler for clean reset on state transitions
-        self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)  # callback-style
+        self.event_bus.subscribe(EventType.STATE_CHANGED, self._handle_state_change)
 
         while True:
             chunk = await self._audio_queue.get()
@@ -191,35 +209,44 @@ class InterruptionDetector:
                 self._speech_detected_at = 0.0
                 continue
 
-            # FIX 2: Use public API if available, fall back to private
-            speech_prob = self.vad.get_speech_probability(chunk)
-            await self._check_interrupt(speech_prob)
+            # ── Cooldown: ignore audio right after entering SPEAKING ──
+            # The first ~500ms is when TTS audio starts hitting the mic.
+            now = time.monotonic()
+            if self._speaking_since > 0 and (now - self._speaking_since) * 1000 < self._state_cooldown_ms:
+                continue
 
-    async def _check_interrupt(self, speech_prob: float) -> None:
+            # ── RMS energy gate: only process if significantly above noise floor ──
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            noise_floor = self.mic_stream.noise_floor
+            if noise_floor > 0 and rms < noise_floor * self._energy_multiplier:
+                # Audio is just speaker bleed / ambient — not a nearby voice
+                self._speech_detected_at = 0.0
+                continue
+
+            speech_prob = self.vad.get_speech_probability(chunk)
+            await self._check_interrupt(speech_prob, rms)
+
+    async def _check_interrupt(self, speech_prob: float, rms: float) -> None:
         """Analyze speech probability to detect sustained interruption."""
-        # FIX 1: Use time.monotonic() — immune to system clock adjustments
         now = time.monotonic()
 
         if speech_prob > self._interrupt_threshold:
             if self._speech_detected_at == 0.0:
-                # First detection — start timing
                 self._speech_detected_at = now
             else:
-                # Check duration of sustained speech
                 duration_ms = (now - self._speech_detected_at) * 1000
                 if duration_ms >= self._interrupt_duration_ms:
-                    # Confirmed interrupt
                     await self.event_bus.publish(
                         EventType.INTERRUPT_DETECTED,
                         data={"speech_prob": speech_prob, "during_sentence": -1},
                     )
                     self._logger.info(
-                        f"INTERRUPT detected ({duration_ms:.0f}ms of speech during SPEAKING)"
+                        "INTERRUPT detected (%.0fms speech, prob=%.2f, rms=%.4f)",
+                        duration_ms, speech_prob, rms,
                     )
                     self._speech_detected_at = 0.0
-                    await asyncio.sleep(0.1)  # Cooldown to prevent re-trigger
+                    await asyncio.sleep(0.5)  # Longer cooldown to prevent re-trigger
         else:
-            # No speech detected — reset timer
             self._speech_detected_at = 0.0
 
     async def _handle_state_change(self, event) -> None:
@@ -227,9 +254,9 @@ class InterruptionDetector:
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
 
-        if new_state == TurnState.SPEAKING:
-            # Entering SPEAKING — fresh start for detection
+        if new_state == TurnState.SPEAKING or new_state == "speaking":
             self._speech_detected_at = 0.0
-        elif old_state == TurnState.SPEAKING:
-            # Leaving SPEAKING — clean up
+            self._speaking_since = time.monotonic()
+        elif old_state == TurnState.SPEAKING or old_state == "speaking":
             self._speech_detected_at = 0.0
+            self._speaking_since = 0.0

@@ -328,8 +328,10 @@ class AudioPlayer:
                 # Yield to event loop so interrupts can be detected
                 await asyncio.sleep(0)
 
-            self._current_stream.stop()
-            self._current_stream.close()
+            stream = self._current_stream
+            if stream is not None:
+                stream.stop()
+                stream.close()
         except Exception as e:
             self._logger.error("Playback error: %s", e)
         finally:

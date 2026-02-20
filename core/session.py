@@ -279,6 +279,19 @@ class Session:
         self.event_bus: EventBus = event_bus
         self._lock: asyncio.Lock = asyncio.Lock()
 
+        # Subscribe to memory compression results to update context
+        self.event_bus.subscribe(EventType.MEMORY_COMPRESSED, self._on_memory_compressed)
+
+    async def _on_memory_compressed(self, event) -> None:
+        """Update compressed_summary when memory is compressed."""
+        summary = event.data.get("summary", "")
+        if summary:
+            if self.compressed_summary:
+                self.compressed_summary += "\n" + summary
+            else:
+                self.compressed_summary = summary
+            logger.info("Session memory updated (%d chars)", len(self.compressed_summary))
+
     # ── state transitions ──────────────────────────────────────────────────
 
     async def set_state(self, new_state: TurnState) -> None:
@@ -313,6 +326,13 @@ class Session:
             agent_output=agent_output,
         )
         self.history.append(turn)
+
+        # Notify memory subsystem of the completed turn
+        await self.event_bus.publish(
+            EventType.TURN_COMPLETE,
+            {"turn": turn},
+            source="Session",
+        )
         return turn
 
     # ── text-in injection ──────────────────────────────────────────────────
