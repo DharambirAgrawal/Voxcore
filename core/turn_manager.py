@@ -256,8 +256,8 @@ class TurnManager:
         self._transcript_queue = event_bus.subscribe(EventType.TRANSCRIPT_READY)
         self._interrupt_queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
         self._playback_done_queue = event_bus.subscribe(EventType.PLAYBACK_DONE)
-        self._llm_done_queue = event_bus.subscribe(EventType.LLM_STREAM_DONE)
         self._safety_queue = event_bus.subscribe(EventType.SAFETY_FLAGGED)
+        self._tool_result_queue = event_bus.subscribe(EventType.TOOL_RESULT_READY)
 
     # ── main entry point ───────────────────────────────────────────────────
 
@@ -268,6 +268,7 @@ class TurnManager:
             self._handle_interrupts(),
             self._handle_playback_done(),
             self._handle_safety_flags(),
+            self._handle_tool_results(),
         )
 
     # ── transcript handling ────────────────────────────────────────────────
@@ -407,3 +408,33 @@ class TurnManager:
 
             elif direction == "input":
                 self._logger.warning("Safety flagged input: %s", event.data.get("reason", "unknown"))
+
+    # ── tool result handling ───────────────────────────────────────────────
+
+    async def _handle_tool_results(self) -> None:
+        """Auto-trigger a new LLM call after a tool result is injected.
+
+        When a tool (e.g. web_search) finishes, its result is injected into
+        the session's text_in_queue by TextInjector.  We fire a fresh LLM
+        call so the AI can read the result and speak it to the user.
+        The tool result appears as [CONTEXT] in the prompt via PromptBuilder.
+        """
+        while True:
+            event = await self._tool_result_queue.get()
+            action = event.data.get("action", "unknown")
+            success = event.data.get("success", True)
+
+            self._logger.info("Tool '%s' result received (success=%s) — auto-responding", action, success)
+
+            # Wait briefly for the TextInjector to finish adding to text_in_queue
+            await asyncio.sleep(0.05)
+
+            # Don't add a fake user turn — just build prompt from existing state
+            # (the tool result is already in text_in_queue, PromptBuilder.build()
+            # will flush it into the [CONTEXT] block)
+            await self.session.set_state(TurnState.THINKING)
+            messages = self.prompt_builder.build(self.session)
+            model = self.brain_router.route("tool result", self.session)
+            self._current_llm_task = asyncio.create_task(
+                self._stream_and_parse(messages, model)
+            )

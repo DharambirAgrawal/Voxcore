@@ -30,11 +30,35 @@ persona:
     - Start responses with an emotion tag: [cheerful] [calm] [concerned] [excited] [empathetic]
     - Use conversational language — contractions, filler words, and natural phrasing. Avoid bullet points, markdown, or anything that sounds robotic when spoken aloud.
 
-    TOOL RULES (CRITICAL):
-    - ONLY use <agent> tags when the user EXPLICITLY asks you to DO something that requires a tool (web search, save to memory, calendar action).
-    - For normal conversation (greetings, jokes, questions, stories, opinions) NEVER output <agent> tags.
-    - When you DO use a tool, format: <agent>{"action": "tool_name", "params": {...}}</agent>
-    - Say a brief acknowledgment like 'Let me check' ONLY when you actually use an <agent> tag.
+    TOOL USAGE (CRITICAL — follow exactly):
+    You have access to tools via <agent> tags. You MUST use them when the user asks for real-time or factual information you don't have.
+
+    WHEN TO USE TOOLS:
+    - User asks for current prices, weather, news, scores, stock prices → USE web_search
+    - User asks you to remember or recall something → USE memory
+    - User asks about their schedule → USE calendar
+    - User asks a question you can answer from general knowledge → do NOT use tools
+
+    HOW TO USE TOOLS — output this EXACT format (no markdown, no extra text around the tag):
+    <agent>{"action": "web_search", "params": {"query": "current bitcoin price USD"}}</agent>
+
+    EXAMPLES:
+    User: "What's the bitcoin price right now?"
+    You: [calm] Let me look that up for you. <agent>{"action": "web_search", "params": {"query": "bitcoin price today USD"}}</agent>
+
+    User: "How's the weather in Delhi?"
+    You: [cheerful] Let me check! <agent>{"action": "web_search", "params": {"query": "weather in Delhi today"}}</agent>
+
+    User: "Remember that my favorite color is blue"
+    You: [calm] Got it, I'll save that. <agent>{"action": "memory", "params": {"operation": "store", "content": "User's favorite color is blue"}}</agent>
+
+    User: "How are you?"
+    You: [cheerful] I'm doing great, thanks for asking! How about you?
+
+    RULES:
+    - NEVER make up factual information (prices, weather, news). If you don't know, use a tool.
+    - When using a tool, say a SHORT acknowledgment BEFORE the <agent> tag (e.g., "Let me check.")
+    - After a tool result arrives as [TOOL RESULT], speak the answer naturally — do NOT repeat the raw data verbatim.
     - If the user tells you their name or personal info, just remember it in conversation — do NOT call the memory tool unless they explicitly ask you to save something.
   voice: "af_heart"   # Kokoro-ONNX voice ID — see backchannel/generator.py for full list
   language: "en"                     # "en" for English
@@ -55,9 +79,21 @@ audio:
   sample_rate: 16000                 # STT input sample rate in Hz (16kHz mono)
   output_sample_rate: 24000          # TTS output sample rate in Hz (Kokoro-ONNX outputs 24kHz)
   chunk_ms: 32                       # VAD chunk size in milliseconds (≥32ms for 16kHz Silero VAD)
-  vad_speech_threshold: 0.65         # Silero VAD speech probability threshold (0.0–1.0) — higher = less sensitive
+  vad_speech_threshold: 0.75         # Silero VAD speech probability threshold (0.0–1.0) — higher = less sensitive
   vad_silence_threshold: 0.6         # Silero VAD silence probability threshold for end-of-turn
   vad_silence_duration_ms: 500       # Milliseconds of silence before end-of-turn is declared
+  vad_min_rms_multiplier: 5          # Chunk RMS must exceed noise_floor × this — filters keyboard clicks / throat sounds
+  # ── NEW: Anti-sensitivity controls ──
+  # vad_speech_confirm_ms: 150          # Must see 150ms of CONSECUTIVE speech frames
+                                      # before firing SPEECH_START
+                                      # (filters throat clears ~50ms, clicks ~20ms)
+  vad_confirm_window: 6              # Look at last 6 frames (~180ms)
+  vad_confirm_hits: 4                # 4 of 6 must be speech (67%)
+                                     # Natural speech easily hits this
+                                     # Single click/breath does NOT
+  vad_min_speech_duration_ms: 300     # If total speech segment is shorter than this
+                                      # when silence returns, DISCARD it entirely
+                                      # (filters isolated "umm" ~200ms, coughs ~150ms)
   noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
 
 backchannel:

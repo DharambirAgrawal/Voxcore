@@ -667,6 +667,7 @@ async def run_pipeline(
         ws_server = WebSocketServer(
             event_bus=modules["event_bus"],
             session=modules["session"],
+            mic_stream=modules["mic_stream"],
             app=app,
         )
         api_server = APIServer(

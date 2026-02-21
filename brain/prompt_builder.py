@@ -303,14 +303,6 @@ class PromptBuilder:
         parts = [
             self.system_prompt,
             f"\nCurrent date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            (
-                "\n\nRESPONSE FORMAT RULES:\n"
-                "- Always prefix your speech with an emotion tag: "
-                "[cheerful] [calm] [concerned] [excited] [empathetic] [curious] [surprised]\n"
-                "- Keep spoken responses under 3 sentences unless asked for more.\n"
-                "- ONLY use <agent> tags when the user explicitly requests an action (search, remember, calendar). "
-                "For normal conversation, do NOT include <agent> tags or tool acknowledgments.\n"
-            ),
         ]
         return "".join(parts)
 

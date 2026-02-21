@@ -205,6 +205,10 @@ class ShortTermMemory:
         self._overflow_buffer.clear()
         self._logger.info("Short-term memory cleared")
 
+    def __len__(self) -> int:
+        """Support len() for the ShortTermMemory."""
+        return len(self._window)
+
     @property
     def size(self) -> int:
         """Current number of turns in the window."""

@@ -306,7 +306,7 @@ class MemoryQueryResponse(BaseModel):
 
 class VoiceProfileUpdateRequest(BaseModel):
     voice: Optional[str] = None  # New voice name
-    speed: Optional[float] = None  # New speed multiplier
+    language: Optional[str] = None  # New language
     default_emotion: Optional[str] = None  # New default emotion
 
 
@@ -415,11 +415,14 @@ class APIServer:
         stm_size = (
             len(self._short_term) if self._short_term is not None else 0
         )
-        ltm_count = (
-            await self._long_term.count()
-            if self._long_term is not None and hasattr(self._long_term, "count")
-            else 0
-        )
+        try:
+            ltm_count = (
+                self._long_term.count()
+                if self._long_term is not None and hasattr(self._long_term, "count")
+                else 0
+            )
+        except Exception:
+            ltm_count = 0
         persona = getattr(self._session, "persona_name", "default")
 
         return SessionInfoResponse(

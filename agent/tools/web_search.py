@@ -126,6 +126,13 @@ EXPORTS:
 ═══════════════════════════════════════════════════════════════════════════════════
 """
 
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                     VOXCORE — agent/tools/web_search.py                         ║
+║                    WEB SEARCH TOOL — SEARCHES THE INTERNET                     ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
 import logging
 import os
 from typing import Any
@@ -136,7 +143,7 @@ from agent.tools.base_tool import BaseTool
 
 
 class WebSearchTool(BaseTool):
-    """Web search tool using a search API."""
+    """Web search tool using Tavily search API."""
 
     name = "web_search"
     description = "Search the web for current information"
@@ -147,42 +154,54 @@ class WebSearchTool(BaseTool):
         super().__init__()
         self.api_key: str = os.environ.get("TAVILY_API_KEY", "")
         self._logger: logging.Logger = logging.getLogger("Tool.web_search")
+        if not self.api_key:
+            self._logger.warning(
+                "TAVILY_API_KEY not set — web_search tool will return errors until configured"
+            )
 
     async def execute(self, params: dict) -> str:
         valid, err = self.validate_params(params)
         if not valid:
             return f"Error: {err}"
 
+        if not self.api_key:
+            return "Error: TAVILY_API_KEY is not configured — cannot perform web search"
+
         query = params["query"]
-        num_results = params.get("num_results", 5)
-        try:
-            num_results = int(num_results)
-        except (TypeError, ValueError):
-            num_results = 5
 
         try:
-            if self.api_key:
-                results = await self._search_tavily(query, num_results)
-            else:
-                results = await self._search_duckduckgo(query, num_results)
+            num_results = int(params.get("num_results", 3))
+        except (TypeError, ValueError):
+            num_results = 3
+
+        search_depth = params.get("search_depth", "basic")
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+
+        try:
+            results = await self._search_tavily(query, num_results, search_depth)
         except Exception as exc:
             self._logger.error("Search failed: %s", exc, exc_info=True)
             return f"Search error: {exc}"
 
         return self._format_results(query, results)
 
-    async def _search_tavily(self, query: str, num_results: int) -> list[dict]:
+    async def _search_tavily(
+        self, query: str, num_results: int, search_depth: str = "basic"
+    ) -> list[dict]:
         url = "https://api.tavily.com/search"
         payload = {
             "api_key": self.api_key,
             "query": query,
             "max_results": num_results,
-            "search_depth": "basic",
+            "search_depth": search_depth,
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"Tavily API error {resp.status}: {body}")
                 data = await resp.json()
 
         results: list[dict] = []
@@ -195,42 +214,6 @@ class WebSearchTool(BaseTool):
                 }
             )
         return results
-
-    async def _search_duckduckgo(self, query: str, num_results: int) -> list[dict]:
-        url = "https://api.duckduckgo.com/"
-        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json(content_type=None)
-
-        results: list[dict] = []
-
-        # Abstract text (top result)
-        if data.get("AbstractText"):
-            results.append(
-                {
-                    "title": data.get("Heading", "Result"),
-                    "snippet": data["AbstractText"],
-                    "url": data.get("AbstractURL", ""),
-                }
-            )
-
-        # Related topics
-        for topic in data.get("RelatedTopics", []):
-            if len(results) >= num_results:
-                break
-            if "Text" in topic:
-                results.append(
-                    {
-                        "title": topic.get("Text", "")[:80],
-                        "snippet": topic.get("Text", ""),
-                        "url": topic.get("FirstURL", ""),
-                    }
-                )
-
-        return results[:num_results]
 
     def _format_results(self, query: str, results: list[dict]) -> str:
         if not results:

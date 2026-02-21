@@ -275,11 +275,21 @@ class ToolRouter:
         except asyncio.TimeoutError:
             self._logger.error("Tool '%s' timed out after %ds", action, self.tool_timeout)
             await self.text_injector.inject_tool_result(action, "Tool timed out", success=False)
+            await self.event_bus.publish(
+                EventType.TOOL_RESULT_READY,
+                {"action": action, "result": "Tool timed out", "success": False},
+                source="ToolRouter",
+            )
 
         except Exception as e:
             self._logger.error("Tool '%s' failed: %s", action, e)
             await self.text_injector.inject_tool_result(
                 action, f"Error: {str(e)}", success=False
+            )
+            await self.event_bus.publish(
+                EventType.TOOL_RESULT_READY,
+                {"action": action, "result": f"Error: {str(e)}", "success": False},
+                source="ToolRouter",
             )
 
     def register_tool(self, name: str, tool: BaseTool) -> None:

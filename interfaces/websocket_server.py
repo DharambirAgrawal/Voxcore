@@ -295,10 +295,12 @@ class WebSocketServer:
         self,
         event_bus: EventBus,
         session: Session,
+        mic_stream=None,
         app: Optional[FastAPI] = None,
     ) -> None:
         self._bus = event_bus
         self._session = session
+        self._mic_stream = mic_stream  # For injecting WebSocket audio into pipeline
         self._app = app or FastAPI(title="VoxCore WebSocket")
         self._connections: dict[str, WebSocket] = {}
         self._active_connection: Optional[str] = None
@@ -426,14 +428,22 @@ class WebSocketServer:
     async def _handle_audio(self, conn_id: str, audio_bytes: bytes) -> None:
         if conn_id != self._active_connection:
             return  # Only active connection sends audio
-        await self._bus.publish(
-            EventType.AUDIO_CHUNK,
-            {
-                "audio": audio_bytes,
-                "source": "websocket",
-                "conn_id": conn_id,
-            },
-        )
+
+        # Inject directly into MicStream's consumer queues so it flows
+        # through VAD → STT → LLM pipeline (same path as hardware mic)
+        if self._mic_stream is not None and hasattr(self._mic_stream, "inject_chunk"):
+            self._mic_stream.inject_chunk(audio_bytes)
+        else:
+            # Fallback: publish event (nothing subscribes to this yet, but log it)
+            self._logger.warning("No MicStream reference — WebSocket audio dropped")
+            await self._bus.publish(
+                EventType.AUDIO_CHUNK,
+                {
+                    "audio": audio_bytes,
+                    "source": "websocket",
+                    "conn_id": conn_id,
+                },
+            )
 
     async def _handle_text_message(self, conn_id: str, message: dict) -> None:
         msg_type = message.get("type")

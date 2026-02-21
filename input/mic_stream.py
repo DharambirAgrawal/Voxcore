@@ -295,6 +295,26 @@ class MicStream:
         self._consumer_queues.append(q)
         return q
 
+    def inject_chunk(self, audio_bytes: bytes) -> None:
+        """
+        Inject external audio (e.g. from WebSocket) into all consumer queues.
+        Converts raw 16-bit PCM bytes to float32 normalised numpy and pushes.
+        """
+        chunk_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        chunk_f32 = chunk_i16.astype(np.float32) / 32768.0
+
+        loop = self._loop
+        if loop is None:
+            return
+
+        for q in self._consumer_queues:
+            def _enqueue(queue: asyncio.Queue = q) -> None:
+                try:
+                    queue.put_nowait(chunk_f32)
+                except asyncio.QueueFull:
+                    pass  # drop silently
+            loop.call_soon_threadsafe(_enqueue)
+
     async def stop(self) -> None:
         """Stop and close the microphone stream."""
         self._running = False
