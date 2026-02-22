@@ -52,7 +52,6 @@ pydantic
 kokoro-onnx
 soundfile
 
-dotenv
 python-dotenv
 
 aiosqlite
