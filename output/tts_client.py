@@ -173,6 +173,7 @@ EMOTION HANDLING:
 import asyncio
 import io
 import logging
+import os
 import re
 from typing import Optional
 
@@ -188,20 +189,42 @@ from output.voice_profile import VoiceProfile
 EMOTION_TAG_PATTERN = re.compile(r'\[\w+\]\s*')
 KOKORO_SAMPLE_RATE = 24000
 
+# V2: Clip tags that should NOT be sent to Kokoro
+CLIP_TAG_PATTERN = re.compile(r'\[(laughs|chuckles|light_laugh|sighs)\]')
+
 
 class TTSClient:
-    """Kokoro-ONNX local TTS client that converts sentences to audio."""
+    """Kokoro-ONNX local TTS client that converts sentences to audio.
+
+    V2 additions:
+    - Subscribes to PLAY_CLIP events and routes them to AudioPlayer
+      via BACKCHANNEL_FIRE (same playback path as backchannel clips)
+    - Strips clip tags from sentences before sending to Kokoro
+    """
 
     def __init__(self, event_bus: EventBus, voice_profile: VoiceProfile, config: dict) -> None:
         self.event_bus: EventBus = event_bus
         self.voice_profile: VoiceProfile = voice_profile
 
-        model_path = config.get("tts_model", "models/kokoro-v1.0.onnx")
-        voices_path = config.get("tts_voices", "models/voices-v1.0.bin")
+        # V2: config is now the full config dict (not just models section)
+        models_cfg = config.get("models", config)  # fallback for backward compat
+        model_path = models_cfg.get("tts_model", "models/kokoro-v1.0.onnx")
+        voices_path = models_cfg.get("tts_voices", "models/voices-v1.0.bin")
         self._kokoro: Kokoro = Kokoro(model_path, voices_path)
 
         self._speech_token_queue: asyncio.Queue = event_bus.subscribe(EventType.LLM_SPEECH_TOKEN)
         self._is_cancelled: bool = False
+
+        # V2: Clips directory for emotional reaction audio
+        bc_cfg = config.get("backchannel", {}) if isinstance(config, dict) else {}
+        self._clips_dir: str = bc_cfg.get("clips_dir", "backchannel/clips/heart/")
+        # V2: Emotional clip filename mapping
+        self._emotional_clips: dict = bc_cfg.get("emotional_clips", {
+            "laughs": "laughs.wav",
+            "chuckles": "chuckles.wav",
+            "light_laugh": "light_laugh.wav",
+            "sighs": "sighs.wav",
+        })
 
         self._logger: logging.Logger = logging.getLogger("TTSClient")
         self._logger.info("Kokoro-ONNX TTS loaded (voice=%s)", voice_profile.voice_name)
@@ -233,6 +256,17 @@ class TTSClient:
                 self._logger.warning("Speech queue full — could not inject TTS sentinel")
 
         self.event_bus.subscribe(EventType.LLM_STREAM_DONE, _on_llm_stream_done)
+
+        # V2: Subscribe to PLAY_CLIP events — route emotional clip audio
+        # directly to AudioPlayer instead of Kokoro synthesis
+        async def _on_play_clip(event) -> None:
+            if self._is_cancelled:
+                return
+            clip_name: str = event.data.get("clip_name", "")
+            sentence_index: int = event.data.get("sentence_index", 0)
+            await self._play_clip(clip_name, sentence_index)
+
+        self.event_bus.subscribe(EventType.PLAY_CLIP, _on_play_clip)
 
         while True:
             event = await self._speech_token_queue.get()
@@ -319,6 +353,49 @@ class TTSClient:
 
         except Exception as e:
             self._logger.error("TTS synthesis failed: %s", e)
+
+    async def _play_clip(self, clip_name: str, sentence_index: int) -> None:
+        """V2: Route an emotional clip (laughs, chuckles, etc.) to AudioPlayer.
+
+        Loads the WAV file from backchannel/clips/heart/ and publishes it
+        as TTS_CHUNK_READY so it plays inline with normal speech audio.
+        """
+        filename = self._emotional_clips.get(clip_name)
+        if not filename:
+            self._logger.warning("Unknown clip name: %s", clip_name)
+            return
+
+        clip_path = os.path.join(self._clips_dir, filename)
+        if not os.path.isfile(clip_path):
+            self._logger.warning("Clip file not found: %s", clip_path)
+            return
+
+        try:
+            with open(clip_path, "rb") as f:
+                wav_bytes = f.read()
+
+            # Publish clip audio as TTS chunks so AudioPlayer plays it inline
+            chunk_size = 4096
+            for i in range(0, len(wav_bytes), chunk_size):
+                if self._is_cancelled:
+                    break
+                chunk = wav_bytes[i : i + chunk_size]
+                is_last = (i + chunk_size) >= len(wav_bytes)
+                await self.event_bus.publish(
+                    EventType.TTS_CHUNK_READY,
+                    {
+                        "audio": chunk,
+                        "sentence_index": sentence_index,
+                        "sentence_done": is_last,
+                        "is_clip": True,
+                    },
+                    source="TTSClient",
+                )
+
+            self._logger.info("TTS: played clip '%s' (index=%d)", clip_name, sentence_index)
+
+        except Exception as e:
+            self._logger.error("Clip playback failed for '%s': %s", clip_name, e)
 
     async def cancel(self) -> None:
         """Cancel current synthesis and drain pending sentences."""

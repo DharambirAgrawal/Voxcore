@@ -327,6 +327,8 @@ from input.vad import VADProcessor
 from input.stt import STTClient
 from input.text_injector import TextInjector
 from input.interruption_detector import InterruptionDetector
+from input.filler_detector import FillerDetector
+from input.speaking_monitor import SpeakingMonitor
 
 from backchannel.cue_detector import CueDetector
 from backchannel.selector import BackchannelSelector
@@ -472,7 +474,19 @@ async def initialize_system(
         event_bus=event_bus,
         mic_stream=mic_stream,
         vad=vad,
-        config=config["audio"],
+        config=config,  # V2: pass full config so it can read speaking_monitor section
+    )
+
+    # V2: Filler detector (Gate 2) and Speaking Monitor (Gate 3)
+    filler_detector = FillerDetector(
+        config=config.get("speaking_monitor", {})
+    )
+    speaking_monitor = SpeakingMonitor(
+        session=session,
+        event_bus=event_bus,
+        mic_stream=mic_stream,
+        filler_detector=filler_detector,
+        config=config,
     )
 
     # ── Brain ────────────────────────────────────────────────────────────────
@@ -486,11 +500,14 @@ async def initialize_system(
     tts_client = TTSClient(
         event_bus=event_bus,
         voice_profile=voice_profile,
-        config=config["models"],
+        config=config,  # V2: pass full config so it can read backchannel.emotional_clips
     )
     audio_player = AudioPlayer(
         session=session, event_bus=event_bus, config=config["audio"]
     )
+
+    # V2: Wire echo suppression — AudioPlayer feeds playback reference to MicStream
+    audio_player.set_reference_callback(mic_stream.set_playback_reference)
 
     # ── Agent ────────────────────────────────────────────────────────────────
     text_out = TextOut(
@@ -543,7 +560,7 @@ async def initialize_system(
     backchannel_selector = BackchannelSelector(
         session=session,
         event_bus=event_bus,
-        config=config.get("backchannel", {}),
+        config=config,  # V2: pass full config so it can read backchannel section
     )
 
     # ── Turn Manager (last — orchestrates everything) ────────────────────────
@@ -588,6 +605,8 @@ async def initialize_system(
         "stt": stt,
         "text_injector": text_injector,
         "interruption_detector": interruption_detector,
+        "filler_detector": filler_detector,
+        "speaking_monitor": speaking_monitor,
         "cue_detector": cue_detector,
         "backchannel_selector": backchannel_selector,
         "llm_client": llm_client,
@@ -637,6 +656,13 @@ async def run_pipeline(
     tasks.append(asyncio.create_task(modules["safety_guard"].run(), name="safety_guard"))
     tasks.append(asyncio.create_task(modules["short_term_memory"].run(), name="short_term_memory"))
     tasks.append(asyncio.create_task(modules["compressor"].run(), name="compressor"))
+
+    # V2: Speaking Monitor (Gate 2 + Gate 3 interrupt classification)
+    sm_cfg = config.get("speaking_monitor", {})
+    if sm_cfg.get("enabled", True):
+        tasks.append(asyncio.create_task(
+            modules["speaking_monitor"].run(), name="speaking_monitor"
+        ))
 
     # ── Backchannel (conditional) ────────────────────────────────────────────
     bc_cfg = config.get("backchannel", {})

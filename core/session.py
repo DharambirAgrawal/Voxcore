@@ -229,6 +229,7 @@ class TurnState(Enum):
     THINKING = "thinking"
     SPEAKING = "speaking"
     INTERRUPTED = "interrupted"
+    SOFT_INJECT = "soft_inject"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

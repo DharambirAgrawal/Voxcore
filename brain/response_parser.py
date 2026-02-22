@@ -219,6 +219,11 @@ AGENT_OPEN_TAG = "<agent>"
 AGENT_CLOSE_TAG = "</agent>"
 EMOTION_TAG_PATTERN = re.compile(r'\[(\w+)\]')
 
+# ── V2: Special paralinguistic tags ──────────────────────────────────────
+# Tags that map to pre-recorded audio clips instead of TTS synthesis
+CLIP_TAGS = frozenset({"laughs", "chuckles", "light_laugh", "sighs"})
+PAUSE_TAG = "..."  # [...] → 300ms silence insertion
+
 
 class ResponseParser:
     """Real-time LLM output parser that splits speech and agent output."""
@@ -344,7 +349,65 @@ class ResponseParser:
             self._speech_buffer = parts[-1]
 
     async def _emit_sentence(self, sentence: str) -> None:
-        """Fire an LLM_SPEECH_TOKEN event for a complete sentence."""
+        """Fire an LLM_SPEECH_TOKEN event for a complete sentence.
+
+        V2: Also detects [laughs], [chuckles], [sighs], [light_laugh] tags
+        and fires PLAY_CLIP events instead of sending them to TTS.
+        Also detects [...] and fires PAUSE_MARKER events.
+        """
+        sentence = sentence.strip()
+        if not sentence:
+            return
+
+        # ── V2: Check for pause markers [...] ────────────────────────────
+        # Split sentence around [...] and process each part
+        parts = sentence.split("[...]")
+        if len(parts) > 1:
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if part:
+                    await self._emit_sentence(part)  # recurse for the text part
+                if i < len(parts) - 1:
+                    # Insert a pause marker between parts
+                    await self.event_bus.publish(EventType.PAUSE_MARKER, {
+                        "duration_ms": 300,
+                        "sentence_index": self._sentence_index,
+                    })
+                    self._logger.debug("Pause marker [...] at sentence %d", self._sentence_index)
+            return
+
+        # ── V2: Check for clip tags [laughs], [chuckles], etc. ───────────
+        # Pattern: sentence might be just "[laughs]" or contain it inline
+        clip_pattern = re.compile(r'\[(laughs|chuckles|light_laugh|sighs)\]')
+        clip_match = clip_pattern.search(sentence)
+        if clip_match:
+            clip_tag = clip_match.group(1)
+            # Text before the clip tag
+            text_before = sentence[:clip_match.start()].strip()
+            # Text after the clip tag
+            text_after = sentence[clip_match.end():].strip()
+
+            # Emit text before the clip (if any)
+            if text_before:
+                await self._emit_speech_token(text_before)
+
+            # Fire PLAY_CLIP event for the clip
+            await self.event_bus.publish(EventType.PLAY_CLIP, {
+                "clip_name": clip_tag,
+                "sentence_index": self._sentence_index,
+            })
+            self._logger.debug("Clip tag [%s] at sentence %d", clip_tag, self._sentence_index)
+
+            # Emit text after the clip (if any)
+            if text_after:
+                await self._emit_speech_token(text_after)
+            return
+
+        # ── Normal sentence (no special tags) ────────────────────────────
+        await self._emit_speech_token(sentence)
+
+    async def _emit_speech_token(self, sentence: str) -> None:
+        """Fire an LLM_SPEECH_TOKEN event for a normal speech sentence."""
         sentence = sentence.strip()
         if not sentence:
             return
@@ -352,7 +415,10 @@ class ResponseParser:
         # Extract emotion tag if present
         match = EMOTION_TAG_PATTERN.search(sentence)
         if match:
-            self._current_emotion = match.group(1)
+            tag = match.group(1)
+            # Only set emotion if it's an actual emotion, not a clip tag
+            if tag not in CLIP_TAGS and tag != PAUSE_TAG:
+                self._current_emotion = tag
 
         await self.event_bus.publish(EventType.LLM_SPEECH_TOKEN, {
             "text": sentence,

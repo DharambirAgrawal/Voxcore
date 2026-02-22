@@ -199,7 +199,9 @@ EXPORTS:
 
 """
 VoxCore — core/turn_manager.py
-The 4-state machine — orchestrates all turn-taking logic.
+The 5-state machine — orchestrates all turn-taking logic.
+
+States: LISTENING → THINKING → SPEAKING → (SOFT_INJECT → SPEAKING | INTERRUPTED → THINKING)
 """
 
 import asyncio
@@ -351,7 +353,11 @@ class TurnManager:
             if self.session.state is not TurnState.SPEAKING:
                 continue
 
-            self._logger.info("INTERRUPT detected — killing TTS")
+            # Check if this interrupt came from the speaking monitor with a transcript
+            monitor_transcript = event.data.get("transcript", "")
+            source = event.data.get("source", "")
+
+            self._logger.info("INTERRUPT detected — killing TTS (source=%s)", source or "gate1")
             await self.session.set_state(TurnState.INTERRUPTED)
 
             # Cancel the running LLM task
@@ -372,7 +378,21 @@ class TurnManager:
                 self._interrupted_content = ""
 
             self._just_interrupted = True  # next transcript is the interrupting speech
-            await self.session.set_state(TurnState.LISTENING)
+
+            # If the speaking monitor already has a transcript, pre-load it
+            # so the user doesn't have to wait for a full STT cycle
+            if monitor_transcript and source == "speaking_monitor":
+                self._logger.info(
+                    "Pre-loaded interrupt transcript from monitor: '%s'",
+                    monitor_transcript,
+                )
+                await self.session.set_state(TurnState.LISTENING)
+                # Directly process the monitor transcript as user speech
+                await self.session.add_turn("user", monitor_transcript)
+                self._just_interrupted = False
+                await self._start_llm_response(monitor_transcript)
+            else:
+                await self.session.set_state(TurnState.LISTENING)
 
     # ── playback done handling ─────────────────────────────────────────────
 
@@ -380,7 +400,7 @@ class TurnManager:
         while True:
             await self._playback_done_queue.get()
 
-            if self.session.state is TurnState.SPEAKING:
+            if self.session.state in (TurnState.SPEAKING, TurnState.SOFT_INJECT):
                 await self.session.set_state(TurnState.LISTENING)
                 self._logger.info("Playback done → LISTENING")
             # If INTERRUPTED, the interrupt handler already transitioned state
@@ -428,6 +448,16 @@ class TurnManager:
 
             # Wait briefly for the TextInjector to finish adding to text_in_queue
             await asyncio.sleep(0.05)
+
+            # Cancel the previous LLM task so we don't have two streams running
+            # at the same time (which causes raw tool result text to be spoken).
+            if self._current_llm_task is not None and not self._current_llm_task.done():
+                self._current_llm_task.cancel()
+                try:
+                    await self._current_llm_task
+                except asyncio.CancelledError:
+                    pass
+                self._interrupted_content = ""  # discard partial from cancelled stream
 
             # Don't add a fake user turn — just build prompt from existing state
             # (the tool result is already in text_in_queue, PromptBuilder.build()

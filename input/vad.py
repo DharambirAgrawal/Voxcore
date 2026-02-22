@@ -501,7 +501,7 @@ class VADProcessor:
         self._confirm_start_time: float = 0.0
 
         # ── Echo suppression ──
-        self._post_speak_cooldown_ms: float = 700.0
+        self._post_speak_cooldown_ms: float = 1500.0
         self._last_speaking_end: float = 0.0
         self._was_speaking: bool = False
 

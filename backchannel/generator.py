@@ -60,6 +60,15 @@ BACKCHANNEL_PHRASES = {
 
 }
 
+# V2: Emotional reaction clips — used inline during AI speech when the LLM
+# emits tags like [laughs], [chuckles], [light_laugh], [sighs].
+EMOTIONAL_CLIPS = {
+    "laughs":       "Ha, that's great!",
+    "chuckles":     "Heh.",
+    "light_laugh":  "Hm heh.",
+    "sighs":        "Mm.",
+}
+
 DEFAULT_OUTPUT_DIR = "clips/heart/"
 DEFAULT_MODEL_PATH = "models/kokoro-v1.0.onnx"
 DEFAULT_VOICES_PATH = "../models/voices-v1.0.bin"
@@ -134,12 +143,14 @@ class ClipGenerator:
         self._logger.info("Kokoro model loaded.")
 
     def generate_all(self, phrases: dict | None = None) -> dict[str, bool]:
-        """Generate all backchannel clips, skipping existing ones."""
+        """Generate all backchannel clips and emotional clips, skipping existing ones."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
+        # V2: Merge emotional clips into the generation pass
+        all_phrases = {**phrases, **EMOTIONAL_CLIPS}
         results: dict[str, bool] = {}
 
-        for clip_name, text in phrases.items():
+        for clip_name, text in all_phrases.items():
             output_path = self.output_dir / f"{clip_name}.wav"
 
             if output_path.exists():
@@ -188,11 +199,13 @@ class ClipGenerator:
             return False
 
     def regenerate_all(self, phrases: dict | None = None) -> dict[str, bool]:
-        """Delete existing clips and regenerate all."""
+        """Delete existing clips and regenerate all (including emotional clips)."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
+        # V2: Merge emotional clips
+        all_phrases = {**phrases, **EMOTIONAL_CLIPS}
 
-        for clip_name in phrases:
+        for clip_name in all_phrases:
             clip_path = self.output_dir / f"{clip_name}.wav"
             if clip_path.exists():
                 clip_path.unlink()

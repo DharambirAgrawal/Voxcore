@@ -254,6 +254,13 @@ class EventType(str, Enum):
     BACKCHANNEL_OPPORTUNITY = "backchannel_opportunity"
     BACKCHANNEL_FIRE = "backchannel_fire"
 
+    # --- Speaking Monitor Events (v2) ---
+    GATE1_PASSED = "gate1_passed"
+    PAUSE_MARKER = "pause_marker"
+    PLAY_CLIP = "play_clip"
+    POSITIVE_REACTION = "positive_reaction"
+    MONITOR_CLASSIFY = "monitor_classify"
+
     # --- Agent Events ---
     TOOL_RESULT_READY = "tool_result_ready"
     AGENT_JSON_OUT = "agent_json_out"
@@ -305,7 +312,7 @@ class EventBus:
         if callback is not None:
             self.on(event_type, callback)
             return None
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._subscribers.setdefault(event_type, []).append(queue)
         return queue
 

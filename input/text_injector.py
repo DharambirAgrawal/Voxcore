@@ -187,9 +187,9 @@ class TextInjector:
     ) -> None:
         """Convenience method for injecting tool execution results."""
         if success:
-            content = f"[TOOL RESULT — {action}]: {result}"
+            content = f"Result from {action}: {result}"
         else:
-            content = f"[TOOL ERROR — {action}]: {result}"
+            content = f"Error from {action}: {result}"
 
         await self.inject(content, priority="high", source="tool_result")
 

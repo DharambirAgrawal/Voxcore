@@ -176,6 +176,7 @@ NOTES ON AUDIO FORMAT:
 """
 
 import asyncio
+import collections
 import logging
 from typing import Any, Optional, List
 
@@ -184,9 +185,18 @@ import sounddevice as sd
 
 from core.event_bus import EventBus
 
+# V2: Default correlation threshold for echo suppression
+DEFAULT_ECHO_CORRELATION_THRESHOLD = 0.7
+
 
 class MicStream:
-    """Continuous microphone audio capture producing fixed-size chunks."""
+    """Continuous microphone audio capture producing fixed-size chunks.
+
+    V2 additions:
+    - Cross-correlation echo suppression: maintains a reference buffer of
+      recently played audio. When an incoming mic chunk correlates strongly
+      (above threshold) with the reference, it's treated as echo and dropped.
+    """
 
     def __init__(self, event_bus: EventBus, config: dict) -> None:
         self.event_bus: EventBus = event_bus
@@ -196,10 +206,20 @@ class MicStream:
         self.calibration_duration: float = config.get("noise_floor_calibration_s", 0.5)
         self.noise_floor: float = 0.0
         self._consumer_queues: List[asyncio.Queue] = []
+        self._raw_consumer_queues: List[asyncio.Queue] = []  # V2: bypass echo suppression
         self._stream: Optional[sd.InputStream] = None
         self._running: bool = False
         self._logger: logging.Logger = logging.getLogger("MicStream")
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # V2: Echo suppression via cross-correlation
+        self._echo_threshold: float = config.get(
+            "echo_correlation_threshold", DEFAULT_ECHO_CORRELATION_THRESHOLD
+        )
+        # Rolling reference buffer — stores ~0.5s of playback audio for correlation
+        ref_samples = int(self.sample_rate * 0.5)
+        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_samples)
+        self._echo_suppression_enabled: bool = config.get("echo_suppression", True)
 
     async def run(self) -> None:
         """Start mic capture and run forever until cancelled."""
@@ -235,6 +255,8 @@ class MicStream:
         """
         Called from PortAudio C thread. Must be fast, no awaits, no heavy work.
         Copies data and pushes float32 normalised chunks to all consumer queues.
+
+        V2: Performs cross-correlation echo check before distributing.
         """
         if status.input_overflow:
             self._logger.warning("Mic input overflow detected")
@@ -247,7 +269,27 @@ class MicStream:
         if loop is None:
             return
 
-        # Fan-out to every registered consumer queue
+        # V2: Raw consumers always get ALL audio (no echo suppression).
+        # InterruptionDetector uses this — it has its own echo EMA discrimination.
+        for q in self._raw_consumer_queues:
+
+            def _enqueue_raw(queue: asyncio.Queue = q) -> None:
+                try:
+                    queue.put_nowait(chunk_f32)
+                except asyncio.QueueFull:
+                    pass  # drop silently — raw consumers can tolerate loss
+
+            loop.call_soon_threadsafe(_enqueue_raw)
+
+        # V2: Echo suppression — check if mic chunk correlates with recent playback
+        if self._echo_suppression_enabled and len(self._reference_buffer) >= len(chunk_f32):
+            ref_arr = np.array(list(self._reference_buffer)[-len(chunk_f32):], dtype=np.float32)
+            correlation = self._fast_correlation(chunk_f32, ref_arr)
+            if correlation > self._echo_threshold:
+                # This chunk is likely echo — drop it for filtered consumers only
+                return
+
+        # Fan-out to every registered (echo-filtered) consumer queue
         for q in self._consumer_queues:
 
             def _enqueue_consumer(queue: asyncio.Queue = q) -> None:
@@ -290,9 +332,21 @@ class MicStream:
         """
         Register a new consumer and return a dedicated queue that will
         receive a copy of every audio chunk independently.
+        Echo-suppressed chunks are NOT delivered to this queue.
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._consumer_queues.append(q)
+        return q
+
+    def add_raw_consumer(self) -> asyncio.Queue:
+        """V2: Register a raw consumer that receives ALL audio, including
+        chunks that would be dropped by echo suppression.
+
+        Used by InterruptionDetector which has its own echo discrimination
+        (echo EMA + energy gate) and needs every chunk to work correctly.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._raw_consumer_queues.append(q)
         return q
 
     def inject_chunk(self, audio_bytes: bytes) -> None:
@@ -314,6 +368,28 @@ class MicStream:
                 except asyncio.QueueFull:
                     pass  # drop silently
             loop.call_soon_threadsafe(_enqueue)
+
+    def set_playback_reference(self, frame: np.ndarray) -> None:
+        """V2: Called by AudioPlayer to feed recently played audio into the
+        reference buffer for cross-correlation echo suppression.
+
+        Args:
+            frame: float32 mono audio frame from AudioPlayer's output.
+        """
+        self._reference_buffer.extend(frame.tolist())
+
+    @staticmethod
+    def _fast_correlation(a: np.ndarray, b: np.ndarray) -> float:
+        """V2: Fast normalized cross-correlation between two same-length arrays.
+
+        Returns a value in [-1, 1]. Values > 0.7 indicate the mic signal
+        closely matches the playback signal (likely echo).
+        """
+        a_norm = np.linalg.norm(a)
+        b_norm = np.linalg.norm(b)
+        if a_norm < 1e-10 or b_norm < 1e-10:
+            return 0.0
+        return float(np.dot(a, b) / (a_norm * b_norm))
 
     async def stop(self) -> None:
         """Stop and close the microphone stream."""

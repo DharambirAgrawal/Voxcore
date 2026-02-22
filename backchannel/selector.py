@@ -249,7 +249,13 @@ _MEDIUM_SPEECH_S = 5
 
 
 class BackchannelSelector:
-    """Picks and fires contextually appropriate backchannel clips."""
+    """Picks and fires contextually appropriate backchannel clips.
+
+    V2 additions:
+    - POSITIVE_REACTION event handler: when the SpeakingMonitor classifies
+      user speech as supportive (IGNORE), it biases next backchannel
+      toward 'agreement' or 'encouragement' categories.
+    """
 
     def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
         self.session: Session = session
@@ -264,6 +270,9 @@ class BackchannelSelector:
         self._last_clip_name: str = ""
         self._available_clips: set[str] = set()
 
+        # V2: Positive reaction bias — influences category selection
+        self._positive_reaction_pending: bool = False
+
         self._logger: logging.Logger = logging.getLogger("BackchannelSelector")
 
     async def run(self) -> None:
@@ -272,6 +281,13 @@ class BackchannelSelector:
 
         # Subscribe to backchannel opportunity events
         queue = self.event_bus.subscribe(EventType.BACKCHANNEL_OPPORTUNITY)
+
+        # V2: Subscribe to POSITIVE_REACTION from SpeakingMonitor
+        async def _on_positive_reaction(event) -> None:
+            self._positive_reaction_pending = True
+            self._logger.debug("Positive reaction received — biasing next backchannel")
+
+        self.event_bus.subscribe(EventType.POSITIVE_REACTION, _on_positive_reaction)
 
         self._logger.info("BackchannelSelector running")
 
@@ -367,7 +383,16 @@ class BackchannelSelector:
         return True
 
     def _determine_category(self, data: dict) -> str:
-        """Choose backchannel category based on speech context."""
+        """Choose backchannel category based on speech context.
+
+        V2: If a POSITIVE_REACTION event was received, bias toward
+        'agreement' category to acknowledge user's supportive feedback.
+        """
+        # V2: Positive reaction bias takes priority
+        if self._positive_reaction_pending:
+            self._positive_reaction_pending = False
+            return "agreement"
+
         is_question = data.get("is_question", False)
         energy_level = data.get("energy_level", 0.0)
         speech_duration = data.get("speech_duration_s", 0.0)

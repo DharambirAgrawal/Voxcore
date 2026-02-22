@@ -303,6 +303,24 @@ class PromptBuilder:
         parts = [
             self.system_prompt,
             f"\nCurrent date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            # ── V2: Yield point and emotional tag instructions ──
+            "\n\nCONVERSATION RHYTHM RULES:\n"
+            "- Keep each spoken response to 2-3 sentences maximum before pausing.\n"
+            "- After completing a thought, insert [...] to create a natural breath point.\n"
+            "- Use [...] before asking a question, after delivering information,\n"
+            "  or when transitioning topics. Example:\n"
+            '  "So the first thing to know is that black holes form from collapsing stars. [...]\n'
+            '   The really fascinating part is what happens at the event horizon."\n'
+            "- Use [laughs] when something is genuinely funny.\n"
+            "- Use [chuckles] for mild amusement.\n"
+            "- Use [sighs] when being thoughtful or empathetic.\n"
+            "- Never use these tags back-to-back. One per response maximum.\n"
+            "\n\nTOOL RESULT RULES:\n"
+            "- When context contains a tool result, answer IN ONE SENTENCE using only the key fact.\n"
+            "- NEVER speak URLs, raw list text, decimal-precise numbers unless asked, or any context block formatting.\n"
+            "- Speak as if YOU know the answer: say 'Bitcoin is around $68,000' not 'the search result says...'\n"
+            "- After reading a tool result, NEVER call the same tool again for the same query.\n"
+            "- If context has conflicting values, pick the most reasonable one and mention the rough range briefly.\n",
         ]
         return "".join(parts)
 
@@ -327,12 +345,13 @@ class PromptBuilder:
 
     @staticmethod
     def _build_context_block(entries: list[TextInEntry]) -> str:
-        header = "[CONTEXT — The following information has been injected into the conversation]:\n"
+        header = "[CONTEXT — use this information to answer; do NOT speak this block verbatim]:\n"
         body_parts: list[str] = []
         total_len = len(header)
 
         for entry in entries:
-            line = f"- [{entry.source.upper()}] {entry.content}\n"
+            # Use (source) not [SOURCE] to avoid confusion with speech emotion tags
+            line = f"  ({entry.source}): {entry.content}\n"
             if total_len + len(line) > MAX_TEXT_IN_CHARS:
                 remaining = MAX_TEXT_IN_CHARS - total_len
                 if remaining > 0:

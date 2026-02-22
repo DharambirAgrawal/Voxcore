@@ -197,6 +197,7 @@ LATENCY:
 
 
 import asyncio
+import collections
 import logging
 import io
 from typing import Optional
@@ -208,9 +209,18 @@ from scipy.io import wavfile
 from core.session import Session, TurnState
 from core.event_bus import EventBus, EventType
 
+# V2: Reference buffer duration for echo suppression (seconds)
+REFERENCE_BUFFER_DURATION_S = 2.0
+
 
 class AudioPlayer:
-    """Interruptible async audio player for TTS output and backchannel clips."""
+    """Interruptible async audio player for TTS output and backchannel clips.
+
+    V2 additions:
+    - PAUSE_MARKER event handling: injects 300ms silence into playback queue
+    - Reference signal buffer: maintains rolling 2s buffer of played audio
+      for correlation-based echo suppression in MicStream
+    """
 
     def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
         self.session: Session = session
@@ -233,10 +243,42 @@ class AudioPlayer:
         self._audio_accumulator: bytearray = bytearray()
         self._tts_stream_done: bool = False  # True once TTSClient has synthesized all sentences
 
+        # V2: Reference signal buffer for echo suppression
+        # Stores recent playback audio so mic_stream can cross-correlate
+        ref_buffer_samples = int(self.output_sample_rate * REFERENCE_BUFFER_DURATION_S)
+        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_buffer_samples)
+
+        # V2: Callback for mic_stream to receive playback reference signal
+        self._reference_callback = None
+
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
+
+    def set_reference_callback(self, callback) -> None:
+        """V2: Register a callback that receives played audio frames for echo suppression.
+
+        The callback receives (frame: np.ndarray) of float32 audio data.
+        MicStream uses this to build its reference buffer for cross-correlation.
+        """
+        self._reference_callback = callback
+
+    def get_reference_buffer(self) -> np.ndarray:
+        """V2: Return the current reference signal buffer as a numpy array.
+
+        Used by MicStream for cross-correlation echo suppression.
+        """
+        if not self._reference_buffer:
+            return np.array([], dtype=np.float32)
+        return np.array(self._reference_buffer, dtype=np.float32)
 
     async def run(self) -> None:
         """Run all player loops concurrently."""
+        # V2: Subscribe to PAUSE_MARKER events
+        async def _on_pause_marker(event) -> None:
+            duration_ms = event.data.get("duration_ms", 300)
+            await self._inject_silence(duration_ms)
+
+        self.event_bus.subscribe(EventType.PAUSE_MARKER, _on_pause_marker)
+
         await asyncio.gather(
             self._process_tts_chunks(),
             self._process_interrupts(),
@@ -360,6 +402,16 @@ class AudioPlayer:
                 end = min(offset + frame_samples, total_samples)
                 frame = audio[offset:end]
                 self._current_stream.write(frame)
+
+                # V2: Feed reference buffer for echo suppression
+                mono_frame = frame[:, 0] if frame.ndim > 1 else frame
+                self._reference_buffer.extend(mono_frame.tolist())
+                if self._reference_callback is not None:
+                    try:
+                        self._reference_callback(mono_frame)
+                    except Exception:
+                        pass
+
                 offset = end
 
                 # Yield to event loop so interrupts can be detected
@@ -373,6 +425,20 @@ class AudioPlayer:
             self._logger.error("Playback error: %s", e)
         finally:
             self._current_stream = None
+
+    async def _inject_silence(self, duration_ms: int) -> None:
+        """V2: Inject silence into the playback queue for pause markers.
+
+        Creates a silent audio array of the specified duration and enqueues it
+        for the playback loop. This creates natural pauses when the LLM emits [...].
+        """
+        num_samples = int(self.output_sample_rate * duration_ms / 1000)
+        silence = np.zeros(num_samples, dtype=np.float32)
+        try:
+            await self._play_queue.put(silence)
+            self._logger.debug("Injected %dms silence", duration_ms)
+        except asyncio.QueueFull:
+            self._logger.warning("Play queue full — could not inject silence")
 
     async def _process_interrupts(self) -> None:
         """Listen for interrupt events and immediately stop playback."""
