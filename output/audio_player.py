@@ -220,6 +220,14 @@ class AudioPlayer:
     - PAUSE_MARKER event handling: injects 300ms silence into playback queue
     - Reference signal buffer: maintains rolling 2s buffer of played audio
       for correlation-based echo suppression in MicStream
+
+    V3 additions:
+    - Playback pause/resume: on PLAYBACK_PAUSE, immediately stops writing
+      audio frames to the speaker while keeping position. On PLAYBACK_RESUME,
+      continues from the exact frame where it paused. This gives the user
+      immediate silence feedback (~20ms latency) while the classification
+      pipeline decides whether to INTERRUPT, INJECT, or IGNORE.
+    - Volume ducking kept as fallback but primary flow is pause/resume.
     """
 
     def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
@@ -235,13 +243,25 @@ class AudioPlayer:
         self._interrupt_queue: asyncio.Queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
         self._backchannel_queue: asyncio.Queue = event_bus.subscribe(EventType.BACKCHANNEL_FIRE)
         self._tts_all_done_queue: asyncio.Queue = event_bus.subscribe(EventType.TTS_ALL_DONE)
+        self._volume_duck_queue: asyncio.Queue = event_bus.subscribe(EventType.VOLUME_DUCK)
+        self._volume_restore_queue: asyncio.Queue = event_bus.subscribe(EventType.VOLUME_RESTORE)
+        self._pause_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_PAUSE)
+        self._resume_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_RESUME)
 
         # State
         self._is_playing: bool = False
         self._is_interrupted: bool = False
+        self._is_paused: bool = False           # V3: true pause — freeze in place
+        self._pause_event: asyncio.Event = asyncio.Event()  # set = not paused
+        self._pause_event.set()  # start unpaused
         self._current_stream: Optional[sd.OutputStream] = None
         self._audio_accumulator: bytearray = bytearray()
-        self._tts_stream_done: bool = False  # True once TTSClient has synthesized all sentences
+        self._tts_stream_done: bool = False
+
+        # V3: Volume ducking — applied per-frame during playback
+        self._volume: float = 1.0
+        self._target_volume: float = 1.0
+        self._volume_ramp_speed: float = 0.05
 
         # V2: Reference signal buffer for echo suppression
         # Stores recent playback audio so mic_stream can cross-correlate
@@ -285,6 +305,10 @@ class AudioPlayer:
             self._process_backchannels(),
             self._playback_loop(),
             self._watch_tts_all_done(),
+            self._process_volume_duck(),
+            self._process_volume_restore(),
+            self._process_pause(),
+            self._process_resume(),
         )
 
     async def _watch_tts_all_done(self) -> None:
@@ -371,7 +395,13 @@ class AudioPlayer:
                 self._logger.debug("Playback complete")
 
     async def _play_audio(self, audio: np.ndarray) -> None:
-        """Play audio array through speakers with 20ms frame interrupt granularity."""
+        """Play audio array through speakers with 20ms frame interrupt granularity.
+
+        V3: Supports true pause/resume. When _is_paused is True, the playback
+        loop waits on _pause_event instead of writing frames. When resumed,
+        it continues from the exact frame offset where it paused.
+        Also applies volume ducking per-frame for smooth transitions.
+        """
         # Normalize to float32
         if audio.dtype == np.int16:
             audio = audio.astype(np.float32) / 32768.0
@@ -399,8 +429,53 @@ class AudioPlayer:
                 if self._is_interrupted:
                     break
 
+                # V3: True pause — wait here until resumed or interrupted
+                if self._is_paused:
+                    # Stop the stream while paused to avoid underflow clicks
+                    if self._current_stream is not None:
+                        try:
+                            self._current_stream.stop()
+                        except Exception:
+                            pass
+                    self._logger.debug("Playback PAUSED at frame %d/%d", offset, total_samples)
+                    # Wait for resume or interrupt
+                    while self._is_paused and not self._is_interrupted:
+                        await asyncio.sleep(0.02)
+                    if self._is_interrupted:
+                        break
+                    # Restart the stream from where we left off
+                    self._logger.debug("Playback RESUMED at frame %d/%d", offset, total_samples)
+                    try:
+                        self._current_stream = sd.OutputStream(
+                            samplerate=self.output_sample_rate,
+                            channels=audio.shape[1],
+                            dtype="float32",
+                        )
+                        self._current_stream.start()
+                    except Exception as e:
+                        self._logger.error("Failed to restart stream after resume: %s", e)
+                        break
+
                 end = min(offset + frame_samples, total_samples)
-                frame = audio[offset:end]
+                frame = audio[offset:end].copy()
+
+                # V3: Smooth volume ramping per-frame
+                if abs(self._volume - self._target_volume) > 0.001:
+                    if self._volume < self._target_volume:
+                        self._volume = min(
+                            self._volume + self._volume_ramp_speed,
+                            self._target_volume,
+                        )
+                    else:
+                        self._volume = max(
+                            self._volume - self._volume_ramp_speed,
+                            self._target_volume,
+                        )
+
+                # Apply volume multiplier
+                if self._volume < 0.99:
+                    frame = frame * self._volume
+
                 self._current_stream.write(frame)
 
                 # V2: Feed reference buffer for echo suppression
@@ -414,7 +489,7 @@ class AudioPlayer:
 
                 offset = end
 
-                # Yield to event loop so interrupts can be detected
+                # Yield to event loop so interrupts/pauses can be detected
                 await asyncio.sleep(0)
 
             stream = self._current_stream
@@ -447,6 +522,11 @@ class AudioPlayer:
             self._logger.info("INTERRUPT — stopping playback")
 
             self._is_interrupted = True
+            self._is_paused = False  # clear pause state
+
+            # V3: Reset volume to full on interrupt
+            self._volume = 1.0
+            self._target_volume = 1.0
 
             # Clear play queue
             while not self._play_queue.empty():
@@ -473,6 +553,74 @@ class AudioPlayer:
             # Brief delay then re-enable
             await asyncio.sleep(0.05)
             self._is_interrupted = False
+
+    async def _process_volume_duck(self) -> None:
+        """Listen for VOLUME_DUCK events and reduce playback volume.
+
+        When the user starts speaking (Gate 1 passes), the SpeakingMonitor
+        fires VOLUME_DUCK. We immediately set the target volume low so the
+        user feels heard. The per-frame ramp in _play_audio handles the
+        smooth transition to avoid audio clicks.
+        """
+        while True:
+            event = await self._volume_duck_queue.get()
+            level = event.data.get("level", 0.15) if event.data else 0.15
+            self._target_volume = max(0.0, min(1.0, level))
+            # Use faster ramp for ducking (immediate feedback)
+            self._volume_ramp_speed = 0.15
+            self._logger.info(
+                "Volume DUCK → %.0f%% (reason: %s)",
+                self._target_volume * 100,
+                event.data.get("reason", "unknown") if event.data else "unknown",
+            )
+
+    async def _process_volume_restore(self) -> None:
+        """Listen for VOLUME_RESTORE events and ramp volume back to 100%.
+
+        Fires after classification determines IGNORE or INJECT — the user
+        wasn't actually interrupting, so restore normal volume.
+        """
+        while True:
+            event = await self._volume_restore_queue.get()
+            self._target_volume = 1.0
+            # Use slower ramp for restore (smooth fade-in)
+            self._volume_ramp_speed = 0.05
+            self._logger.info(
+                "Volume RESTORE → 100%% (reason: %s)",
+                event.data.get("reason", "unknown") if event.data else "unknown",
+            )
+
+    async def _process_pause(self) -> None:
+        """Listen for PLAYBACK_PAUSE events — freeze playback immediately.
+
+        PersonaPlex-inspired: when user starts speaking, we don't just duck
+        the volume — we completely stop outputting audio within 20ms. This
+        gives the mic a clean signal (no echo) to transcribe the user's speech.
+        The playback position is preserved so we can resume later.
+        """
+        while True:
+            event = await self._pause_queue.get()
+            if not self._is_paused and self._is_playing:
+                self._is_paused = True
+                self._logger.info(
+                    "Playback PAUSED (reason: %s)",
+                    event.data.get("reason", "user_speaking") if event.data else "user_speaking",
+                )
+
+    async def _process_resume(self) -> None:
+        """Listen for PLAYBACK_RESUME events — continue from where we paused.
+
+        Fires when classification returns IGNORE or INJECT — the user was
+        just reacting, not interrupting. AI picks up exactly where it left off.
+        """
+        while True:
+            event = await self._resume_queue.get()
+            if self._is_paused:
+                self._is_paused = False
+                self._logger.info(
+                    "Playback RESUMED (reason: %s)",
+                    event.data.get("reason", "classification_done") if event.data else "classification_done",
+                )
 
     async def _process_backchannels(self) -> None:
         """Play backchannel audio clips (e.g. 'mhm', 'yeah') when not speaking."""

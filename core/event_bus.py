@@ -260,6 +260,10 @@ class EventType(str, Enum):
     PLAY_CLIP = "play_clip"
     POSITIVE_REACTION = "positive_reaction"
     MONITOR_CLASSIFY = "monitor_classify"
+    VOLUME_DUCK = "volume_duck"        # Duck audio volume (user speaking)
+    VOLUME_RESTORE = "volume_restore"  # Restore audio volume (false alarm / IGNORE)
+    PLAYBACK_PAUSE = "playback_pause"    # Freeze playback in place (user speaking)
+    PLAYBACK_RESUME = "playback_resume"  # Resume playback from where it froze
 
     # --- Agent Events ---
     TOOL_RESULT_READY = "tool_result_ready"

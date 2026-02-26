@@ -71,7 +71,7 @@ models:
   llm_agentic: "moonshotai/kimi-k2-instruct"                    # Agentic brain — tool use
   llm_deep: "qwen/qwen3-32b"                                    # Deep brain — summaries / analysis
   llm_power: "openai/gpt-oss-120b"                              # Power brain — max intelligence (rare)
-  llm_monitor: "qwen/qwen3-32b"                            # V2: Speaking monitor interrupt classifier
+  llm_monitor: "llama-3.1-8b-instant"                            # V3: Fast classifier for speaking monitor (no thinking prefix)
   tts_model: "models/kokoro-v1.0.onnx"                            # Kokoro-ONNX model file (local)
   tts_voices: "models/voices-v1.0.bin"                            # Kokoro voice embeddings file (local)
   safety: "meta-llama/llama-guard-4-12b"                         # Llama Guard — safety filtering
@@ -96,17 +96,20 @@ audio:
                                       # when silence returns, DISCARD it entirely
                                       # (filters isolated "umm" ~200ms, coughs ~150ms)
   noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
-  echo_correlation_threshold: 0.7    # V2: Cross-correlation threshold for echo suppression (0.0–1.0)
-  echo_suppression: true             # V2: Enable/disable echo suppression in mic_stream
+  echo_correlation_threshold: 0.7    # V2: Cross-correlation threshold for echo suppression (legacy fallback)
+  echo_suppression: true             # V2: Enable/disable legacy cross-correlation echo suppression
+  echo_cancellation: true            # V3: WebRTC-style adaptive AEC (recommended — replaces echo_suppression)
+  aec_filter_blocks: 12              # V3: AEC filter partitions (12 × 30ms = 360ms echo tail)
+  aec_step_size: 0.3                 # V3: AEC NLMS step size (0.0–1.0, 0.3 = safe for most rooms)
 
 # V2: Speaking Monitor — 3-gate interrupt classification during AI speech
 speaking_monitor:
   enabled: true                        # Enable/disable the speaking monitor (Gate 2 + Gate 3)
-  model: "qwen/qwen3-32b"        # LLM model for semantic interrupt classification (Gate 3)
+  model: "llama-3.1-8b-instant"        # LLM model for semantic interrupt classification (Gate 3)
   gate1_min_duration_ms: 300           # Gate 1: minimum speech duration before triggering (ms)
   gate2_filler_list: []                # Gate 2: additional filler words (merged with defaults)
-  gate3_debounce_s: 3                  # Gate 3: minimum seconds between LLM classification calls
-  gate3_audio_window_ms: 600           # Gate 3: audio window for transcription (ms)
+  gate3_debounce_s: 1.5               # Gate 3: minimum seconds between LLM classification calls
+  gate3_audio_window_ms: 2000          # Gate 3: audio window for transcription (ms)
   context_words: 30                    # Number of recent AI speech words to include in classifier prompt
 
 backchannel:

@@ -247,11 +247,13 @@ NOTES:
 ║         WEBSOCKET SERVER — REAL-TIME BIDIRECTIONAL AUDIO/TEXT STREAMING          ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 """
-
+""
 import logging
 import asyncio
 import json
+import os
 import struct
+import sys
 import time
 from typing import Optional
 
@@ -259,6 +261,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 import uvicorn
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from core.event_bus import EventBus, EventType
 from core.session import Session, TurnState
 

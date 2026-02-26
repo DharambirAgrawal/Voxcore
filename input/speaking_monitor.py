@@ -50,37 +50,63 @@ from input.mic_stream import MicStream
 
 CLASSIFIER_SYSTEM_PROMPT = """\
 You are a real-time speech intent classifier for a voice AI system.
-The AI assistant is currently speaking. The user has said something.
+The AI assistant was speaking and paused because the user started talking.
 Classify the user's intent as exactly one of three words:
 
-IGNORE — The user is reacting naturally without wanting to take over.
+IGNORE — The user is reacting passively without wanting to take over.
   Examples: "yeah", "right", "uh-huh", "wow", "haha", "oh interesting",
-            laughter, short affirmations, single word reactions.
-  IMPORTANT: If the user's transcript contains words or phrases the AI is
-  currently saying (acoustic echo/feedback from speakers), classify as IGNORE.
-  Echo signs: transcript closely matches or is a fragment of the AI's words.
+            laughter, brief affirmations mid-story (mm-hmm, cool).
 
 INJECT — The user added something meaningful but doesn't need the AI to stop.
   Examples: "oh and also...", "by the way...", "actually I forgot to mention",
             adding context, minor corrections that don't change the topic.
 
-INTERRUPT — The user clearly wants the AI to stop and respond to them.
-  Examples: "wait", "stop", "hold on", "no", "actually...", "I have a question",
-            asking a new question, contradicting, expressing urgency.
+INTERRUPT — The user wants the AI to stop and respond to something new.
+  Examples: asking a question, changing the topic, contradicting,
+            saying something that requires a new response from the AI.
+
+RULE: If the user said something short and ambiguous, choose IGNORE.
+RULE: If the user is clearly asking a question or making a statement that
+      needs a response, choose INTERRUPT.
 
 Reply with ONLY one word: IGNORE, INJECT, or INTERRUPT"""
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FAST STOP WORDS — these bypass the LLM entirely for instant response
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Words/phrases that ALWAYS mean "stop talking"
+STOP_KEYWORDS: set[str] = {
+    "stop", "wait", "hold on", "hold", "pause", "shut up", "be quiet",
+    "enough", "quiet", "hush", "silence", "stop it", "stop stop",
+    "stop stop stop", "okay stop", "ok stop", "please stop", "can you stop",
+    "stop please", "that's enough", "ok enough", "okay enough",
+    "stop talking", "hey stop", "no stop", "no no", "no no no",
+}
+
+# Words/phrases that are attention-getters = user wants to speak
+ATTENTION_KEYWORDS: set[str] = {
+    "hey", "hello", "excuse me", "listen", "wait wait",
+    "actually", "but", "question", "i have a question",
+    "can i", "let me", "what about", "how about",
+    "thank you", "thanks", "okay thanks", "ok thanks",
+    "that's great thanks", "alright thanks",
+}
+
 
 class SpeakingMonitor:
-    """Gate 3 — LLM-powered semantic interrupt classifier.
+    """PersonaPlex-inspired interrupt classifier.
 
-    Activated during SPEAKING state only. Receives GATE1_PASSED events
-    from InterruptionDetector, runs Gate 2 (filler check) and Gate 3
-    (allam-2-7b classification). Fires INTERRUPT_DETECTED, publishes
-    SOFT_INJECT context, or does nothing (IGNORE).
+    When the user speaks during AI playback:
+    1. PAUSE playback instantly (silence within 20ms)
+    2. Collect audio for 600ms (clean mic, no echo)
+    3. Transcribe with Whisper
+    4. Fast keyword check → instant INTERRUPT for "stop/wait/hey"
+    5. Echo + filler check → instant RESUME for false alarms
+    6. LLM classify → INTERRUPT / INJECT / IGNORE(RESUME)
 
-    Uses HF_AUDIO_BASE_URL/transcribe/monitor for fast short-clip STT
-    and Groq allam-2-7b for semantic classification.
+    This creates the natural "conversation pause" feeling — the AI stops
+    talking when you start, listens, then either resumes or responds.
     """
 
     def __init__(
@@ -99,16 +125,16 @@ class SpeakingMonitor:
         # Config
         monitor_cfg = config.get("speaking_monitor", {})
         self._enabled: bool = monitor_cfg.get("enabled", True)
-        self._model: str = monitor_cfg.get("model", "qwen/qwen3-32b")
+        self._model: str = monitor_cfg.get("model", "llama-3.1-8b-instant")
         self._debounce_s: float = monitor_cfg.get("gate3_debounce_s", 3.0)
-        self._audio_window_ms: int = monitor_cfg.get("gate3_audio_window_ms", 600)
+        self._audio_window_ms: int = monitor_cfg.get("gate3_audio_window_ms", 2000)
         self._context_words: int = monitor_cfg.get("context_words", 30)
-
+        self._collection_delay_ms: int = monitor_cfg.get("collection_delay_ms", 600)
         # HF Audio endpoint for /transcribe/monitor
         self._hf_audio_base_url: str = os.environ.get("HF_AUDIO_BASE_URL", "")
         self._hf_audio_api_key: str = os.environ.get("HF_AUDIO_API_KEY", "")
 
-        # Groq client for allam classification
+        # Groq client for classification
         self._groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
         # Audio buffering for rolling window
@@ -118,7 +144,7 @@ class SpeakingMonitor:
         # State tracking
         self._is_active: bool = False
         self._last_classify_time: float = 0.0
-        self._last_ai_speech: str = ""  # Rolling buffer of what the AI is saying
+        self._last_ai_speech: str = ""  # Full AI response text for echo detection
         self._audio_queue: Optional[asyncio.Queue] = None
 
         self._logger = logging.getLogger("SpeakingMonitor")
@@ -193,9 +219,9 @@ class SpeakingMonitor:
         """Track what the AI is currently saying for classification context."""
         text = event.data.get("text", "")
         if text:
-            # Keep a rolling buffer of the last N words
-            words = self._last_ai_speech.split() + text.split()
-            self._last_ai_speech = " ".join(words[-self._context_words:])
+            # Keep the entire AI response for the current turn to ensure
+            # echo detection works even if TTS is lagging far behind LLM generation.
+            self._last_ai_speech += text
 
     async def _on_state_changed(self, event) -> None:
         """Activate/deactivate based on state transitions."""
@@ -226,16 +252,28 @@ class SpeakingMonitor:
             self._logger.debug("SpeakingMonitor deactivated (%s)", new_state)
 
     # ─────────────────────────────────────────────────────────────────────
-    # Classification pipeline (Gate 2 + Gate 3)
+    # PersonaPlex Classification Pipeline
     # ─────────────────────────────────────────────────────────────────────
 
     async def _classify_interrupt(self, gate1_data: dict) -> None:
-        """Run Gate 2 (filler check) and Gate 3 (LLM classification).
+        """PersonaPlex-inspired interrupt classification.
 
-        CRITICAL: If any step fails, we fall back to firing INTERRUPT_DETECTED
-        directly. Gate 1 already confirmed sustained user speech — silently
-        swallowing the interrupt would make the system unresponsive.
+        Flow:
+          1. PAUSE playback instantly (silence within 20ms)
+          2. Wait 600ms for user to finish phrase (mic is clean — no echo)
+          3. Transcribe with Whisper
+          4. Fast keyword check → instant INTERRUPT for "stop/wait/hey"
+          5. Echo check → instant RESUME for AI's own voice
+          6. Filler check → instant RESUME for "uh-huh/yeah"
+          7. LLM classify → INTERRUPT / INJECT / IGNORE(RESUME)
+
+        The key insight: by PAUSING instead of DUCKING, we get:
+        - Instant silence feedback (user feels heard in 20ms)
+        - Clean mic signal (no AI audio contaminating the buffer)
+        - Perfect STT transcription (no echo interference)
+        - Natural conversation feel (like a human pausing to listen)
         """
+        paused = False
         try:
             # Bail if state changed since we started
             if self.session.state != TurnState.SPEAKING:
@@ -244,51 +282,99 @@ class SpeakingMonitor:
             # ── Debounce: set IMMEDIATELY to prevent concurrent tasks ────
             self._last_classify_time = time.time()
 
-            # ── Step 1: Get audio window for transcription ───────────────
-            audio_window = self._get_audio_window()
-            if audio_window is None or len(audio_window) < 100:
-                self._logger.warning(
-                    "Not enough audio for classification — fallback INTERRUPT"
-                )
-                await self._fallback_interrupt(gate1_data)
+            # ── Step 1: PAUSE playback INSTANTLY ─────────────────────────
+            await self.event_bus.publish(
+                EventType.PLAYBACK_PAUSE,
+                {"reason": "user_speaking"},
+                source="SpeakingMonitor",
+            )
+            paused = True
+            self._logger.debug("Playback paused — collecting user speech")
+
+            # ── Step 2: Collection delay ─────────────────────────────────
+            # Wait for user to finish their phrase. AI is SILENT so mic
+            # gets a perfectly clean signal with zero echo contamination.
+            delay_s = self._collection_delay_ms / 1000.0
+            await asyncio.sleep(delay_s)
+
+            # Bail if state changed during the wait
+            if self.session.state != TurnState.SPEAKING:
+                paused = False  # state handler took over
                 return
 
-            # ── Step 2: Transcribe via HF /transcribe/monitor ────────────
+            # ── Step 3: Transcribe ───────────────────────────────────────
+            # Grab recent audio. Since AI was paused, this is pure user voice.
+            audio_window = self._get_audio_window(ms_override=1200)
+            if audio_window is None or len(audio_window) < 100:
+                self._logger.warning(
+                    "Not enough audio — fallback INTERRUPT"
+                )
+                await self._do_interrupt(gate1_data, "")
+                paused = False
+                return
+
             transcript = await self._transcribe_short_clip(audio_window)
             if not transcript or not transcript.strip():
-                # Empty transcript means STT couldn't recognize anything.
-                # This is almost always TTS echo picked up by the mic —
-                # real user speech would produce a transcript.
-                # Treat as IGNORE, not INTERRUPT.
+                # Empty transcript = probably was echo from before the pause
                 self._logger.debug(
-                    "Empty transcript from monitor STT — likely echo, IGNORE"
+                    "Empty transcript — likely pre-pause echo, RESUME"
                 )
+                await self._do_resume("empty_transcript")
+                paused = False
                 return
 
             self._logger.info("Monitor transcript: '%s'", transcript)
 
-            # ── Gate 2: Filler word check ────────────────────────────────
+            # ── Step 4: Fast keyword check ───────────────────────────────
+            # No LLM call needed — instant decision for common stop words.
+            # This is the "say stop once and it stops" experience.
+            normalised = transcript.strip().lower().rstrip(".!?,")
+            if normalised in STOP_KEYWORDS:
+                self._logger.info(
+                    "STOP keyword detected ('%s') → instant INTERRUPT",
+                    normalised,
+                )
+                await self._do_interrupt(gate1_data, transcript)
+                paused = False
+                return
+
+            if normalised in ATTENTION_KEYWORDS:
+                self._logger.info(
+                    "ATTENTION keyword detected ('%s') → instant INTERRUPT",
+                    normalised,
+                )
+                await self._do_interrupt(gate1_data, transcript)
+                paused = False
+                return
+
+            # ── Step 5: Echo transcript check ────────────────────────────
+            if self._is_echo_transcript(transcript):
+                self._logger.info(
+                    "Echo transcript detected ('%s') → RESUME", transcript,
+                )
+                await self._do_resume("echo_transcript")
+                paused = False
+                return
+
+            # ── Step 6: Filler word check ────────────────────────────────
             is_filler, matched_word = self.filler_detector.is_filler(transcript)
             if is_filler:
                 self._logger.info(
-                    "Gate 2: FILLER detected ('%s') — IGNORE",
+                    "FILLER detected ('%s') → RESUME",
                     matched_word or transcript,
                 )
-                # Note as implicit backchannel / positive reaction
                 await self.event_bus.publish(
                     EventType.POSITIVE_REACTION,
                     {"text": transcript, "matched_word": matched_word},
                     source="SpeakingMonitor",
                 )
-                await self.event_bus.publish(
-                    EventType.MONITOR_CLASSIFY,
-                    {"classification": "IGNORE", "reason": "filler",
-                     "transcript": transcript},
-                    source="SpeakingMonitor",
-                )
+                await self._do_resume("filler")
+                paused = False
                 return
 
-            # ── Gate 3: allam-2-7b classification ────────────────────────
+            # ── Step 7: LLM classification ───────────────────────────────
+            # Only reaches here for ambiguous phrases that aren't keywords,
+            # echo, or fillers. LLM decides the intent.
             classification = await self._classify_with_llm(transcript)
 
             self._logger.info(
@@ -303,7 +389,7 @@ class SpeakingMonitor:
                 source="SpeakingMonitor",
             )
 
-            # ── Stale check: state may have changed during async LLM call ─
+            # Stale check
             if self.session.state not in (
                 TurnState.SPEAKING, TurnState.SOFT_INJECT,
             ):
@@ -311,80 +397,142 @@ class SpeakingMonitor:
                     "Classification arrived but state is %s — discarding",
                     self.session.state.value,
                 )
+                paused = False
                 return
 
             # ── Act on classification ────────────────────────────────────
             if classification == "IGNORE":
-                await self.event_bus.publish(
-                    EventType.POSITIVE_REACTION,
-                    {"text": transcript},
-                    source="SpeakingMonitor",
-                )
+                await self._do_resume("ignore")
+                paused = False
 
             elif classification == "INJECT":
-                # Soft inject: add to context silently, AI continues
+                # Resume playback, but inject the user's words into context
                 await self.session.inject_text(
                     content=f"[USER ADDED MID-SPEECH]: {transcript}",
                     priority="high",
                     source="user_mid_speech",
                 )
-                # Briefly transition to SOFT_INJECT to record the event
                 await self.session.set_state(TurnState.SOFT_INJECT)
-                # Return to SPEAKING immediately
                 await self.session.set_state(TurnState.SPEAKING)
                 self._logger.info("INJECT: '%s' added to context", transcript)
+                await self._do_resume("inject")
+                paused = False
 
             elif classification == "INTERRUPT":
-                # Full interrupt
-                self._logger.info("INTERRUPT: killing TTS for '%s'", transcript)
-                await self.event_bus.publish(
-                    EventType.INTERRUPT_DETECTED,
-                    {
-                        "speech_prob": gate1_data.get("speech_prob", 0.0),
-                        "during_sentence": -1,
-                        "transcript": transcript,
-                        "source": "speaking_monitor",
-                    },
-                    source="SpeakingMonitor",
-                )
+                await self._do_interrupt(gate1_data, transcript)
+                paused = False
 
         except Exception:
             self._logger.exception(
                 "Classification pipeline error — fallback INTERRUPT"
             )
             try:
-                await self._fallback_interrupt(gate1_data)
+                await self._do_interrupt(gate1_data, "")
+                paused = False
             except Exception:
                 self._logger.exception("Fallback interrupt also failed")
+        finally:
+            # Safety net: always resume if we paused and didn't interrupt/resume
+            if paused:
+                try:
+                    await self._do_resume("cleanup")
+                except Exception:
+                    pass
 
-    async def _fallback_interrupt(self, gate1_data: dict) -> None:
-        """Fire INTERRUPT_DETECTED directly when the classification pipeline
-        fails. Gate 1 already confirmed the user was speaking — we must not
-        silently swallow the interrupt."""
-        self._logger.warning("Firing fallback INTERRUPT_DETECTED")
+    # ─────────────────────────────────────────────────────────────────────
+    # Action helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _do_resume(self, reason: str) -> None:
+        """Resume playback — AI continues from where it paused."""
+        # Reset debounce from RESUME time, not from classify start.
+        # Prevents echo from re-triggering Gate 3 immediately after resume.
+        self._last_classify_time = time.time()
+        await self.event_bus.publish(
+            EventType.PLAYBACK_RESUME,
+            {"reason": reason},
+            source="SpeakingMonitor",
+        )
+
+    async def _do_interrupt(self, gate1_data: dict, transcript: str) -> None:
+        """Full interrupt — kill TTS, go to INTERRUPTED state."""
+        self._logger.info("INTERRUPT: killing TTS for '%s'", transcript or "(no transcript)")
         await self.event_bus.publish(
             EventType.INTERRUPT_DETECTED,
             {
                 "speech_prob": gate1_data.get("speech_prob", 0.0),
                 "during_sentence": -1,
-                "transcript": "",
-                "source": "speaking_monitor_fallback",
+                "transcript": transcript,
+                "source": "speaking_monitor",
             },
             source="SpeakingMonitor",
         )
 
     # ─────────────────────────────────────────────────────────────────────
+    # Echo transcript detection
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _is_echo_transcript(self, transcript: str) -> bool:
+        """Check if the transcript is likely echo from the AI's speaker output.
+
+        Compares words in the transcript against what the AI was recently
+        saying. If >60% of transcript words appear in the AI's speech,
+        it's almost certainly mic picking up speaker output — not the user.
+
+        Examples that would be caught:
+          AI says: "That's great, Dharambeer. How's your day going so far?"
+          Transcript: "That's great." → 100% overlap → echo
+
+          AI says: "I'd love to! Here's a little one."
+          Transcript: "I'd love to." → 100% overlap → echo
+
+          AI says: "Finley loved to collect shiny shells"
+          Transcript: "to collect." → 100% overlap → echo
+        """
+        if not self._last_ai_speech:
+            return False
+
+        # Normalize: lowercase, strip punctuation
+        import re as _re
+        def _normalize(text: str) -> set[str]:
+            words = _re.findall(r"[a-z']+", text.lower())
+            # Filter out very short words that match anything (a, I, to)
+            return {w for w in words if len(w) > 1}
+
+        t_words = _normalize(transcript)
+        ai_words = _normalize(self._last_ai_speech)
+
+        if not t_words:
+            return False
+
+        overlap = t_words & ai_words
+        ratio = len(overlap) / len(t_words)
+
+        self._logger.debug(
+            "Echo check: transcript='%s' overlap=%.0f%% (%s / %d words)",
+            transcript, ratio * 100, overlap, len(t_words),
+        )
+
+        return ratio > 0.6
+
+    # ─────────────────────────────────────────────────────────────────────
     # Audio window extraction
     # ─────────────────────────────────────────────────────────────────────
 
-    def _get_audio_window(self) -> Optional[np.ndarray]:
-        """Extract the last audio_window_ms of buffered audio."""
+    def _get_audio_window(self, ms_override: Optional[int] = None) -> Optional[np.ndarray]:
+        """Extract the last N ms of buffered audio.
+
+        Args:
+            ms_override: If set, use this many ms instead of audio_window_ms.
+                         Used post-collection-delay to get a focused window.
+        """
         if not self._audio_buffer:
             return None
 
+        window_ms = ms_override if ms_override is not None else self._audio_window_ms
         # Calculate how many chunks we need
         chunk_ms = 30  # mic_stream default
-        chunks_needed = max(1, self._audio_window_ms // chunk_ms)
+        chunks_needed = max(1, window_ms // chunk_ms)
 
         # Get the last N chunks
         available = list(self._audio_buffer)
@@ -484,9 +632,12 @@ class SpeakingMonitor:
     # ─────────────────────────────────────────────────────────────────────
 
     async def _classify_with_llm(self, transcript: str) -> str:
-        """Classify user intent using allam-2-7b via Groq.
+        """Classify user intent using LLM via Groq.
 
         Returns one of: 'IGNORE', 'INJECT', 'INTERRUPT'
+
+        Handles thinking models (qwen3, etc.) that output <think> tags
+        by stripping them before parsing the classification.
         """
         # Build the user message with context
         ai_context = self._last_ai_speech[-100:] if self._last_ai_speech else "(just started speaking)"
@@ -500,11 +651,28 @@ class SpeakingMonitor:
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.0,
-                max_tokens=5,
+                max_tokens=50,
                 stream=False,
             )
 
-            result = response.choices[0].message.content.strip().upper()
+            raw_result = response.choices[0].message.content.strip()
+
+            # Strip <think>...</think> tags from thinking models (qwen3, etc.)
+            import re
+            cleaned = re.sub(
+                r"<think>.*?</think>",
+                "",
+                raw_result,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+            # Also handle unclosed <think> tags (truncated thinking)
+            cleaned = re.sub(
+                r"<think>.*",
+                "",
+                cleaned,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+            result = cleaned.upper() if cleaned else raw_result.upper()
 
             # Validate — must be one of the three
             if result in ("IGNORE", "INJECT", "INTERRUPT"):

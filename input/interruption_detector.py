@@ -207,8 +207,6 @@ class InterruptionDetector:
 
         # ── Tuning knobs ─────────────────────────────────────────────────
         self._interrupt_threshold: float = 0.60
-        # Gate 1 duration — SpeakingMonitor handles filler/classification on top,
-        # so Gate 1 can be sensitive (300ms catches short commands like "stop").
         self._interrupt_duration_ms: int = (
             monitor_cfg.get("gate1_min_duration_ms", 300)
             if self._monitor_enabled
@@ -216,7 +214,9 @@ class InterruptionDetector:
         )
         self._energy_multiplier: float = 2.5
 
-        # ── Echo baseline tracking ───────────────────────────────────────
+        # ── AEC mode vs legacy echo EMA ───────────────────────────────
+        self._aec_enabled: bool = audio_cfg.get("echo_cancellation", True)
+        # Legacy echo baseline (only used when AEC is OFF)
         self._echo_ema: float = 0.0
         self._echo_ema_initialized: bool = False
         self._echo_gate_multiplier: float = 3.0
@@ -233,6 +233,14 @@ class InterruptionDetector:
 
         # ── FIX: Self-tracked state transitions ──────────────────────────
         self._was_speaking_state: bool = False
+
+        # ── Playback pause/resume tracking (PersonaPlex) ─────────────────
+        # When SpeakingMonitor pauses playback, Gate 1 must be suppressed
+        # to avoid re-triggering on stale audio. On resume, a cooldown
+        # lets echo_ema recalibrate to the real playback level.
+        self._playback_paused: bool = False
+        self._resume_cooldown_until: float = 0.0
+        self._resume_cooldown_ms: float = 1500.0
 
         self._logger = logging.getLogger("InterruptionDetector")
 
@@ -278,27 +286,56 @@ class InterruptionDetector:
         return rms < self._echo_ema * self._echo_gate_multiplier
 
     # ─────────────────────────────────────────────────────────────────────
+    # PersonaPlex pause/resume callbacks
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _on_playback_pause(self, event) -> None:
+        """SpeakingMonitor paused playback — suppress Gate 1 detection."""
+        self._playback_paused = True
+        self._speech_detected_at = 0.0
+        self._last_speech_at = 0.0
+
+    async def _on_playback_resume(self, event) -> None:
+        """Playback resumed — recalibrate echo baseline before detecting."""
+        self._playback_paused = False
+        self._resume_cooldown_until = (
+            time.monotonic() + self._resume_cooldown_ms / 1000.0
+        )
+        self._speech_detected_at = 0.0
+        self._last_speech_at = 0.0
+        self._logger.debug(
+            "Resume → echo recalibration cooldown %.0fms",
+            self._resume_cooldown_ms,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
     # Main loop — self-tracks state transitions
     # ─────────────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         self._load_own_model()
-        # V2: Use raw consumer to bypass MicStream echo suppression.
-        # This detector has its own echo EMA discrimination and needs
-        # ALL audio (including echo-heavy chunks) to work correctly.
-        self._audio_queue = self.mic_stream.add_raw_consumer()
+        # V3: With AEC, use regular consumer (echo already removed).
+        # Legacy: use raw consumer + echo EMA discrimination.
+        if self._aec_enabled:
+            self._audio_queue = self.mic_stream.add_consumer()
+        else:
+            self._audio_queue = self.mic_stream.add_raw_consumer()
         self._logger.info(
             "InterruptionDetector started (vad=%.2f, dur=%dms, "
-            "echo_gate=%.1f×, cooldown=%dms, min_rms=%.4f, monitor=%s)",
+            "cooldown=%dms, min_rms=%.4f, monitor=%s, aec=%s)",
             self._interrupt_threshold,
             self._interrupt_duration_ms,
-            self._echo_gate_multiplier,
             int(self._state_cooldown_ms),
             self._min_absolute_rms,
             "ENABLED" if self._monitor_enabled else "disabled",
+            "ON" if self._aec_enabled else "OFF",
         )
 
         non_speech_gate = 0.35
+
+        # Subscribe to pause/resume events from PersonaPlex pipeline
+        self.event_bus.subscribe(EventType.PLAYBACK_PAUSE, self._on_playback_pause)
+        self.event_bus.subscribe(EventType.PLAYBACK_RESUME, self._on_playback_resume)
 
         while True:
             chunk = await self._audio_queue.get()
@@ -327,6 +364,9 @@ class InterruptionDetector:
                 self._last_speech_at = 0.0
                 self._echo_ema = 0.0
                 self._echo_ema_initialized = False
+                # Reset pause/resume state from any previous cycle
+                self._playback_paused = False
+                self._resume_cooldown_until = 0.0
                 if self._own_model is not None:
                     self._own_model.reset_states()
                 self._logger.debug(
@@ -338,33 +378,61 @@ class InterruptionDetector:
             rms = float(np.sqrt(np.mean(chunk ** 2)))
             speech_prob = self._get_speech_probability(chunk)
 
-            # ── Cooldown: ignore first window, calibrate echo baseline ────
-            # With raw audio consumer, TTS echo arrives here too (prob > 0.35).
-            # Update echo_ema on ALL frames during cooldown so the baseline
-            # tracks the actual TTS echo level, not just ambient noise.
-            elapsed_ms = (now - self._speaking_since) * 1000.0
-            if elapsed_ms < self._state_cooldown_ms:
-                if rms > 0.0005:
+            # ── Playback paused → suppress detection entirely ────────
+            if self._playback_paused:
+                continue
+
+            # ── Post-resume cooldown → recalibrate ───────────────────
+            if now < self._resume_cooldown_until:
+                if not self._aec_enabled and rms > 0.0005:
                     self._update_echo_ema(rms)
                 continue
 
-            # ── Update echo EMA only on non-speech frames ────────────────
-            if speech_prob < non_speech_gate and self._should_update_echo_ema(rms):
-                self._update_echo_ema(rms)
+            # ── Cooldown: ignore first window after entering SPEAKING ────
+            elapsed_ms = (now - self._speaking_since) * 1000.0
+            if elapsed_ms < self._state_cooldown_ms:
+                if not self._aec_enabled and rms > 0.0005:
+                    self._update_echo_ema(rms)
+                continue
 
-            # ── Energy gate ──────────────────────────────────────────────
+            # ══════════════════════════════════════════════════════════
+            # Energy gate — AEC vs legacy path
+            # ══════════════════════════════════════════════════════════
             noise_floor = self.mic_stream.noise_floor
-            ambient_gate = (
-                noise_floor * self._energy_multiplier if noise_floor > 0 else 0
-            )
-            echo_gate = (
-                self._echo_ema * self._echo_gate_multiplier
-                if self._echo_ema > 0
-                else 0
-            )
-            energy_threshold = max(
-                ambient_gate, echo_gate, self._min_absolute_rms
-            )
+
+            if self._aec_enabled:
+                # ── AEC mode: echo already removed ──
+                # Simple threshold: rms > noise_floor × multiplier
+                # No echo EMA needed — the signal is clean.
+                ambient_gate = (
+                    noise_floor * self._energy_multiplier
+                    if noise_floor > 0
+                    else 0
+                )
+                energy_threshold = max(ambient_gate, self._min_absolute_rms)
+            else:
+                # ── Legacy mode: echo EMA tracking ──
+                if speech_prob < non_speech_gate:
+                    if self._should_update_echo_ema(rms):
+                        self._update_echo_ema(rms)
+                elif self._echo_ema < 0.003:
+                    self._update_echo_ema(rms)
+                elif self._echo_ema > 0 and rms < self._echo_ema * 2.0:
+                    self._update_echo_ema(rms)
+
+                ambient_gate = (
+                    noise_floor * self._energy_multiplier
+                    if noise_floor > 0
+                    else 0
+                )
+                echo_gate = (
+                    self._echo_ema * self._echo_gate_multiplier
+                    if self._echo_ema > 0
+                    else 0
+                )
+                energy_threshold = max(
+                    ambient_gate, echo_gate, self._min_absolute_rms
+                )
 
             if rms < energy_threshold:
                 # Don't immediately reset — brief energy dips between phonemes
@@ -381,15 +449,15 @@ class InterruptionDetector:
 
             # ── Passed energy gate — check VAD + duration ────────────────
             if self._speech_detected_at == 0.0:
-                # First frame passing energy gate — log at INFO for visibility
+                # First frame passing energy gate — log for visibility
                 self._logger.info(
                     "Interrupt candidate: prob=%.3f rms=%.4f gate=%.4f "
-                    "(echo_ema=%.4f, ratio=%.1f×)",
+                    "(aec=%s, echo_ema=%.4f)",
                     speech_prob,
                     rms,
                     energy_threshold,
+                    "ON" if self._aec_enabled else "OFF",
                     self._echo_ema,
-                    rms / energy_threshold if energy_threshold > 0 else 0,
                 )
             await self._check_interrupt(speech_prob, rms)
 
