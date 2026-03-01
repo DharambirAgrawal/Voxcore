@@ -49,27 +49,40 @@ from input.mic_stream import MicStream
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CLASSIFIER_SYSTEM_PROMPT = """\
-You are a real-time speech intent classifier for a voice AI system.
-The AI assistant was speaking and paused because the user started talking.
-Classify the user's intent as exactly one of three words:
+You are a real-time speech intent classifier for a voice AI.
+The AI was speaking. It paused because the user spoke.
+Classify the user's intent based on the transcript.
 
-IGNORE — The user is reacting passively without wanting to take over.
-  Examples: "yeah", "right", "uh-huh", "wow", "haha", "oh interesting",
-            laughter, brief affirmations mid-story (mm-hmm, cool).
+DECISION (choose ONE):
+  IGNORE    — ONLY for reflexive 1-2 word sounds with no information:
+              "haha", "wow", "oh", "hmm", "right", "yeah"
+              These are involuntary reactions, not directed speech.
+  INJECT    — user is reacting WITH content (3+ words about what AI said):
+              "I really liked that", "that's a good point", "oh that's interesting",
+              "I love this story", "that reminds me of something"
+              The user is adding something meaningful — AI should acknowledge briefly.
+  INTERRUPT — user wants the AI to STOP and respond to them:
+              Questions ("can you tell me...", "what about...", "how do I..."),
+              corrections, topic changes, or commands.
 
-INJECT — The user added something meaningful but doesn't need the AI to stop.
-  Examples: "oh and also...", "by the way...", "actually I forgot to mention",
-            adding context, minor corrections that don't change the topic.
+IMPORTANT RULES:
+- If the transcript is 3+ words, it is almost NEVER IGNORE.
+- Questions or requests ("can you", "tell me", "what about") → INTERRUPT.
+- Positive reactions with content ("I liked that", "good story") → INJECT.
+- Only bare sounds/words with zero content → IGNORE.
 
-INTERRUPT — The user wants the AI to stop and respond to something new.
-  Examples: asking a question, changing the topic, contradicting,
-            saying something that requires a new response from the AI.
+If INTERRUPT, also classify TYPE:
+  STOP              — wants silence, no response
+  PAUSE             — brief hold, AI content may resume
+  CORRECTION        — fixing something AI said
+  NEW_QUESTION      — new unrelated topic
+  SAME_TOPIC_REDIRECT — follow-up on current topic
+  URGENCY           — safety, distress, critical issue
+  DONE_LISTENING    — user has heard enough
 
-RULE: If the user said something short and ambiguous, choose IGNORE.
-RULE: If the user is clearly asking a question or making a statement that
-      needs a response, choose INTERRUPT.
-
-Reply with ONLY one word: IGNORE, INJECT, or INTERRUPT"""
+Reply ONLY in this format (two lines):
+DECISION: IGNORE|INJECT|INTERRUPT
+TYPE: STOP|PAUSE|CORRECTION|NEW_QUESTION|SAME_TOPIC_REDIRECT|URGENCY|DONE_LISTENING|null"""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FAST STOP WORDS — these bypass the LLM entirely for instant response
@@ -88,25 +101,39 @@ STOP_KEYWORDS: set[str] = {
 ATTENTION_KEYWORDS: set[str] = {
     "hey", "hello", "excuse me", "listen", "wait wait",
     "actually", "but", "question", "i have a question",
-    "can i", "let me", "what about", "how about",
+    "can i", "can you", "could you", "let me", "tell me",
+    "what about", "how about", "what is", "what's",
     "thank you", "thanks", "okay thanks", "ok thanks",
     "that's great thanks", "alright thanks",
 }
 
+# Prefixes: if transcript STARTS WITH any of these, it's attention/question
+ATTENTION_PREFIXES: tuple[str, ...] = (
+    "can you", "could you", "can i", "tell me", "what about",
+    "how about", "what is", "what's", "how do", "how can",
+    "do you", "would you", "will you", "i want", "i need",
+    "i have a", "let me", "actually", "excuse me",
+)
+
 
 class SpeakingMonitor:
-    """PersonaPlex-inspired interrupt classifier.
+    """PersonaPlex-inspired interrupt classifier (v3).
 
     When the user speaks during AI playback:
-    1. PAUSE playback instantly (silence within 20ms)
-    2. Collect audio for 600ms (clean mic, no echo)
-    3. Transcribe with Whisper
+    1. Enter PENDING state (TTS fully paused, filters OFF)
+    2. Play pre-pause clip ("mm" from clips_dir)
+    3. Collect audio (clean mic, no echo — AI is silent)
     4. Fast keyword check → instant INTERRUPT for "stop/wait/hey"
     5. Echo + filler check → instant RESUME for false alarms
-    6. LLM classify → INTERRUPT / INJECT / IGNORE(RESUME)
+    6. LLM classify (Gate 3) → CLASSIFIED event → InterruptRouter
+    7. VAD-end action: wait for user silence before routing
 
-    This creates the natural "conversation pause" feeling — the AI stops
-    talking when you start, listens, then either resumes or responds.
+    V3 changes from v2:
+    - PENDING state: full TTS pause (not ducked)
+    - CLASSIFIED event: published to EventBus for InterruptRouter routing
+    - Two-path Gate 1: Path A (burst) skips filler check, Path B goes full pipeline
+    - VAD-end action: 300ms silence before acting on classification
+    - Gate 3 timeout: max 3s wait before default PAUSE
     """
 
     def __init__(
@@ -116,11 +143,15 @@ class SpeakingMonitor:
         mic_stream: MicStream,
         filler_detector: FillerDetector,
         config: dict,
+        audio_player=None,
+        gate3_done_event: Optional[asyncio.Event] = None,
     ) -> None:
         self.session = session
         self.event_bus = event_bus
         self.mic_stream = mic_stream
         self.filler_detector = filler_detector
+        self._audio_player = audio_player       # V3: direct ref for pause/resume
+        self._gate3_done_event = gate3_done_event  # V3: stops filler clip
 
         # Config
         monitor_cfg = config.get("speaking_monitor", {})
@@ -148,6 +179,17 @@ class SpeakingMonitor:
         self._audio_queue: Optional[asyncio.Queue] = None
 
         self._logger = logging.getLogger("SpeakingMonitor")
+
+        # V3: Gate 3 timeout
+        self._gate3_timeout_s: float = monitor_cfg.get("gate3_timeout_s", 3.0)
+        # V3: VAD-end silence wait
+        self._vad_silence_ms: int = monitor_cfg.get("vad_interrupt_silence_ms", 300)
+        # V3: Re-classify interval (samples) — every 1.5s of audio
+        self._reclassify_samples: int = monitor_cfg.get("gate3_reclassify_every_samples", 24000)
+        # V3: Pre-pause clip from config
+        bc_cfg = config.get("backchannel", {})
+        self._clips_dir: str = bc_cfg.get("clips_dir", "backchannel/clips/heart/")
+        self._pre_pause_clip: str = monitor_cfg.get("pre_pause_clip", "mm_hmm.wav")
 
     async def run(self) -> None:
         """Main loop — listen for GATE1_PASSED events and run Gate 2 + 3."""
@@ -182,8 +224,8 @@ class SpeakingMonitor:
             try:
                 event = await gate1_queue.get()
 
-                # Only process during SPEAKING
-                if self.session.state != TurnState.SPEAKING:
+                # Only process during SPEAKING (or PENDING for re-triggers)
+                if self.session.state not in (TurnState.SPEAKING, TurnState.PENDING):
                     continue
 
                 if not self._is_active:
@@ -198,8 +240,13 @@ class SpeakingMonitor:
                     )
                     continue
 
-                # Run Gate 2 + 3 in background task
-                asyncio.create_task(self._classify_interrupt(event.data))
+                # V3: Get Gate 1 path info
+                gate1_path = event.data.get("path", "B")
+
+                # Run classification in background task
+                asyncio.create_task(
+                    self._classify_interrupt(event.data, gate1_path=gate1_path)
+                )
 
             except asyncio.CancelledError:
                 self._logger.info("SpeakingMonitor cancelled")
@@ -229,10 +276,11 @@ class SpeakingMonitor:
         old_state = event.data.get("old_state", "")
 
         if new_state == TurnState.SPEAKING.value:
-            # Don't clear buffers when returning from SOFT_INJECT → SPEAKING
-            # (the AI is still mid-sentence, context should be preserved)
             if old_state == TurnState.SOFT_INJECT.value:
                 self._logger.debug("SpeakingMonitor: SOFT_INJECT → SPEAKING (preserved buffers)")
+            elif old_state == TurnState.PAUSED.value:
+                # V3: Resuming from PAUSED — keep buffers, stay active
+                self._logger.debug("SpeakingMonitor: PAUSED → SPEAKING (resumed)")
             else:
                 self._is_active = True
                 self._audio_buffer.clear()
@@ -240,8 +288,15 @@ class SpeakingMonitor:
                 self._logger.debug("SpeakingMonitor activated")
 
         elif new_state == TurnState.SOFT_INJECT.value:
-            # Stay active during SOFT_INJECT — AI is still speaking
             self._logger.debug("SpeakingMonitor: SOFT_INJECT (staying active)")
+
+        elif new_state == TurnState.PAUSED.value:
+            # V3: PAUSED — stay active (we may need to re-classify)
+            self._logger.debug("SpeakingMonitor: PAUSED (staying active)")
+
+        elif new_state == TurnState.PENDING.value:
+            # V3: PENDING — classification in progress
+            self._logger.debug("SpeakingMonitor: PENDING (classifying)")
 
         elif new_state in (
             TurnState.LISTENING.value,
@@ -249,190 +304,226 @@ class SpeakingMonitor:
             TurnState.INTERRUPTED.value,
         ):
             self._is_active = False
+            # V3: If leaving PENDING/PAUSED, ensure filler clip stops
+            if old_state in (TurnState.PENDING.value, TurnState.PAUSED.value):
+                if self._gate3_done_event is not None:
+                    self._gate3_done_event.set()
+                    self._logger.debug("gate3_done_event set (state left PENDING/PAUSED)")
             self._logger.debug("SpeakingMonitor deactivated (%s)", new_state)
 
     # ─────────────────────────────────────────────────────────────────────
     # PersonaPlex Classification Pipeline
     # ─────────────────────────────────────────────────────────────────────
 
-    async def _classify_interrupt(self, gate1_data: dict) -> None:
-        """PersonaPlex-inspired interrupt classification.
+    async def _classify_interrupt(
+        self, gate1_data: dict, gate1_path: str = "B",
+    ) -> None:
+        """V3 PersonaPlex-inspired interrupt classification.
 
         Flow:
-          1. PAUSE playback instantly (silence within 20ms)
-          2. Wait 600ms for user to finish phrase (mic is clean — no echo)
-          3. Transcribe with Whisper
+          1. Enter PENDING state (TTS fully paused, filters OFF)
+          2. Play pre-pause filler clip (breath/mm) instantly
+          3. Run Gate 3 classification in background
           4. Fast keyword check → instant INTERRUPT for "stop/wait/hey"
-          5. Echo check → instant RESUME for AI's own voice
-          6. Filler check → instant RESUME for "uh-huh/yeah"
-          7. LLM classify → INTERRUPT / INJECT / IGNORE(RESUME)
-
-        The key insight: by PAUSING instead of DUCKING, we get:
-        - Instant silence feedback (user feels heard in 20ms)
-        - Clean mic signal (no AI audio contaminating the buffer)
-        - Perfect STT transcription (no echo interference)
-        - Natural conversation feel (like a human pausing to listen)
+          5. Echo check → instant RESUME
+          6. Path A: skip filler check (burst = intentional)
+             Path B: filler check → instant RESUME
+          7. LLM classify (Gate 3) with timeout
+          8. VAD-end action: wait for user silence with re-classification
+          9. Publish CLASSIFIED event → InterruptRouter
         """
         paused = False
         try:
-            # Bail if state changed since we started
-            if self.session.state != TurnState.SPEAKING:
+            if self.session.state not in (TurnState.SPEAKING, TurnState.PENDING):
                 return
 
-            # ── Debounce: set IMMEDIATELY to prevent concurrent tasks ────
             self._last_classify_time = time.time()
 
-            # ── Step 1: PAUSE playback INSTANTLY ─────────────────────────
+            # ── Step 1: PAUSE playback → enter PENDING ───────────────────
+            # V3: Call audio_player.pause() DIRECTLY for ~3ms response
+            if self._audio_player is not None:
+                await self._audio_player.pause()
+            else:
+                # Fallback: event-based pause
+                await self.event_bus.publish(
+                    EventType.PLAYBACK_PAUSE,
+                    {"reason": "user_speaking"},
+                    source="SpeakingMonitor",
+                )
+
+            # V3: Set session state to PENDING
+            await self.session.set_state(TurnState.PENDING)
+            paused = True
+
+            # V3: Play pre-pause filler clip IMMEDIATELY (~3ms from Gate 2 pass)
+            # This gives the user instant audio feedback while Gate 3 runs
+            if self._gate3_done_event is not None:
+                self._gate3_done_event.clear()
+            clip_path = os.path.join(self._clips_dir, self._pre_pause_clip)
+            if self._audio_player is not None and os.path.isfile(clip_path):
+                if self._gate3_done_event is not None:
+                    asyncio.create_task(
+                        self._audio_player.play_clip_looping(
+                            clip_path, stop_event=self._gate3_done_event,
+                        )
+                    )
+                else:
+                    asyncio.create_task(self._audio_player.play_clip(clip_path))
+
+            # V3: Publish PENDING event for WebSocket clients
             await self.event_bus.publish(
-                EventType.PLAYBACK_PAUSE,
-                {"reason": "user_speaking"},
+                EventType.PENDING,
+                {"gate1_path": gate1_path, "urgency_hint": gate1_path == "A"},
                 source="SpeakingMonitor",
             )
-            paused = True
-            self._logger.debug("Playback paused — collecting user speech")
+
+            self._logger.debug(
+                "PENDING — playback paused, filler clip playing, collecting user speech (path=%s)",
+                gate1_path,
+            )
 
             # ── Step 2: Collection delay ─────────────────────────────────
-            # Wait for user to finish their phrase. AI is SILENT so mic
-            # gets a perfectly clean signal with zero echo contamination.
             delay_s = self._collection_delay_ms / 1000.0
             await asyncio.sleep(delay_s)
 
-            # Bail if state changed during the wait
-            if self.session.state != TurnState.SPEAKING:
-                paused = False  # state handler took over
+            if self.session.state not in (
+                TurnState.SPEAKING, TurnState.PENDING, TurnState.PAUSED,
+            ):
+                paused = False
                 return
 
             # ── Step 3: Transcribe ───────────────────────────────────────
-            # Grab recent audio. Since AI was paused, this is pure user voice.
             audio_window = self._get_audio_window(ms_override=1200)
             if audio_window is None or len(audio_window) < 100:
-                self._logger.warning(
-                    "Not enough audio — fallback INTERRUPT"
-                )
-                await self._do_interrupt(gate1_data, "")
+                self._logger.warning("Not enough audio — fallback INTERRUPT")
+                await self._publish_classified("INTERRUPT", "STOP", "", gate1_data)
                 paused = False
                 return
 
             transcript = await self._transcribe_short_clip(audio_window)
             if not transcript or not transcript.strip():
-                # Empty transcript = probably was echo from before the pause
-                self._logger.debug(
-                    "Empty transcript — likely pre-pause echo, RESUME"
-                )
+                self._logger.debug("Empty transcript — likely echo, RESUME")
                 await self._do_resume("empty_transcript")
                 paused = False
                 return
 
-            self._logger.info("Monitor transcript: '%s'", transcript)
+            self._logger.info("Monitor transcript: '%s' (path=%s)", transcript, gate1_path)
 
             # ── Step 4: Fast keyword check ───────────────────────────────
-            # No LLM call needed — instant decision for common stop words.
-            # This is the "say stop once and it stops" experience.
             normalised = transcript.strip().lower().rstrip(".!?,")
             if normalised in STOP_KEYWORDS:
-                self._logger.info(
-                    "STOP keyword detected ('%s') → instant INTERRUPT",
-                    normalised,
+                self._logger.info("STOP keyword → instant INTERRUPT")
+                await self._publish_classified(
+                    "INTERRUPT", "STOP", transcript, gate1_data,
                 )
-                await self._do_interrupt(gate1_data, transcript)
                 paused = False
                 return
 
-            if normalised in ATTENTION_KEYWORDS:
-                self._logger.info(
-                    "ATTENTION keyword detected ('%s') → instant INTERRUPT",
-                    normalised,
+            if normalised in ATTENTION_KEYWORDS or normalised.startswith(ATTENTION_PREFIXES):
+                self._logger.info("ATTENTION keyword/prefix → instant INTERRUPT")
+                await self._publish_classified(
+                    "INTERRUPT", "NEW_QUESTION", transcript, gate1_data,
                 )
-                await self._do_interrupt(gate1_data, transcript)
                 paused = False
                 return
 
             # ── Step 5: Echo transcript check ────────────────────────────
             if self._is_echo_transcript(transcript):
-                self._logger.info(
-                    "Echo transcript detected ('%s') → RESUME", transcript,
-                )
+                self._logger.info("Echo transcript → RESUME")
                 await self._do_resume("echo_transcript")
                 paused = False
                 return
 
             # ── Step 6: Filler word check ────────────────────────────────
-            is_filler, matched_word = self.filler_detector.is_filler(transcript)
-            if is_filler:
-                self._logger.info(
-                    "FILLER detected ('%s') → RESUME",
-                    matched_word or transcript,
-                )
-                await self.event_bus.publish(
-                    EventType.POSITIVE_REACTION,
-                    {"text": transcript, "matched_word": matched_word},
-                    source="SpeakingMonitor",
-                )
-                await self._do_resume("filler")
-                paused = False
-                return
+            # V3: Path A (HIGH_ENERGY_BURST) skips filler check
+            if gate1_path != "A":
+                is_filler, matched_word = self.filler_detector.is_filler(transcript)
+                if is_filler:
+                    self._logger.info("FILLER → RESUME")
+                    await self.event_bus.publish(
+                        EventType.POSITIVE_REACTION,
+                        {"text": transcript, "matched_word": matched_word},
+                        source="SpeakingMonitor",
+                    )
+                    await self._do_resume("filler")
+                    paused = False
+                    return
 
-            # ── Step 7: LLM classification ───────────────────────────────
-            # Only reaches here for ambiguous phrases that aren't keywords,
-            # echo, or fillers. LLM decides the intent.
-            classification = await self._classify_with_llm(transcript)
+            # ── Step 7: LLM classification (Gate 3) with timeout ─────────
+            urgency_hint = (gate1_path == "A")
+            try:
+                decision, interrupt_type = await asyncio.wait_for(
+                    self._classify_with_llm(
+                        transcript,
+                        speech_position="mid_sentence",
+                        urgency_hint=urgency_hint,
+                    ),
+                    timeout=self._gate3_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "Gate 3 timeout (%.1fs) — default INTERRUPT/PAUSE",
+                    self._gate3_timeout_s,
+                )
+                decision, interrupt_type = "INTERRUPT", "PAUSE"
 
             self._logger.info(
-                "Gate 3: %s (transcript='%s', ai_context='%s')",
-                classification, transcript, self._last_ai_speech[-60:],
+                "Gate 3: decision=%s type=%s (transcript='%s')",
+                decision, interrupt_type, transcript,
             )
 
-            await self.event_bus.publish(
-                EventType.MONITOR_CLASSIFY,
-                {"classification": classification, "transcript": transcript,
-                 "ai_context": self._last_ai_speech[-100:]},
-                source="SpeakingMonitor",
+            # ── Step 8: VAD-end action — wait for user silence ───────────
+            # V3: Re-classify every 1.5s if user keeps speaking
+            decision, interrupt_type = await self._wait_for_user_to_finish(
+                transcript, gate1_data, decision, interrupt_type,
+                urgency_hint=urgency_hint,
             )
 
-            # Stale check
+            # ── Step 9: Publish CLASSIFIED event ─────────────────────────
             if self.session.state not in (
                 TurnState.SPEAKING, TurnState.SOFT_INJECT,
+                TurnState.PENDING, TurnState.PAUSED,
             ):
                 self._logger.info(
-                    "Classification arrived but state is %s — discarding",
+                    "State changed to %s — discarding classification",
                     self.session.state.value,
                 )
                 paused = False
                 return
 
-            # ── Act on classification ────────────────────────────────────
-            if classification == "IGNORE":
+            # Route based on decision
+            if decision == "IGNORE":
+                # V3: Play a soft acknowledgment so user feels heard
+                if self._audio_player is not None:
+                    ack_clip = os.path.join(self._clips_dir, "mm_hmm.wav")
+                    if os.path.exists(ack_clip):
+                        try:
+                            await self._audio_player.play_clip(ack_clip)
+                        except Exception:
+                            pass  # Don't block resume on clip failure
                 await self._do_resume("ignore")
                 paused = False
-
-            elif classification == "INJECT":
-                # Resume playback, but inject the user's words into context
-                await self.session.inject_text(
-                    content=f"[USER ADDED MID-SPEECH]: {transcript}",
-                    priority="high",
-                    source="user_mid_speech",
+            elif decision == "INJECT":
+                await self._publish_classified(
+                    "INJECT", "SAME_TOPIC_REDIRECT", transcript, gate1_data,
                 )
-                await self.session.set_state(TurnState.SOFT_INJECT)
-                await self.session.set_state(TurnState.SPEAKING)
-                self._logger.info("INJECT: '%s' added to context", transcript)
-                await self._do_resume("inject")
                 paused = False
-
-            elif classification == "INTERRUPT":
-                await self._do_interrupt(gate1_data, transcript)
+            elif decision == "INTERRUPT":
+                await self._publish_classified(
+                    "INTERRUPT", interrupt_type, transcript, gate1_data,
+                )
                 paused = False
 
         except Exception:
-            self._logger.exception(
-                "Classification pipeline error — fallback INTERRUPT"
-            )
+            self._logger.exception("Classification pipeline error — fallback INTERRUPT")
             try:
-                await self._do_interrupt(gate1_data, "")
+                await self._publish_classified(
+                    "INTERRUPT", "STOP", "", gate1_data,
+                )
                 paused = False
             except Exception:
-                self._logger.exception("Fallback interrupt also failed")
+                self._logger.exception("Fallback also failed")
         finally:
-            # Safety net: always resume if we paused and didn't interrupt/resume
             if paused:
                 try:
                     await self._do_resume("cleanup")
@@ -445,14 +536,21 @@ class SpeakingMonitor:
 
     async def _do_resume(self, reason: str) -> None:
         """Resume playback — AI continues from where it paused."""
-        # Reset debounce from RESUME time, not from classify start.
-        # Prevents echo from re-triggering Gate 3 immediately after resume.
         self._last_classify_time = time.time()
-        await self.event_bus.publish(
-            EventType.PLAYBACK_RESUME,
-            {"reason": reason},
-            source="SpeakingMonitor",
-        )
+        # V3: Stop the filler clip first
+        if self._gate3_done_event is not None:
+            self._gate3_done_event.set()
+        # V3: Resume via direct call (faster) or event fallback
+        if self._audio_player is not None:
+            await self._audio_player.resume()
+        else:
+            await self.event_bus.publish(
+                EventType.PLAYBACK_RESUME,
+                {"reason": reason},
+                source="SpeakingMonitor",
+            )
+        # V3: Return to SPEAKING state
+        await self.session.set_state(TurnState.SPEAKING)
 
     async def _do_interrupt(self, gate1_data: dict, transcript: str) -> None:
         """Full interrupt — kill TTS, go to INTERRUPTED state."""
@@ -467,6 +565,115 @@ class SpeakingMonitor:
             },
             source="SpeakingMonitor",
         )
+
+    # ── V3: CLASSIFIED event publishing ──────────────────────────────────
+
+    async def _publish_classified(
+        self,
+        decision: str,
+        interrupt_type: str,
+        transcript: str,
+        gate1_data: dict,
+    ) -> None:
+        """V3: Publish a CLASSIFIED event for InterruptRouter to handle."""
+        await self.event_bus.publish(
+            EventType.CLASSIFIED,
+            {
+                "decision": decision,
+                "interrupt_type": interrupt_type,
+                "transcript": transcript,
+                "speech_prob": gate1_data.get("speech_prob", 0.0),
+                "rms": gate1_data.get("rms", 0.0),
+                "path": gate1_data.get("path", "B"),
+                "ai_context": self._last_ai_speech[-100:],
+            },
+            source="SpeakingMonitor",
+        )
+        self._logger.info(
+            "CLASSIFIED: decision=%s type=%s transcript='%s'",
+            decision, interrupt_type, transcript,
+        )
+
+    async def _wait_for_user_to_finish(
+        self,
+        transcript: str,
+        gate1_data: dict,
+        decision: str,
+        interrupt_type: str,
+        urgency_hint: bool = False,
+    ) -> tuple[str, str]:
+        """V3: Wait for user silence before acting on classification.
+
+        While waiting, accumulates audio. Every 1.5s of continuous speech,
+        re-transcribes and re-classifies (user may have changed intent).
+
+        Returns the (potentially updated) (decision, interrupt_type) tuple.
+        """
+        silence_threshold_s = self._vad_silence_ms / 1000.0  # 300ms
+        check_interval = 0.05  # 50ms
+        max_wait = 3.0  # max total wait for silence
+        reclassify_interval_s = self._reclassify_samples / self._sample_rate  # 1.5s
+
+        elapsed = 0.0
+        time_since_reclassify = 0.0
+        silence_duration = 0.0
+
+        while elapsed < max_wait:
+            # Check recent audio energy
+            recent = self.mic_stream.last_200ms()
+            if len(recent) > 0:
+                rms = float(np.sqrt(np.mean(recent ** 2)))
+                noise_floor = self.mic_stream.noise_floor
+                is_silent = rms < noise_floor * 2.0
+            else:
+                is_silent = True
+
+            if is_silent:
+                silence_duration += check_interval
+                if silence_duration >= silence_threshold_s:
+                    # User has been silent long enough — act on current classification
+                    self._logger.debug(
+                        "VAD-end: %.0fms silence — proceeding with %s/%s",
+                        silence_duration * 1000, decision, interrupt_type,
+                    )
+                    return decision, interrupt_type
+            else:
+                silence_duration = 0.0
+                time_since_reclassify += check_interval
+
+            # V3: Re-classify every 1.5s if user keeps speaking
+            if time_since_reclassify >= reclassify_interval_s:
+                time_since_reclassify = 0.0
+                self._logger.debug("Re-classifying after %.1fs of continued speech", reclassify_interval_s)
+
+                # Get fresh audio and re-transcribe
+                audio_window = self._get_audio_window(ms_override=2000)
+                if audio_window is not None and len(audio_window) > 100:
+                    new_transcript = await self._transcribe_short_clip(audio_window)
+                    if new_transcript and new_transcript.strip():
+                        transcript = new_transcript
+                        try:
+                            new_decision, new_type = await asyncio.wait_for(
+                                self._classify_with_llm(
+                                    transcript,
+                                    speech_position="mid_sentence",
+                                    urgency_hint=urgency_hint,
+                                ),
+                                timeout=2.0,
+                            )
+                            decision, interrupt_type = new_decision, new_type
+                            self._logger.info(
+                                "Re-classified: %s/%s (transcript='%s')",
+                                decision, interrupt_type, transcript,
+                            )
+                        except asyncio.TimeoutError:
+                            self._logger.debug("Re-classify timed out — keeping previous result")
+
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+
+        self._logger.debug("VAD-end: max wait %.1fs reached — proceeding", max_wait)
+        return decision, interrupt_type
 
     # ─────────────────────────────────────────────────────────────────────
     # Echo transcript detection
@@ -631,17 +838,36 @@ class SpeakingMonitor:
     # LLM classification: allam-2-7b
     # ─────────────────────────────────────────────────────────────────────
 
-    async def _classify_with_llm(self, transcript: str) -> str:
-        """Classify user intent using LLM via Groq.
+    async def _classify_with_llm(
+        self, transcript: str, speech_position: str = "mid_sentence",
+        urgency_hint: bool = False,
+    ) -> tuple[str, str]:
+        """V3: Classify user intent using LLM via Groq.
 
-        Returns one of: 'IGNORE', 'INJECT', 'INTERRUPT'
+        Returns (decision, interrupt_type) tuple:
+          decision: 'IGNORE', 'INJECT', or 'INTERRUPT'
+          interrupt_type: 'STOP', 'PAUSE', 'CORRECTION', 'NEW_QUESTION',
+                         'SAME_TOPIC_REDIRECT', 'URGENCY', 'DONE_LISTENING', or 'null'
 
-        Handles thinking models (qwen3, etc.) that output <think> tags
-        by stripping them before parsing the classification.
+        Sends context including AI speech, speech_position, and urgency_hint.
+        Parses two-line "DECISION: X\nTYPE: Y" response format.
         """
-        # Build the user message with context
-        ai_context = self._last_ai_speech[-100:] if self._last_ai_speech else "(just started speaking)"
-        user_msg = f'Context:\nAI was saying: "{ai_context}"\nUser said: "{transcript}"\n\nReply with ONLY one word: IGNORE, INJECT, or INTERRUPT'
+        import re
+
+        # Build rich context for the classifier
+        ai_context = self._last_ai_speech[-200:] if self._last_ai_speech else "(just started speaking)"
+        urgency_str = "yes — Path A burst detected" if urgency_hint else "no"
+
+        user_msg = (
+            f'Context:\n'
+            f'AI was saying: "{ai_context}"\n'
+            f'User said: "{transcript}"\n'
+            f'Speech position: {speech_position}\n'
+            f'Urgency hint: {urgency_str}\n\n'
+            f'Reply ONLY in the two-line format:\n'
+            f'DECISION: IGNORE|INJECT|INTERRUPT\n'
+            f'TYPE: STOP|PAUSE|CORRECTION|NEW_QUESTION|SAME_TOPIC_REDIRECT|URGENCY|DONE_LISTENING|null'
+        )
 
         try:
             response = await self._groq_client.chat.completions.create(
@@ -658,47 +884,72 @@ class SpeakingMonitor:
             raw_result = response.choices[0].message.content.strip()
 
             # Strip <think>...</think> tags from thinking models (qwen3, etc.)
-            import re
             cleaned = re.sub(
-                r"<think>.*?</think>",
-                "",
-                raw_result,
+                r"<think>.*?</think>", "", raw_result,
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
-            # Also handle unclosed <think> tags (truncated thinking)
             cleaned = re.sub(
-                r"<think>.*",
-                "",
-                cleaned,
+                r"<think>.*", "", cleaned,
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
-            result = cleaned.upper() if cleaned else raw_result.upper()
+            if not cleaned:
+                cleaned = raw_result
 
-            # Validate — must be one of the three
-            if result in ("IGNORE", "INJECT", "INTERRUPT"):
-                return result
+            # Parse two-line DECISION+TYPE format
+            decision, itype = self._parse_decision_type(cleaned)
 
-            # If the model returned something unexpected, try to parse
-            for label in ("INTERRUPT", "INJECT", "IGNORE"):
-                if label in result:
-                    self._logger.warning(
-                        "allam returned '%s', parsed as %s", result, label
-                    )
-                    return label
-
-            # Default to IGNORE if we can't parse
-            self._logger.warning(
-                "allam returned unparseable '%s', defaulting to IGNORE", result
+            self._logger.info(
+                "LLM raw='%s' → decision=%s type=%s",
+                cleaned.replace('\n', ' | '), decision, itype,
             )
-            return "IGNORE"
+            return decision, itype
 
         except Exception:
             self._logger.exception(
-                "%s classification failed — defaulting to INTERRUPT "
-                "(Gate 1 already confirmed sustained speech)",
+                "%s classification failed — defaulting to INTERRUPT/STOP",
                 self._model,
             )
-            # On error, default to INTERRUPT — Gate 1 confirmed the user was
-            # speaking. Silently swallowing this as IGNORE would make the
-            # system completely unresponsive to interrupts when the LLM is down.
-            return "INTERRUPT"
+            return "INTERRUPT", "STOP"
+
+    @staticmethod
+    def _parse_decision_type(text: str) -> tuple[str, str]:
+        """Parse 'DECISION: X\\nTYPE: Y' format from LLM response.
+
+        Handles various formatting quirks (extra whitespace, single-line, etc.)
+        """
+        import re
+
+        upper = text.upper()
+
+        # Try standard two-line parse
+        decision_match = re.search(r"DECISION\s*:\s*(IGNORE|INJECT|INTERRUPT)", upper)
+        type_match = re.search(
+            r"TYPE\s*:\s*(STOP|PAUSE|CORRECTION|NEW_QUESTION|SAME_TOPIC_REDIRECT|URGENCY|DONE_LISTENING|NULL)",
+            upper,
+        )
+
+        decision = decision_match.group(1) if decision_match else None
+        itype = type_match.group(1) if type_match else "null"
+        if itype == "NULL":
+            itype = "null"
+
+        # If we got a valid decision, return it
+        if decision:
+            # For IGNORE/INJECT, type should be null
+            if decision in ("IGNORE", "INJECT"):
+                itype = "null"
+            elif decision == "INTERRUPT" and itype == "null":
+                # INTERRUPT without a type — default to STOP
+                itype = "STOP"
+            return decision, itype
+
+        # Fallback: try to find just a decision word
+        for label in ("INTERRUPT", "INJECT", "IGNORE"):
+            if label in upper:
+                fallback_type = "null"
+                if label == "INTERRUPT":
+                    fallback_type = "STOP"
+                return label, fallback_type
+
+        # Can't parse at all — default to IGNORE
+        return "IGNORE", "null"

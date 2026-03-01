@@ -224,10 +224,12 @@ class AudioPlayer:
     V3 additions:
     - Playback pause/resume: on PLAYBACK_PAUSE, immediately stops writing
       audio frames to the speaker while keeping position. On PLAYBACK_RESUME,
-      continues from the exact frame where it paused. This gives the user
-      immediate silence feedback (~20ms latency) while the classification
-      pipeline decides whether to INTERRUPT, INJECT, or IGNORE.
+      continues from the exact frame where it paused.
     - Volume ducking kept as fallback but primary flow is pause/resume.
+    - play_clip() for one-shot clip playback without filter feeds
+    - play_clip_looping() for looping a clip until a stop event
+    - pause()/resume()/flush() as proper async methods for InterruptRouter
+    - Filter feed control: only feeds AriaVoiceFilter/Gate0 during TTS chunks
     """
 
     def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
@@ -270,6 +272,11 @@ class AudioPlayer:
 
         # V2: Callback for mic_stream to receive playback reference signal
         self._reference_callback = None
+
+        # V3: Direct references for filter feed control
+        self._mic_stream = None     # Set via set_mic_stream()
+        self._aria_filter = None    # AriaVoiceFilter instance
+        self._gate0 = None          # Gate0EchoCheck instance
 
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
 
@@ -487,6 +494,18 @@ class AudioPlayer:
                     except Exception:
                         pass
 
+                # V3: Feed AriaVoiceFilter and Gate0 for multi-layer echo suppression
+                if hasattr(self, '_aria_filter') and self._aria_filter is not None:
+                    try:
+                        self._aria_filter.feed_aria_audio(mono_frame)
+                    except Exception:
+                        pass
+                if hasattr(self, '_gate0') and self._gate0 is not None:
+                    try:
+                        self._gate0.feed_tts_spectrum(mono_frame)
+                    except Exception:
+                        pass
+
                 offset = end
 
                 # Yield to event loop so interrupts/pauses can be detected
@@ -659,3 +678,125 @@ class AudioPlayer:
     def is_playing(self) -> bool:
         """Whether audio is currently being played."""
         return self._is_playing
+
+    # ── V3: Direct API for InterruptRouter ────────────────────────────────
+
+    def set_v3_refs(self, mic_stream, aria_filter=None, gate0=None) -> None:
+        """V3: Inject direct references for filter feed control.
+
+        Called once during main.py initialization.
+        """
+        self._mic_stream = mic_stream
+        self._aria_filter = aria_filter
+        self._gate0 = gate0
+        self._logger.info("V3 refs attached (mic_stream, aria_filter, gate0)")
+
+    async def pause(self) -> None:
+        """V3: Freeze TTS playback in RAM. Called by InterruptRouter.
+
+        - Immediately stops audio output within 20ms
+        - Preserves playback position for resume()
+        - Toggles filter OFF (no echo suppression needed when silent)
+        """
+        if not self._is_paused and self._is_playing:
+            self._is_paused = True
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(False)
+            self._logger.info("V3: Playback PAUSED (filter OFF)")
+
+    async def resume(self) -> None:
+        """V3: Resume TTS from exact frame where it paused. Called by InterruptRouter.
+
+        - Restarts audio output from preserved position
+        - Toggles filter ON (echo suppression needed again)
+        """
+        if self._is_paused:
+            self._is_paused = False
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(True)
+            self._logger.info("V3: Playback RESUMED (filter ON)")
+
+    async def flush(self) -> None:
+        """V3: Discard ALL buffered TTS. Called by InterruptRouter for STOP/CORRECTION/etc.
+
+        - Clears play queue
+        - Clears audio accumulator
+        - Stops current audio stream
+        - Toggles filter OFF
+        """
+        self._is_interrupted = True
+        self._is_paused = False
+        self._volume = 1.0
+        self._target_volume = 1.0
+
+        while not self._play_queue.empty():
+            try:
+                self._play_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        self._audio_accumulator = bytearray()
+        sd.stop()
+
+        if self._current_stream is not None:
+            try:
+                self._current_stream.stop()
+                self._current_stream.close()
+            except Exception:
+                pass
+            self._current_stream = None
+
+        if self._mic_stream is not None:
+            self._mic_stream.set_filter_active(False)
+
+        await asyncio.sleep(0.05)
+        self._is_interrupted = False
+        self._logger.info("V3: Playback FLUSHED (filter OFF)")
+
+    async def play_clip(self, clip_path: str) -> None:
+        """V3: Play a clip once without feeding echo filters.
+
+        Used for bridge clips (sure.wav, got_it.wav) and pre-pause clips.
+        Does NOT feed AriaVoiceFilter or Gate0 — these are not Aria's voice.
+        """
+        try:
+            sr, audio = wavfile.read(clip_path)
+            audio_float = audio.astype(np.float32)
+            if audio.dtype == np.int16:
+                audio_float = audio_float / 32768.0
+            sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
+            self._logger.debug("V3: played clip '%s'", clip_path)
+        except Exception as e:
+            self._logger.error("V3: clip playback failed: %s", e)
+
+    async def play_clip_looping(self, clip_path: str, stop_event: asyncio.Event) -> None:
+        """V3: Loop a clip until stop_event is set (for pre-pause during PENDING).
+
+        Plays the clip, waits for its duration, checks stop_event, repeats.
+        Stops between loops (not mid-playback) when event is set.
+        """
+        try:
+            sr, audio = wavfile.read(clip_path)
+            audio_float = audio.astype(np.float32)
+            if audio.dtype == np.int16:
+                audio_float = audio_float / 32768.0
+
+            clip_duration = len(audio_float) / sr
+            max_loops = 10  # safety limit
+
+            for _ in range(max_loops):
+                if stop_event.is_set():
+                    break
+                sd.play(audio_float * 0.7, samplerate=sr, blocking=False)
+                # Wait for clip to finish, checking stop_event periodically
+                elapsed = 0.0
+                while elapsed < clip_duration:
+                    if stop_event.is_set():
+                        sd.stop()
+                        break
+                    await asyncio.sleep(0.05)
+                    elapsed += 0.05
+
+            self._logger.debug("V3: clip loop done '%s'", clip_path)
+        except Exception as e:
+            self._logger.error("V3: clip loop failed: %s", e)

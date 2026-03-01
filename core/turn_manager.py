@@ -199,9 +199,9 @@ EXPORTS:
 
 """
 VoxCore — core/turn_manager.py
-The 5-state machine — orchestrates all turn-taking logic.
+The 6-state machine — orchestrates all turn-taking logic.
 
-States: LISTENING → THINKING → SPEAKING → (SOFT_INJECT → SPEAKING | INTERRUPTED → THINKING)
+States: LISTENING → THINKING → SPEAKING → (PAUSED → SPEAKING | SOFT_INJECT → SPEAKING | INTERRUPTED → THINKING)
 """
 
 import asyncio
@@ -260,6 +260,11 @@ class TurnManager:
         self._playback_done_queue = event_bus.subscribe(EventType.PLAYBACK_DONE)
         self._safety_queue = event_bus.subscribe(EventType.SAFETY_FLAGGED)
         self._tool_result_queue = event_bus.subscribe(EventType.TOOL_RESULT_READY)
+        # V3: CLASSIFIED events from SpeakingMonitor's Gate 3
+        self._classified_queue = event_bus.subscribe(EventType.CLASSIFIED)
+
+        # V3: InterruptRouter reference (set via set_interrupt_router after construction)
+        self._interrupt_router = None
 
     # ── main entry point ───────────────────────────────────────────────────
 
@@ -271,7 +276,13 @@ class TurnManager:
             self._handle_playback_done(),
             self._handle_safety_flags(),
             self._handle_tool_results(),
+            self._handle_classified(),  # V3
         )
+
+    def set_interrupt_router(self, router) -> None:
+        """V3: Inject InterruptRouter after construction."""
+        self._interrupt_router = router
+        self._logger.info("V3: InterruptRouter attached to TurnManager")
 
     # ── transcript handling ────────────────────────────────────────────────
 
@@ -280,6 +291,21 @@ class TurnManager:
             event = await self._transcript_queue.get()
             text: str = event.data.get("text", "")
             if not text or not text.strip():
+                continue
+
+            # V3: If InterruptRouter already added the turn, skip add_turn
+            turn_already_added = event.data.get("turn_added", False)
+
+            # V3: During PENDING/PAUSED, only process transcripts from InterruptRouter
+            # (which have turn_added=True). Drop normal VAD→STT transcripts to prevent
+            # race condition with SpeakingMonitor's classification pipeline.
+            if not turn_already_added and self.session.state in (
+                TurnState.PENDING, TurnState.PAUSED,
+            ):
+                self._logger.debug(
+                    "Dropping transcript during %s (SpeakingMonitor has priority): '%s'",
+                    self.session.state.value, text[:40],
+                )
                 continue
 
             self._logger.info("User said: %s", text)
@@ -291,11 +317,13 @@ class TurnManager:
             if self._just_interrupted and normalised in self._stop_phrases:
                 self._logger.info("Stop phrase detected ('%s') — staying silent", normalised)
                 self._just_interrupted = False
-                await self.session.add_turn("user", text)
+                if not turn_already_added:
+                    await self.session.add_turn("user", text)
                 # Don't start LLM response — stay in LISTENING
                 continue
 
-            await self.session.add_turn("user", text)
+            if not turn_already_added:
+                await self.session.add_turn("user", text)
 
             if self.safety_guard is not None:
                 asyncio.create_task(self.safety_guard.check(text, direction="input"))
@@ -403,6 +431,9 @@ class TurnManager:
             if self.session.state in (TurnState.SPEAKING, TurnState.SOFT_INJECT):
                 await self.session.set_state(TurnState.LISTENING)
                 self._logger.info("Playback done → LISTENING")
+            elif self.session.state == TurnState.PAUSED:
+                # V3: PAUSED stays PAUSED — playback done doesn't exit PAUSED
+                self._logger.debug("Playback done during PAUSED — ignoring")
             # If INTERRUPTED, the interrupt handler already transitioned state
 
     # ── safety flag handling ───────────────────────────────────────────────
@@ -468,3 +499,33 @@ class TurnManager:
             self._current_llm_task = asyncio.create_task(
                 self._stream_and_parse(messages, model)
             )
+
+    # ── V3: CLASSIFIED event handling ────────────────────────────────────
+
+    async def _handle_classified(self) -> None:
+        """V3: Route CLASSIFIED events from Gate 3 to InterruptRouter.
+
+        SpeakingMonitor publishes CLASSIFIED after Gate 3 completes and
+        VAD confirms user stopped speaking. TurnManager simply delegates
+        to InterruptRouter.route() for all decision/type handling.
+        """
+        while True:
+            event = await self._classified_queue.get()
+
+            if self._interrupt_router is None:
+                self._logger.warning(
+                    "CLASSIFIED received but no InterruptRouter attached — ignoring"
+                )
+                continue
+
+            classified = event.data
+            self._logger.info(
+                "CLASSIFIED: decision=%s type=%s",
+                classified.get("decision", "?"),
+                classified.get("interrupt_type", "none"),
+            )
+
+            try:
+                await self._interrupt_router.route(classified)
+            except Exception:
+                self._logger.exception("InterruptRouter.route() failed")

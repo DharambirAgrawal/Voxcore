@@ -265,6 +265,13 @@ class EventType(str, Enum):
     PLAYBACK_PAUSE = "playback_pause"    # Freeze playback in place (user speaking)
     PLAYBACK_RESUME = "playback_resume"  # Resume playback from where it froze
 
+    # --- V3: Interrupt Pipeline Events ---
+    PENDING = "pending"                    # User speech detected during SPEAKING, TTS paused
+    CLASSIFIED = "classified"              # Gate 3 returned DECISION + TYPE
+    FILLER_REACTION = "filler_reaction"    # Gate 2 detected filler word, AI continues
+    FILTER_ACTIVE_CHANGE = "filter_active_change"  # AriaVoiceFilter / Gate 0 toggled
+    WARMUP_COMPLETE = "warmup_complete"    # Startup warmup finished, echo protection ready
+
     # --- Agent Events ---
     TOOL_RESULT_READY = "tool_result_ready"
     AGENT_JSON_OUT = "agent_json_out"

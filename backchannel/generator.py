@@ -69,6 +69,14 @@ EMOTIONAL_CLIPS = {
     "sighs":        "Mm.",
 }
 
+# V3: Pre-pause clips — played instantly when entering PENDING state
+# These give the user audio feedback while Gate 3 classifies.
+PRE_PAUSE_CLIPS = {
+    "breath":   "Hmm.",        # Soft breath-like sound
+    "mm":       "Mm.",         # Minimal acknowledgment
+    "mm_hmm":   "Mm-hmm.",    # Slightly longer (reuses backchannel)
+}
+
 DEFAULT_OUTPUT_DIR = "clips/heart/"
 DEFAULT_MODEL_PATH = "models/kokoro-v1.0.onnx"
 DEFAULT_VOICES_PATH = "../models/voices-v1.0.bin"
@@ -147,7 +155,8 @@ class ClipGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
         # V2: Merge emotional clips into the generation pass
-        all_phrases = {**phrases, **EMOTIONAL_CLIPS}
+        # V3: Add pre-pause clips for PENDING state filler
+        all_phrases = {**phrases, **EMOTIONAL_CLIPS, **PRE_PAUSE_CLIPS}
         results: dict[str, bool] = {}
 
         for clip_name, text in all_phrases.items():
@@ -203,7 +212,8 @@ class ClipGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
         # V2: Merge emotional clips
-        all_phrases = {**phrases, **EMOTIONAL_CLIPS}
+        # V3: Add pre-pause clips
+        all_phrases = {**phrases, **EMOTIONAL_CLIPS, **PRE_PAUSE_CLIPS}
 
         for clip_name in all_phrases:
             clip_path = self.output_dir / f"{clip_name}.wav"

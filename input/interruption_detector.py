@@ -162,19 +162,21 @@ from input.vad import VADProcessor
 class InterruptionDetector:
     """Gate 1 — Monitors audio during SPEAKING for sustained user speech.
 
-    Without hardware AEC the mic picks up TTS echo.  Silero VAD reports
-    prob ≈ 1.0 for echo because it IS speech — just not the user's.
+    V3 two-path system:
+      Path A: HIGH_ENERGY_BURST — 150ms, 8× noise floor. Catches sharp commands
+              ("stop", "hold on"). Skips Gate 2, goes directly to Gate 3.
+      Path B: NORMAL_SPEECH — 600ms, 3× noise floor. For regular interruptions.
+              Proceeds to Gate 2 (filler check) then Gate 3 (LLM classification).
 
     Discrimination strategy:
       1. Hard cooldown (500ms) after entering SPEAKING
       2. Continuously adapting echo RMS baseline (EMA)
       3. Energy gate: rms must exceed max(ambient, echo_ema × 3, absolute_min)
       4. VAD probability gate (0.60)
-      5. Sustained speech window — configurable via speaking_monitor.gate1_min_duration_ms
-         (defaults to 600ms when monitor enabled, 300ms when disabled)
+      5. Two-path sustained speech window
 
-    When speaking_monitor is ENABLED (v2):
-      - Fires GATE1_PASSED instead of INTERRUPT_DETECTED
+    When speaking_monitor is ENABLED (v2/v3):
+      - Fires GATE1_PASSED with path='A' or path='B'
       - SpeakingMonitor handles Gate 2 (filler) and Gate 3 (LLM classification)
 
     When speaking_monitor is DISABLED:
@@ -207,6 +209,14 @@ class InterruptionDetector:
 
         # ── Tuning knobs ─────────────────────────────────────────────────
         self._interrupt_threshold: float = 0.60
+
+        # V3: Two-path Gate 1 configuration
+        self._path_a_duration_ms: int = monitor_cfg.get("gate1_path_a_min_duration_ms", 150)
+        self._path_a_energy_ratio: float = monitor_cfg.get("gate1_path_a_energy_ratio", 8.0)
+        self._path_b_duration_ms: int = monitor_cfg.get("gate1_path_b_min_duration_ms", 600)
+        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 3.0)
+
+        # Legacy single-path fallback (when monitor disabled)
         self._interrupt_duration_ms: int = (
             monitor_cfg.get("gate1_min_duration_ms", 300)
             if self._monitor_enabled
@@ -469,23 +479,32 @@ class InterruptionDetector:
         now = time.monotonic()
 
         if speech_prob > self._interrupt_threshold:
-            self._last_speech_at = now  # track latest high-prob speech frame
+            self._last_speech_at = now
             if self._speech_detected_at == 0.0:
                 self._speech_detected_at = now
                 self._logger.debug(
                     "Interrupt timer accumulating (prob=%.3f, rms=%.4f)",
-                    speech_prob,
-                    rms,
+                    speech_prob, rms,
                 )
             else:
                 duration_ms = (now - self._speech_detected_at) * 1000
-                self._logger.debug(
-                    "Gate 1: %.0f/%.0fms (prob=%.2f)",
-                    duration_ms, self._interrupt_duration_ms, speech_prob,
-                )
-                if duration_ms >= self._interrupt_duration_ms:
-                    if self._monitor_enabled:
-                        # ── V2: Defer to SpeakingMonitor (Gate 2 + 3) ────
+                noise_floor = self.mic_stream.noise_floor
+
+                if self._monitor_enabled:
+                    # ── V3: Two-path Gate 1 ─────────────────────────
+                    path = None
+                    energy_ratio = rms / max(noise_floor, 1e-8)
+
+                    # Path A: HIGH_ENERGY_BURST — short + very loud
+                    if (duration_ms >= self._path_a_duration_ms
+                            and energy_ratio >= self._path_a_energy_ratio):
+                        path = "A"
+                    # Path B: NORMAL_SPEECH — sustained + moderate
+                    elif (duration_ms >= self._path_b_duration_ms
+                            and energy_ratio >= self._path_b_energy_ratio):
+                        path = "B"
+
+                    if path is not None:
                         await self.event_bus.publish(
                             EventType.GATE1_PASSED,
                             data={
@@ -493,15 +512,27 @@ class InterruptionDetector:
                                 "rms": rms,
                                 "duration_ms": duration_ms,
                                 "echo_ema": self._echo_ema,
+                                "path": path,
+                                "energy_ratio": energy_ratio,
                             },
                             source="InterruptionDetector",
                         )
                         self._logger.info(
-                            "Gate 1 PASSED (%.0fms, prob=%.2f, rms=%.4f) → SpeakingMonitor",
-                            duration_ms, speech_prob, rms,
+                            "Gate 1 PASSED path=%s (%.0fms, prob=%.2f, rms=%.4f, "
+                            "ratio=%.1f×) → SpeakingMonitor",
+                            path, duration_ms, speech_prob, rms, energy_ratio,
                         )
+                        self._speech_detected_at = 0.0
+                        self._last_speech_at = 0.0
+                        await asyncio.sleep(0.5)
                     else:
-                        # ── V1 fallback: fire INTERRUPT_DETECTED directly ─
+                        self._logger.debug(
+                            "Gate 1: %.0fms (prob=%.2f, ratio=%.1f×) — waiting",
+                            duration_ms, speech_prob, energy_ratio,
+                        )
+                else:
+                    # ── V1 fallback: fire INTERRUPT_DETECTED directly ──
+                    if duration_ms >= self._interrupt_duration_ms:
                         await self.event_bus.publish(
                             EventType.INTERRUPT_DETECTED,
                             data={
@@ -512,15 +543,13 @@ class InterruptionDetector:
                         self._logger.info(
                             "INTERRUPT detected (%.0fms, prob=%.2f, "
                             "rms=%.4f, echo_ema=%.4f, ratio=%.1f×)",
-                            duration_ms,
-                            speech_prob,
-                            rms,
+                            duration_ms, speech_prob, rms,
                             self._echo_ema,
                             rms / self._echo_ema if self._echo_ema > 0 else 0,
                         )
-                    self._speech_detected_at = 0.0
-                    self._last_speech_at = 0.0
-                    await asyncio.sleep(0.5)
+                        self._speech_detected_at = 0.0
+                        self._last_speech_at = 0.0
+                        await asyncio.sleep(0.5)
         else:
             # Non-speech frame: only reset timer if hold window expired
             if self._speech_detected_at > 0 and self._last_speech_at > 0:
@@ -529,5 +558,4 @@ class InterruptionDetector:
                     self._speech_detected_at = 0.0
                     self._last_speech_at = 0.0
             elif self._speech_detected_at > 0 and self._last_speech_at == 0.0:
-                # Timer started but never saw high-prob frame — reset
                 self._speech_detected_at = 0.0

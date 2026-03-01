@@ -102,15 +102,39 @@ audio:
   aec_filter_blocks: 12              # V3: AEC filter partitions (12 × 30ms = 360ms echo tail)
   aec_step_size: 0.3                 # V3: AEC NLMS step size (0.0–1.0, 0.3 = safe for most rooms)
 
-# V2: Speaking Monitor — 3-gate interrupt classification during AI speech
+# V2/V3: Speaking Monitor — multi-gate interrupt classification during AI speech
 speaking_monitor:
-  enabled: true                        # Enable/disable the speaking monitor (Gate 2 + Gate 3)
+  enabled: true                        # Enable/disable the speaking monitor
   model: "llama-3.1-8b-instant"        # LLM model for semantic interrupt classification (Gate 3)
-  gate1_min_duration_ms: 300           # Gate 1: minimum speech duration before triggering (ms)
-  gate2_filler_list: []                # Gate 2: additional filler words (merged with defaults)
-  gate3_debounce_s: 1.5               # Gate 3: minimum seconds between LLM classification calls
-  gate3_audio_window_ms: 2000          # Gate 3: audio window for transcription (ms)
-  context_words: 30                    # Number of recent AI speech words to include in classifier prompt
+  # ── V3: Two-path Gate 1 ──
+  gate1_path_a_min_duration_ms: 150    # Path A: HIGH_ENERGY_BURST — short, loud (shout/command)
+  gate1_path_a_energy_ratio: 8         # Path A: 8× noise floor required
+  gate1_path_b_min_duration_ms: 600    # Path B: NORMAL_SPEECH — sustained, moderate
+  gate1_path_b_energy_ratio: 3         # Path B: 3× noise floor required
+  gate1_min_duration_ms: 300           # Legacy: minimum speech duration (deprecated by two-path)
+  # ── Gate 2/3 ──
+  gate2_filler_list: []                # Gate 2: additional filler words
+  gate3_debounce_s: 1.5                # Gate 3: min seconds between LLM calls
+  gate3_audio_window_ms: 2000          # Gate 3: audio window for transcription
+  gate3_timeout_s: 3.0                 # Gate 3: max wait before default INTERRUPT:PAUSE
+  context_words: 30                    # Number of recent AI words in classifier prompt
+  # ── V3: PENDING state ──
+  pre_pause_clip: "hmm.wav"            # Clip to play during PENDING (from clips_dir)
+  paused_auto_resume_s: 3.0            # Seconds before PAUSED auto-resumes
+  # ── V3: VAD interrupt sensitivity ──
+  vad_interrupt_threshold: 0.5         # VAD threshold during SPEAKING (lower = more sensitive)
+  vad_interrupt_silence_ms: 300        # Silence before VAD-end action fires
+
+# V3: Echo suppression configuration (4-layer system)
+echo_suppression:
+  # Layer 2: AriaVoiceFilter (resemblyzer speaker identity)
+  aria_similarity_threshold: 0.75      # Cosine similarity above this → echo (0.0-1.0)
+  # Layer 3: Gate0EchoCheck (spectral + temporal)
+  gate0_spectral_threshold: 0.85       # Spectral cosine similarity above this → echo
+  gate0_temporal_gate_ms: 80           # TTS played < N ms ago → automatic echo
+  gate0_ema_alpha: 0.1                 # EMA smoothing for TTS spectrum fingerprint
+  # Startup warmup
+  warmup_text: "Hello, how are you doing today? I hope you're having a wonderful day."
 
 backchannel:
   enabled: true                      # Enable/disable backchannel system entirely

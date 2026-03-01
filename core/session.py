@@ -230,6 +230,8 @@ class TurnState(Enum):
     SPEAKING = "speaking"
     INTERRUPTED = "interrupted"
     SOFT_INJECT = "soft_inject"
+    PENDING = "pending"         # V3: TTS paused, Gate 3 classifying
+    PAUSED = "paused"           # V3: TTS frozen in RAM, resumable
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
