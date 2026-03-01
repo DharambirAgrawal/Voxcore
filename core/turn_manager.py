@@ -431,6 +431,20 @@ class TurnManager:
             if self.session.state in (TurnState.SPEAKING, TurnState.SOFT_INJECT):
                 await self.session.set_state(TurnState.LISTENING)
                 self._logger.info("Playback done → LISTENING")
+
+                # ── Deferred INJECT execution ──────────────────────────────
+                # If the user said "after this can you tell me X" during TTS,
+                # the InterruptRouter stored the transcript as a deferred task.
+                # Now that playback is done, fire it as a fresh user turn.
+                if self._interrupt_router is not None:
+                    deferred = self._interrupt_router.pop_deferred_task()
+                    if deferred:
+                        self._logger.info(
+                            "Executing deferred task: '%s'", deferred[:60],
+                        )
+                        await self.session.add_turn("user", deferred)
+                        await self._start_llm_response(deferred)
+
             elif self.session.state == TurnState.PAUSED:
                 # V3: PAUSED stays PAUSED — playback done doesn't exit PAUSED
                 self._logger.debug("Playback done during PAUSED — ignoring")

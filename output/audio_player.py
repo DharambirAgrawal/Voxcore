@@ -200,6 +200,7 @@ import asyncio
 import collections
 import logging
 import io
+import time
 from typing import Optional
 
 import numpy as np
@@ -774,41 +775,17 @@ class AudioPlayer:
             # Clips don't feed AriaFilter/Gate0, so enabling filters during clips
             # would block real user speech against stale TTS fingerprint.
 
-            frame_ms = 20
-            frame_samples = sr * frame_ms // 1000
-            total_samples = audio_float.shape[0]
+            # V3 FIX: Use sd.play instead of manual frame loops to prevent ASYNC thread underflows
+            sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
 
-            stream = sd.OutputStream(
-                samplerate=sr,
-                channels=audio_float.shape[1],
-                dtype="float32",
-            )
-            stream.start()
-
-            offset = 0
-            while offset < total_samples:
+            duration = len(audio_float) / sr
+            start_time = time.time()
+            
+            while time.time() - start_time < duration:
                 if self._is_interrupted:
+                    sd.stop()
                     break
-
-                end = min(offset + frame_samples, total_samples)
-                frame = audio_float[offset:end].copy()
-
-                stream.write(frame * 0.9)
-
-                # Legacy reference buffer only — NO AriaFilter/Gate0 feeds
-                mono_frame = frame[:, 0] if frame.ndim > 1 else frame
-                self._reference_buffer.extend(mono_frame.tolist())
-                if self._reference_callback is not None:
-                    try:
-                        self._reference_callback(mono_frame)
-                    except Exception:
-                        pass
-
-                offset = end
-                await asyncio.sleep(0)
-
-            stream.stop()
-            stream.close()
+                await asyncio.sleep(0.05)
 
             self._logger.debug("V3: played clip '%s' (no filter feed)", clip_path)
         except asyncio.CancelledError:

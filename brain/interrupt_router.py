@@ -25,6 +25,7 @@ INTERRUPT TYPES:
 import asyncio
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,10 @@ class InterruptRouter:
         self._resume_phrases = set(
             sm_cfg.get("paused_resume_phrases", list(RESUME_PHRASES))
         )
+
+        # Deferred INJECT — stores transcript of "after this can you..." requests
+        # so they fire automatically when the current TTS turn ends.
+        self._pending_deferred_task: Optional[str] = None
 
         self._logger = logging.getLogger("InterruptRouter")
 
@@ -168,25 +173,52 @@ class InterruptRouter:
     # ── INJECT ───────────────────────────────────────────────────────────────
 
     async def _handle_inject(self, classified: dict) -> None:
-        """Resume TTS and inject user's text into LLM context."""
+        """Resume TTS and inject user's text into LLM context.
+
+        If the request is deferred (e.g. 'after this can you tell me...'),
+        the transcript is stored for execution once the current TTS turn ends
+        rather than being injected mid-stream.
+        """
         self._gate3_done_event.set()  # stop filler clip
         await self._audio_player.resume()
         self._mic_stream.set_filter_active(True)
 
         transcript = classified.get("transcript", "")
         inject_point = classified.get("inject_point", "mid_sentence")
+        is_deferred = classified.get("deferred", False)
 
-        await self._session.inject_text(
-            content=f"[User interjected: {transcript}]",
-            priority="high",
-            source="interrupt_inject",
-        )
+        if is_deferred:
+            # Deferred request: store transcript so TurnManager can trigger it
+            # once the current TTS playback finishes — don't inject mid-stream.
+            self._pending_deferred_task = transcript
+            self._logger.info(
+                "INJECT (deferred) — stored task '%s', resuming TTS",
+                transcript[:60],
+            )
+        else:
+            # Immediate inject: add context to LLM session now.
+            await self._session.inject_text(
+                content=f"[User interjected: {transcript}]",
+                priority="high",
+                source="interrupt_inject",
+            )
+            self._logger.info("INJECT — injected '%s' at %s", transcript[:40], inject_point)
 
         from core.session import TurnState
         await self._session.set_state(TurnState.SOFT_INJECT)
-        # Immediately return to SPEAKING — inject_point handled by response_parser
+        # Return to SPEAKING so TTS continues
         await self._session.set_state(TurnState.SPEAKING)
-        self._logger.info("INJECT — injected '%s' at %s", transcript[:40], inject_point)
+
+    def pop_deferred_task(self) -> Optional[str]:
+        """Return and clear any pending deferred task transcript.
+
+        Called by TurnManager after playback ends to fire deferred requests
+        (e.g. 'after this can you tell me the bitcoin price').
+        Returns None if no deferred task is pending.
+        """
+        task = self._pending_deferred_task
+        self._pending_deferred_task = None
+        return task
 
     # ── INTERRUPT:STOP ───────────────────────────────────────────────────────
 

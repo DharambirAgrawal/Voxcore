@@ -57,17 +57,25 @@ DECISION (choose ONE):
   IGNORE    — ONLY for reflexive 1-2 word sounds with no information:
               "haha", "wow", "oh", "hmm", "right", "yeah"
               These are involuntary reactions, not directed speech.
-  INJECT    — user is reacting WITH content (3+ words about what AI said):
-              "I really liked that", "that's a good point", "oh that's interesting",
-              "I love this story", "that reminds me of something"
-              The user is adding something meaningful — AI should acknowledge briefly.
-  INTERRUPT — user wants the AI to STOP and respond to them:
-              Questions ("can you tell me...", "what about...", "how do I..."),
-              corrections, topic changes, or commands.
+  INJECT    — user is adding something but does NOT want to stop the AI:
+              Reactions: "I really liked that", "that's a good point"
+              Deferred requests: "after this can you...", "when you're done tell me...",
+              "after the story...", "also later can you...", "once you finish..."
+              KEY: if the user says "after this" or "when you're done" before a request,
+              they want the AI to CONTINUE what it's doing and handle it LATER.
+              This is INJECT, NOT INTERRUPT.
+  INTERRUPT — user wants the AI to STOP RIGHT NOW and respond:
+              Immediate questions without deferral ("what is X?", "how do I...")
+              Corrections, topic changes, or commands.
+              No "after this"/"when done"/"later" qualifier present.
 
-IMPORTANT RULES:
+CRITICAL RULES:
+- "after this", "after the story", "when you're done", "once you finish",
+  "also can you later", "before you forget" → ALWAYS INJECT, never INTERRUPT.
+  The user explicitly wants the AI to continue and handle the request afterward.
 - If the transcript is 3+ words, it is almost NEVER IGNORE.
-- Questions or requests ("can you", "tell me", "what about") → INTERRUPT.
+- Questions WITHOUT deferral ("can you tell me X" with no "after this") → INTERRUPT.
+- Questions WITH deferral ("after this can you tell me X") → INJECT.
 - Positive reactions with content ("I liked that", "good story") → INJECT.
 - Only bare sounds/words with zero content → IGNORE.
 
@@ -98,21 +106,33 @@ STOP_KEYWORDS: set[str] = {
 }
 
 # Words/phrases that are attention-getters = user wants to speak
+# V3 FIX: Removed multi-word phrases that overlap with deferred requests.
+# Only truly unambiguous single-word attention-getters remain.
+# Multi-word transcripts go through the LLM classifier for proper
+# deferral detection ("after this can you..." = INJECT not INTERRUPT).
 ATTENTION_KEYWORDS: set[str] = {
     "hey", "hello", "excuse me", "listen", "wait wait",
-    "actually", "but", "question", "i have a question",
-    "can i", "can you", "could you", "let me", "tell me",
-    "what about", "how about", "what is", "what's",
-    "thank you", "thanks", "okay thanks", "ok thanks",
-    "that's great thanks", "alright thanks",
+    "question", "i have a question",
 }
 
-# Prefixes: if transcript STARTS WITH any of these, it's attention/question
+# Prefixes: if transcript STARTS WITH any of these, it's attention/question.
+# V3 FIX: Only kept prefixes that are NEVER used in deferred requests.
+# Removed "can you", "could you", "tell me", "what about", etc. because
+# those commonly appear WITH deferral ("after this can you...").
+# The LLM classifier handles the nuance of immediate vs deferred.
 ATTENTION_PREFIXES: tuple[str, ...] = (
-    "can you", "could you", "can i", "tell me", "what about",
-    "how about", "what is", "what's", "how do", "how can",
-    "do you", "would you", "will you", "i want", "i need",
-    "i have a", "let me", "actually", "excuse me",
+    "excuse me",
+)
+
+# V3: Deferral phrases — if ANY of these appear in the transcript, the user
+# wants the AI to continue and handle the request LATER.  Forces INJECT.
+DEFERRAL_PHRASES: tuple[str, ...] = (
+    "after this", "after the story", "after that", "after you finish",
+    "after you're done", "when you're done", "when you finish",
+    "once you're done", "once you finish", "once this is done",
+    "later can you", "also later", "before you forget",
+    "remind me to", "remind me after", "don't forget to",
+    "but first finish", "keep going but", "continue but",
 )
 
 
@@ -190,6 +210,13 @@ class SpeakingMonitor:
         bc_cfg = config.get("backchannel", {})
         self._clips_dir: str = bc_cfg.get("clips_dir", "backchannel/clips/heart/")
         self._pre_pause_clip: str = monitor_cfg.get("pre_pause_clip", "mm_hmm.wav")
+
+        # V3: HF endpoint failure counter — skip HF after consecutive failures
+        self._hf_consecutive_failures: int = 0
+        self._hf_max_failures: int = 1  # after 1 failure, go straight to Groq
+
+        # V3: Pre-pause chunk count — used to prefer clean post-pause audio
+        self._pre_pause_chunk_count: int = 0
 
     async def run(self) -> None:
         """Main loop — listen for GATE1_PASSED events and run Gate 2 + 3."""
@@ -351,6 +378,24 @@ class SpeakingMonitor:
                     source="SpeakingMonitor",
                 )
 
+            # V3 FIX: Keep the LAST ~1s of audio (the speech that triggered
+            # Gate 1) but discard everything older.  The old approach cleared
+            # the entire buffer, which threw away the user's actual utterance
+            # because Gate 1 fires 600-700ms AFTER speech starts — the user
+            # may already be finishing "can you stop" by the time we get here.
+            # Keeping ~1s preserves that speech; the echo-transcript check
+            # handles any residual AI audio that leaks through.
+            _keep_ms = 1200  # keep last 1.2 s (covers Gate 1 window + margin)
+            _keep_chunks = max(1, _keep_ms // 30)  # ~40 chunks at 30 ms each
+            _kept = list(self._audio_buffer)[-_keep_chunks:]
+            self._audio_buffer.clear()
+            self._audio_buffer.extend(_kept)
+            self._pre_pause_chunk_count = len(_kept)  # mark boundary
+            self._logger.debug(
+                "Buffer trimmed: kept %d chunks (~%dms) of pre-Gate1 speech",
+                len(_kept), len(_kept) * 30,
+            )
+
             # V3: Set session state to PENDING
             await self.session.set_state(TurnState.PENDING)
             paused = True
@@ -377,7 +422,11 @@ class SpeakingMonitor:
             )
 
             # ── Step 2: Collection delay ─────────────────────────────────
-            delay_s = self._collection_delay_ms / 1000.0
+            # V3 FIX: Reduced from config value (600ms) to 350ms.
+            # The longer speech-end wait (Step 2b) compensates — this gets
+            # us to transcription faster for short commands while still
+            # capturing full utterances via the adaptive silence detector.
+            delay_s = min(self._collection_delay_ms / 1000.0, 0.35)
             await asyncio.sleep(delay_s)
 
             if self.session.state not in (
@@ -386,9 +435,25 @@ class SpeakingMonitor:
                 paused = False
                 return
 
+            # ── Step 2b: Wait for user to finish speaking ────────────────
+            # V3 FIX: No hard max_wait — the user can speak as long as they
+            # want.  We just wait for 700ms of contiguous silence (matches
+            # the normal VAD's silence=700ms setting).  Previous values of
+            # 200-500ms were cutting off mid-sentence on natural inter-word
+            # pauses.  The 10s safety cap only triggers in pathological cases.
+            await self._wait_for_speech_end(max_wait_s=10.0, silence_ms=700)
+
+            if self.session.state not in (
+                TurnState.SPEAKING, TurnState.PENDING, TurnState.PAUSED,
+            ):
+                paused = False
+                return
+
             # ── Step 3: Transcribe ───────────────────────────────────────
-            # Use 2000ms window so Whisper API has enough context to avoid returning empty string for single words
-            audio_window = self._get_audio_window(ms_override=2000)
+            # V3 FIX: Use full available buffer (up to 10s) since the user
+            # can now speak as long as they want.  The smart windowing in
+            # _get_audio_window() already prefers clean post-pause audio.
+            audio_window = self._get_audio_window(ms_override=10000)
             if audio_window is None or len(audio_window) < 100:
                 self._logger.warning("Not enough audio — fallback INTERRUPT")
                 await self._publish_classified("INTERRUPT", "STOP", "", gate1_data)
@@ -396,76 +461,99 @@ class SpeakingMonitor:
                 return
 
             transcript = await self._transcribe_short_clip(audio_window)
+            
+            decision = "IGNORE"
+            interrupt_type = "null"
+            urgency_hint = (gate1_path == "A")
+
             if not transcript or not transcript.strip():
-                self._logger.warning("Empty transcript from STT — likely echo or short word dropped by STT, RESUME")
-                await self._do_resume("empty_transcript")
-                paused = False
-                return
+                # V3 FIX: Don't resume immediately on empty transcript if user is still making noise.
+                # Treat as default IGNORE and let VAD (Step 8) wait for them to finish, where it might re-trigger STT.
+                self._logger.warning("Empty transcript from STT — treating as IGNORE (waiting for VAD)")
+                transcript = ""
+            else:
+                self._logger.info("Monitor transcript: '%s' (path=%s)", transcript, gate1_path)
 
-            self._logger.info("Monitor transcript: '%s' (path=%s)", transcript, gate1_path)
+                # ── Step 4: Fast keyword check ───────────────────────────────
+                normalised = transcript.strip().lower().rstrip(".!?,")
 
-            # ── Step 4: Fast keyword check ───────────────────────────────
-            normalised = transcript.strip().lower().rstrip(".!?,")
-            if normalised in STOP_KEYWORDS:
-                self._logger.info("STOP keyword → instant INTERRUPT")
-                await self._publish_classified(
-                    "INTERRUPT", "STOP", transcript, gate1_data,
+                # V3: Check for deferral phrases FIRST — these always mean INJECT
+                has_deferral = any(d in normalised for d in DEFERRAL_PHRASES)
+
+                # Exact match OR any multi-word stop phrase is a substring
+                # (catches "hey can you stop" matching "can you stop" from the set).
+                # Single-word keywords are only checked exact — avoids matching
+                # "stopped", "waiting", etc.
+                # Guard: if has_deferral, treat as deferred INJECT not immediate stop.
+                _is_stop = (not has_deferral) and (
+                    normalised in STOP_KEYWORDS or
+                    any(kw in normalised for kw in STOP_KEYWORDS if " " in kw)
                 )
-                paused = False
-                return
-
-            if normalised in ATTENTION_KEYWORDS or normalised.startswith(ATTENTION_PREFIXES):
-                self._logger.info("ATTENTION keyword/prefix → instant INTERRUPT")
-                await self._publish_classified(
-                    "INTERRUPT", "NEW_QUESTION", transcript, gate1_data,
-                )
-                paused = False
-                return
-
-            # ── Step 5: Echo transcript check ────────────────────────────
-            if self._is_echo_transcript(transcript):
-                self._logger.info("Echo transcript → RESUME")
-                await self._do_resume("echo_transcript")
-                paused = False
-                return
-
-            # ── Step 6: Filler word check ────────────────────────────────
-            # V3: Path A (HIGH_ENERGY_BURST) skips filler check
-            if gate1_path != "A":
-                is_filler, matched_word = self.filler_detector.is_filler(transcript)
-                if is_filler:
-                    self._logger.info("FILLER → RESUME")
-                    await self.event_bus.publish(
-                        EventType.POSITIVE_REACTION,
-                        {"text": transcript, "matched_word": matched_word},
-                        source="SpeakingMonitor",
+                if _is_stop:
+                    self._logger.info("STOP keyword → instant INTERRUPT")
+                    await self._publish_classified(
+                        "INTERRUPT", "STOP", transcript, gate1_data,
                     )
-                    await self._do_resume("filler")
                     paused = False
                     return
 
-            # ── Step 7: LLM classification (Gate 3) with timeout ─────────
-            urgency_hint = (gate1_path == "A")
-            try:
-                decision, interrupt_type = await asyncio.wait_for(
-                    self._classify_with_llm(
-                        transcript,
-                        speech_position="mid_sentence",
-                        urgency_hint=urgency_hint,
-                    ),
-                    timeout=self._gate3_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                self._logger.warning(
-                    "Gate 3 timeout (%.1fs) — default INTERRUPT/PAUSE",
-                    self._gate3_timeout_s,
-                )
-                decision, interrupt_type = "INTERRUPT", "PAUSE"
+                # V3: If deferral phrase detected, skip keyword bypass → let LLM classify
+                # "after this can you tell me bitcoin price" should be INJECT, not INTERRUPT
+                if has_deferral:
+                    self._logger.info(
+                        "Deferral phrase detected → skipping keyword check, using LLM"
+                    )
+                elif normalised in ATTENTION_KEYWORDS or normalised.startswith(ATTENTION_PREFIXES):
+                    self._logger.info("ATTENTION keyword/prefix → instant INTERRUPT")
+                    await self._publish_classified(
+                        "INTERRUPT", "NEW_QUESTION", transcript, gate1_data,
+                    )
+                    paused = False
+                    return
 
-            self._logger.info(
-                "Gate 3: decision=%s type=%s (transcript='%s')",
-                decision, interrupt_type, transcript,
-            )
+                # ── Step 5: Echo transcript check ────────────────────────────
+                if self._is_echo_transcript(transcript):
+                    self._logger.info("Echo transcript → RESUME")
+                    await self._do_resume("echo_transcript")
+                    paused = False
+                    return
+
+                # ── Step 6: Filler word check ────────────────────────────────
+                # V3: Path A (HIGH_ENERGY_BURST) skips filler check
+                if gate1_path != "A":
+                    is_filler, matched_word = self.filler_detector.is_filler(transcript)
+                    if is_filler:
+                        self._logger.info("FILLER → RESUME")
+                        await self.event_bus.publish(
+                            EventType.POSITIVE_REACTION,
+                            {"text": transcript, "matched_word": matched_word},
+                            source="SpeakingMonitor",
+                        )
+                        await self._do_resume("filler")
+                        paused = False
+                        return
+
+                # ── Step 7: LLM classification (Gate 3) with timeout ─────────
+                try:
+                    decision, interrupt_type = await asyncio.wait_for(
+                        self._classify_with_llm(
+                            transcript,
+                            speech_position="mid_sentence",
+                            urgency_hint=urgency_hint,
+                        ),
+                        timeout=self._gate3_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning(
+                        "Gate 3 timeout (%.1fs) — default INTERRUPT/PAUSE",
+                        self._gate3_timeout_s,
+                    )
+                    decision, interrupt_type = "INTERRUPT", "PAUSE"
+
+                self._logger.info(
+                    "Gate 3: decision=%s type=%s (transcript='%s')",
+                    decision, interrupt_type, transcript,
+                )
 
             # ── Step 8: VAD-end action — wait for user silence ───────────
             # V3: Re-classify every 1.5s if user keeps speaking
@@ -501,6 +589,7 @@ class SpeakingMonitor:
             elif decision == "INJECT":
                 await self._publish_classified(
                     "INJECT", "SAME_TOPIC_REDIRECT", transcript, gate1_data,
+                    deferred=has_deferral,
                 )
                 paused = False
             elif decision == "INTERRUPT":
@@ -569,6 +658,7 @@ class SpeakingMonitor:
         interrupt_type: str,
         transcript: str,
         gate1_data: dict,
+        deferred: bool = False,
     ) -> None:
         """V3: Publish a CLASSIFIED event for InterruptRouter to handle."""
         await self.event_bus.publish(
@@ -581,12 +671,55 @@ class SpeakingMonitor:
                 "rms": gate1_data.get("rms", 0.0),
                 "path": gate1_data.get("path", "B"),
                 "ai_context": self._last_ai_speech[-100:],
+                "deferred": deferred,
             },
             source="SpeakingMonitor",
         )
         self._logger.info(
             "CLASSIFIED: decision=%s type=%s transcript='%s'",
             decision, interrupt_type, transcript,
+        )
+
+    async def _wait_for_speech_end(
+        self, max_wait_s: float = 1.8, silence_ms: int = 200
+    ) -> None:
+        """Block until the mic has been silent for `silence_ms` ms or `max_wait_s` elapses.
+
+        Called after the initial collection delay so we capture the user's
+        full utterance before running filler / LLM classification.
+        Polls every 50ms; exits as soon as a contiguous silence window is seen.
+        """
+        silence_threshold_s = silence_ms / 1000.0
+        check_interval = 0.05
+        elapsed = 0.0
+        silence_duration = 0.0
+
+        while elapsed < max_wait_s:
+            recent = self.mic_stream.last_200ms()
+            if len(recent) > 0:
+                rms = float(np.sqrt(np.mean(recent ** 2)))
+                noise_floor = self.mic_stream.noise_floor
+                is_silent = rms < noise_floor * 2.5
+            else:
+                is_silent = True
+
+            if is_silent:
+                silence_duration += check_interval
+                if silence_duration >= silence_threshold_s:
+                    self._logger.debug(
+                        "Speech-end VAD: %.0fms silence after %.0fms total",
+                        silence_duration * 1000, elapsed * 1000,
+                    )
+                    return
+            else:
+                silence_duration = 0.0
+
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+
+        self._logger.debug(
+            "Speech-end VAD: max_wait %.1fs reached without silence — proceeding",
+            max_wait_s,
         )
 
     async def _wait_for_user_to_finish(
@@ -722,23 +855,63 @@ class SpeakingMonitor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _get_audio_window(self, ms_override: Optional[int] = None) -> Optional[np.ndarray]:
-        """Extract the last N ms of buffered audio.
+        """Extract audio from the rolling buffer, preferring post-pause audio.
 
-        Args:
-            ms_override: If set, use this many ms instead of audio_window_ms.
-                         Used post-collection-delay to get a focused window.
+        The buffer contains two regions after Gate 1:
+          [0 .. _pre_pause_chunk_count)  — recorded while TTS was playing (echo-contaminated)
+          [_pre_pause_chunk_count .. end) — recorded after TTS paused (clean)
+
+        Strategy:
+          • If we have >= 500ms of post-pause audio AND it contains actual speech
+            (RMS > noise_floor × 1.5), use ONLY post-pause chunks (up to ms_override).
+          • Otherwise fall back to the full buffer. The critical case is when the
+            user finished speaking BEFORE Gate 1 fired — the post-pause chunks are
+            then just silence, and using them gives STT nothing to work with.
+            The echo-transcript check downstream catches pure AI echo.
         """
         if not self._audio_buffer:
             return None
 
         window_ms = ms_override if ms_override is not None else self._audio_window_ms
-        # Calculate how many chunks we need
         chunk_ms = 30  # mic_stream default
         chunks_needed = max(1, window_ms // chunk_ms)
 
-        # Get the last N chunks
         available = list(self._audio_buffer)
-        window_chunks = available[-chunks_needed:]
+        pre_count = min(self._pre_pause_chunk_count, len(available))
+        post_chunks = available[pre_count:]
+        post_ms = len(post_chunks) * chunk_ms
+
+        if post_ms >= 500:
+            # Check if post-pause chunks actually contain speech or are just
+            # silence accumulated during the _wait_for_speech_end wait period.
+            noise_floor = self.mic_stream.noise_floor
+            speech_threshold = noise_floor * 1.5 if noise_floor > 0 else 0.005
+            post_audio = np.concatenate(post_chunks) if post_chunks else np.array([])
+            post_rms = float(np.sqrt(np.mean(post_audio ** 2))) if len(post_audio) > 0 else 0.0
+            has_speech = post_rms > speech_threshold
+
+            if has_speech:
+                # Enough clean post-pause audio — use only that
+                window_chunks = post_chunks[-chunks_needed:]
+                self._logger.debug(
+                    "Audio window: using %d post-pause chunks (%dms), skipping %d pre-pause (rms=%.4f)",
+                    len(window_chunks), len(window_chunks) * chunk_ms, pre_count, post_rms,
+                )
+            else:
+                # Post-pause is silence (user finished speaking before Gate 1 fired).
+                # Fall back to full buffer to capture the pre-pause speech utterance.
+                window_chunks = available[-chunks_needed:]
+                self._logger.debug(
+                    "Audio window: post-pause silent (rms=%.4f < %.4f) — using full buffer %d chunks (%dms)",
+                    post_rms, speech_threshold, len(window_chunks), len(window_chunks) * chunk_ms,
+                )
+        else:
+            # Short command case — include pre-pause buffer
+            window_chunks = available[-chunks_needed:]
+            self._logger.debug(
+                "Audio window: using full buffer %d chunks (%dms) (post-pause only %dms)",
+                len(window_chunks), len(window_chunks) * chunk_ms, post_ms,
+            )
 
         if not window_chunks:
             return None
@@ -758,14 +931,23 @@ class SpeakingMonitor:
         audio_int16 = (audio * 32768.0).clip(-32768, 32767).astype(np.int16)
         pcm_bytes = audio_int16.tobytes()
 
-        # Try HF endpoint first
-        if self._hf_audio_base_url:
+        # Try HF endpoint first — but skip if it has failed too many times
+        if self._hf_audio_base_url and self._hf_consecutive_failures < self._hf_max_failures:
             try:
-                return await self._transcribe_hf_monitor(pcm_bytes)
+                result = await self._transcribe_hf_monitor(pcm_bytes)
+                self._hf_consecutive_failures = 0  # reset on success
+                return result
             except Exception:
+                self._hf_consecutive_failures += 1
                 self._logger.warning(
-                    "HF /transcribe/monitor failed, falling back to Groq"
+                    "HF /transcribe/monitor failed (%d/%d), falling back to Groq",
+                    self._hf_consecutive_failures, self._hf_max_failures,
                 )
+        elif self._hf_consecutive_failures >= self._hf_max_failures:
+            self._logger.debug(
+                "HF skipped (%d consecutive failures) — using Groq directly",
+                self._hf_consecutive_failures,
+            )
 
         # Fallback: Groq whisper
         return await self._transcribe_groq_short(pcm_bytes)
@@ -789,8 +971,9 @@ class SpeakingMonitor:
         data.add_field("sample_rate", str(self._sample_rate))
 
         async with aiohttp.ClientSession() as http_session:
+            # V3: timeout slashed to 1.5s to prevent massive 5-second hangs on HF failures
             async with http_session.post(
-                url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=1.5)
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()

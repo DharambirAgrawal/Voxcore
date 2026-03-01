@@ -192,6 +192,13 @@ KOKORO_SAMPLE_RATE = 24000
 # V2: Clip tags that should NOT be sent to Kokoro
 CLIP_TAG_PATTERN = re.compile(r'\[(laughs|chuckles|light_laugh|sighs)\]')
 
+# Strip [TOOL RESULT ...] and [TOOL ERROR ...] artifact prefixes that the LLM
+# sometimes echoes back — they should NEVER be spoken aloud.
+ARTIFACT_PREFIX_PATTERN = re.compile(
+    r'^\s*\[TOOL\s+(?:RESULT|ERROR)[^\]]*\]\s*\n?',
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 class TTSClient:
     """Kokoro-ONNX local TTS client that converts sentences to audio.
@@ -295,6 +302,8 @@ class TTSClient:
 
             # Strip LLM emotion tags — Kokoro doesn't use them
             sentence = EMOTION_TAG_PATTERN.sub("", sentence).strip()
+            # Strip any [TOOL RESULT/ERROR] prefix the LLM echoed into its response
+            sentence = ARTIFACT_PREFIX_PATTERN.sub("", sentence).strip()
             if not sentence:
                 continue
 
