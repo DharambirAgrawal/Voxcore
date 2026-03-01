@@ -393,6 +393,9 @@ class AudioPlayer:
                 self._mic_stream.set_filter_active(True)
             try:
                 await self._play_audio(audio_array)
+            except asyncio.CancelledError:
+                self._is_playing = False
+                break
             finally:
                 if self._mic_stream is not None:
                     self._mic_stream.set_filter_active(False)
@@ -760,49 +763,77 @@ class AudioPlayer:
         self._logger.info("V3: Playback FLUSHED (filter OFF)")
 
     async def play_clip(self, clip_path: str) -> None:
-        """V3: Play a clip once without feeding echo filters.
+        """V3: Play a clip once with proper filter feeding to prevent mic pollution.
 
         Used for bridge clips (sure.wav, got_it.wav) and pre-pause clips.
-        Does NOT feed AriaVoiceFilter or Gate0 — these are not Aria's voice.
+        Feeds AriaVoiceFilter and Gate0 so the mic doesn't pick up the clip
+        and falsely trigger gates.
         """
         try:
             sr, audio = wavfile.read(clip_path)
             audio_float = audio.astype(np.float32)
             if audio.dtype == np.int16:
                 audio_float = audio_float / 32768.0
-            sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
+
+            if audio_float.ndim == 1:
+                audio_float = audio_float.reshape(-1, 1)
+
+            was_filter_active = False
+            if self._mic_stream is not None:
+                was_filter_active = self._mic_stream._filter_active
+                self._mic_stream.set_filter_active(True)
+
+            frame_ms = 20
+            frame_samples = sr * frame_ms // 1000
+            total_samples = audio_float.shape[0]
+
+            stream = sd.OutputStream(
+                samplerate=sr,
+                channels=audio_float.shape[1],
+                dtype="float32",
+            )
+            stream.start()
+
+            offset = 0
+            while offset < total_samples:
+                if self._is_interrupted:
+                    break
+
+                end = min(offset + frame_samples, total_samples)
+                frame = audio_float[offset:end].copy()
+
+                stream.write(frame * 0.9)
+
+                mono_frame = frame[:, 0] if frame.ndim > 1 else frame
+                self._reference_buffer.extend(mono_frame.tolist())
+                if self._reference_callback is not None:
+                    try:
+                        self._reference_callback(mono_frame)
+                    except Exception:
+                        pass
+
+                if hasattr(self, '_aria_filter') and self._aria_filter is not None:
+                    try:
+                        self._aria_filter.feed_aria_audio(mono_frame)
+                    except Exception:
+                        pass
+                if hasattr(self, '_gate0') and self._gate0 is not None:
+                    try:
+                        self._gate0.feed_tts_spectrum(mono_frame)
+                    except Exception:
+                        pass
+
+                offset = end
+                await asyncio.sleep(0)
+
+            stream.stop()
+            stream.close()
+
+            if self._mic_stream is not None and not was_filter_active:
+                self._mic_stream.set_filter_active(False)
+
             self._logger.debug("V3: played clip '%s'", clip_path)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             self._logger.error("V3: clip playback failed: %s", e)
-
-    async def play_clip_looping(self, clip_path: str, stop_event: asyncio.Event) -> None:
-        """V3: Loop a clip until stop_event is set (for pre-pause during PENDING).
-
-        Plays the clip, waits for its duration, checks stop_event, repeats.
-        Stops between loops (not mid-playback) when event is set.
-        """
-        try:
-            sr, audio = wavfile.read(clip_path)
-            audio_float = audio.astype(np.float32)
-            if audio.dtype == np.int16:
-                audio_float = audio_float / 32768.0
-
-            clip_duration = len(audio_float) / sr
-            max_loops = 4  # ~2s max for a 0.5s clip
-
-            for _ in range(max_loops):
-                if stop_event.is_set():
-                    break
-                sd.play(audio_float * 0.7, samplerate=sr, blocking=False)
-                # Wait for clip to finish, checking stop_event periodically
-                elapsed = 0.0
-                while elapsed < clip_duration:
-                    if stop_event.is_set():
-                        sd.stop()
-                        break
-                    await asyncio.sleep(0.05)
-                    elapsed += 0.05
-
-            self._logger.debug("V3: clip loop done '%s'", clip_path)
-        except Exception as e:
-            self._logger.error("V3: clip loop failed: %s", e)

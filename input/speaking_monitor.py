@@ -361,14 +361,8 @@ class SpeakingMonitor:
                 self._gate3_done_event.clear()
             clip_path = os.path.join(self._clips_dir, self._pre_pause_clip)
             if self._audio_player is not None and os.path.isfile(clip_path):
-                if self._gate3_done_event is not None:
-                    asyncio.create_task(
-                        self._audio_player.play_clip_looping(
-                            clip_path, stop_event=self._gate3_done_event,
-                        )
-                    )
-                else:
-                    asyncio.create_task(self._audio_player.play_clip(clip_path))
+                # V3: Play filler clip exactly once
+                asyncio.create_task(self._audio_player.play_clip(clip_path))
 
             # V3: Publish PENDING event for WebSocket clients
             await self.event_bus.publish(
@@ -393,7 +387,8 @@ class SpeakingMonitor:
                 return
 
             # ── Step 3: Transcribe ───────────────────────────────────────
-            audio_window = self._get_audio_window(ms_override=1200)
+            # Use 2000ms window so Whisper API has enough context to avoid returning empty string for single words
+            audio_window = self._get_audio_window(ms_override=2000)
             if audio_window is None or len(audio_window) < 100:
                 self._logger.warning("Not enough audio — fallback INTERRUPT")
                 await self._publish_classified("INTERRUPT", "STOP", "", gate1_data)
@@ -402,7 +397,7 @@ class SpeakingMonitor:
 
             transcript = await self._transcribe_short_clip(audio_window)
             if not transcript or not transcript.strip():
-                self._logger.debug("Empty transcript — likely echo, RESUME")
+                self._logger.warning("Empty transcript from STT — likely echo or short word dropped by STT, RESUME")
                 await self._do_resume("empty_transcript")
                 paused = False
                 return
