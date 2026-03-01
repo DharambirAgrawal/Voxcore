@@ -96,11 +96,7 @@ audio:
                                       # when silence returns, DISCARD it entirely
                                       # (filters isolated "umm" ~200ms, coughs ~150ms)
   noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
-  echo_correlation_threshold: 0.7    # V2: Cross-correlation threshold for echo suppression (legacy fallback)
-  echo_suppression: true             # V2: Enable/disable legacy cross-correlation echo suppression
-  echo_cancellation: false           # V3: WebRTC-style adaptive AEC (disabled, rely on Gate0 and Aria)
-  aec_filter_blocks: 12              # V3: AEC filter partitions (12 × 30ms = 360ms echo tail)
-  aec_step_size: 0.3                 # V3: AEC NLMS step size (0.0–1.0, 0.3 = safe for most rooms)
+  noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
 
 # V2/V3: Speaking Monitor — multi-gate interrupt classification during AI speech
 speaking_monitor:
@@ -111,7 +107,7 @@ speaking_monitor:
   gate1_path_a_energy_ratio: 8         # Path A: 8× noise floor required
   gate1_path_b_min_duration_ms: 600    # Path B: NORMAL_SPEECH — sustained, moderate
   gate1_path_b_energy_ratio: 3         # Path B: 3× noise floor required
-  gate1_min_duration_ms: 300           # Legacy: minimum speech duration (deprecated by two-path)
+  gate1_path_b_energy_ratio: 3         # Path B: 3× noise floor required
   # ── Gate 2/3 ──
   gate2_filler_list: []                # Gate 2: additional filler words
   gate3_debounce_s: 1.5                # Gate 3: min seconds between LLM calls
@@ -130,7 +126,10 @@ echo_suppression:
   # Layer 2: AriaVoiceFilter (resemblyzer speaker identity)
   aria_similarity_threshold: 0.75      # Cosine similarity above this → echo (0.0-1.0)
   # Layer 3: Gate0EchoCheck (spectral + temporal)
-  gate0_spectral_threshold: 0.85       # Spectral cosine similarity above this → echo
+  gate0_spectral_threshold: 0.92       # Spectral cosine similarity above this → echo
+                                       # (raised from 0.85 — 6-bin truncation bug caused
+                                       #  false positives on user speech; now with 257 bins
+                                       #  0.92 is safe and precise)
   gate0_temporal_gate_ms: 80           # TTS played < N ms ago → automatic echo
   gate0_ema_alpha: 0.1                 # EMA smoothing for TTS spectrum fingerprint
   # Startup warmup

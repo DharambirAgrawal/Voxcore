@@ -34,11 +34,20 @@ class Gate0EchoCheck:
     Maintains a rolling exponential moving average of recent TTS
     output spectra. Compares each mic chunk's spectrum against it.
     High similarity = mic sounds like TTS = echo → drop.
+
+    V3 fix: Uses a fixed FFT size (512 points) with zero-padding to
+    guarantee consistent spectral resolution (257 bins) regardless
+    of input chunk size. Previous implementation truncated to the
+    shortest chunk ever fed, permanently degrading to as few as 6 bins.
     """
+
+    # Fixed FFT size — guarantees 257 bins (512/2 + 1) regardless of chunk size.
+    # 512 samples at 16 kHz = 32ms — good spectral resolution for voice.
+    _FFT_SIZE: int = 512
 
     def __init__(
         self,
-        spectral_threshold: float = 0.85,
+        spectral_threshold: float = 0.92,
         temporal_gate_ms: int = 80,
         ema_alpha: float = 0.1,
     ):
@@ -54,6 +63,23 @@ class Gate0EchoCheck:
     def is_ready(self) -> bool:
         return self._is_ready
 
+    def _fixed_spectrum(self, chunk: np.ndarray) -> np.ndarray:
+        """Compute magnitude spectrum with fixed FFT size (zero-padded).
+
+        Always produces exactly (_FFT_SIZE // 2 + 1) bins regardless of
+        input chunk length. Short chunks are zero-padded; long chunks are
+        truncated to _FFT_SIZE samples before FFT.
+        """
+        data = chunk.astype(np.float32)
+        if len(data) >= self._FFT_SIZE:
+            data = data[:self._FFT_SIZE]
+        else:
+            # Zero-pad to _FFT_SIZE
+            padded = np.zeros(self._FFT_SIZE, dtype=np.float32)
+            padded[:len(data)] = data
+            data = padded
+        return np.abs(np.fft.rfft(data))
+
     def feed_tts_spectrum(self, chunk: np.ndarray) -> None:
         """
         Update rolling spectral fingerprint with TTS output.
@@ -63,20 +89,22 @@ class Gate0EchoCheck:
           2. audio_player._play_tts_chunk() — from live TTS output
 
         NOT called for clips. Same exclusion rule as AriaVoiceFilter.
+
+        V3 fix: Uses fixed FFT size so EMA bin count never degrades.
         """
         self._last_tts_chunk_time = time.time()
 
-        spectrum = np.abs(np.fft.rfft(chunk.astype(np.float32)))
+        spectrum = self._fixed_spectrum(chunk)
 
         if self._tts_spectrum_ema is None:
-            self._tts_spectrum_ema = spectrum
+            self._tts_spectrum_ema = spectrum.copy()
+            self._logger.debug("Gate0 EMA initialized (bins=%d, ready=True)", len(spectrum))
         else:
-            # Truncate/pad to match lengths (chunk sizes may vary)
-            min_len = min(len(spectrum), len(self._tts_spectrum_ema))
             self._tts_spectrum_ema = (
-                self._ema_alpha * spectrum[:min_len]
-                + (1 - self._ema_alpha) * self._tts_spectrum_ema[:min_len]
+                self._ema_alpha * spectrum
+                + (1 - self._ema_alpha) * self._tts_spectrum_ema
             )
+            self._logger.debug("Gate0 EMA updated (bins=%d, samples=%d)", len(spectrum), len(chunk))
         self._is_ready = True
 
     def is_echo(self, mic_chunk: np.ndarray) -> bool:
@@ -94,30 +122,31 @@ class Gate0EchoCheck:
         if not self._is_ready:
             return False
 
-        # Check 1: Temporal gate
-        # Echo physically cannot arrive before TTS plays.
-        # If TTS chunk played < 80ms ago, any mic audio is likely echo.
-        ms_since_tts = (time.time() - self._last_tts_chunk_time) * 1000
-        if ms_since_tts < self._temporal_gate_ms:
-            return True
+        # Check 1: Temporal gate (REMOVED)
+        # Previously, this blocked ALL audio for 80ms after any TTS chunk.
+        # Since TTS plays continuously, it muted the mic entirely.
+        # We now rely purely on the spectral check below for live double-talk.
+        pass
 
         # Check 2: Spectral similarity
-        mic_spectrum = np.abs(np.fft.rfft(mic_chunk.astype(np.float32)))
+        mic_spectrum = self._fixed_spectrum(mic_chunk)
 
-        # Match lengths for comparison
-        min_len = min(len(mic_spectrum), len(self._tts_spectrum_ema))
-        if min_len == 0:
-            return False
-
-        mic_norm = mic_spectrum[:min_len]
-        tts_norm = self._tts_spectrum_ema[:min_len]
+        # Both spectra are guaranteed to have the same length (_FFT_SIZE//2 + 1)
+        mic_norm = mic_spectrum
+        tts_norm = self._tts_spectrum_ema
 
         # Normalize to unit vectors (cosine similarity)
         mic_mag = np.linalg.norm(mic_norm) + 1e-8
         tts_mag = np.linalg.norm(tts_norm) + 1e-8
 
         similarity = float(np.dot(mic_norm / mic_mag, tts_norm / tts_mag))
-        return similarity > self._threshold
+        if similarity > self._threshold:
+            self._logger.debug("Gate0 BLOCKED (spectral): sim=%.3f > %.2f threshold",
+                               similarity, self._threshold)
+            return True
+
+        self._logger.debug("Gate0 PASSED: spectral=%.3f", similarity)
+        return False
 
     def reset(self) -> None:
         """Reset on persona/voice change."""

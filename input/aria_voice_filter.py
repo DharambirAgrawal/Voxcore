@@ -120,7 +120,13 @@ class AriaVoiceFilter:
                 return False
             mic_embedding = encoder.embed_utterance(wav)
             similarity = float(np.dot(self._aria_embedding, mic_embedding))
-            return similarity > self._threshold
+            if similarity > self._threshold:
+                self._logger.debug("AriaFilter BLOCKED: sim=%.3f > %.2f threshold",
+                                   similarity, self._threshold)
+                return True
+            self._logger.debug("AriaFilter PASSED: sim=%.3f ≤ %.2f",
+                               similarity, self._threshold)
+            return False
         except Exception:
             return False
 

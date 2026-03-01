@@ -209,9 +209,6 @@ from scipy.io import wavfile
 from core.session import Session, TurnState
 from core.event_bus import EventBus, EventType
 
-# V2: Reference buffer duration for echo suppression (seconds)
-REFERENCE_BUFFER_DURATION_S = 2.0
-
 
 class AudioPlayer:
     """Interruptible async audio player for TTS output and backchannel clips.
@@ -265,37 +262,13 @@ class AudioPlayer:
         self._target_volume: float = 1.0
         self._volume_ramp_speed: float = 0.05
 
-        # V2: Reference signal buffer for echo suppression
-        # Stores recent playback audio so mic_stream can cross-correlate
-        ref_buffer_samples = int(self.output_sample_rate * REFERENCE_BUFFER_DURATION_S)
-        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_buffer_samples)
-
-        # V2: Callback for mic_stream to receive playback reference signal
-        self._reference_callback = None
-
         # V3: Direct references for filter feed control
         self._mic_stream = None     # Set via set_mic_stream()
         self._aria_filter = None    # AriaVoiceFilter instance
         self._gate0 = None          # Gate0EchoCheck instance
+        self._mic_sample_rate: int = 16000  # Mic rate for resampling feeds
 
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
-
-    def set_reference_callback(self, callback) -> None:
-        """V2: Register a callback that receives played audio frames for echo suppression.
-
-        The callback receives (frame: np.ndarray) of float32 audio data.
-        MicStream uses this to build its reference buffer for cross-correlation.
-        """
-        self._reference_callback = callback
-
-    def get_reference_buffer(self) -> np.ndarray:
-        """V2: Return the current reference signal buffer as a numpy array.
-
-        Used by MicStream for cross-correlation echo suppression.
-        """
-        if not self._reference_buffer:
-            return np.array([], dtype=np.float32)
-        return np.array(self._reference_buffer, dtype=np.float32)
 
     async def run(self) -> None:
         """Run all player loops concurrently."""
@@ -494,26 +467,27 @@ class AudioPlayer:
 
                 self._current_stream.write(frame)
 
-                # V2: Feed reference buffer for echo suppression
-                mono_frame = frame[:, 0] if frame.ndim > 1 else frame
-                self._reference_buffer.extend(mono_frame.tolist())
-                if self._reference_callback is not None:
-                    try:
-                        self._reference_callback(mono_frame)
-                    except Exception:
-                        pass
 
-                # V3: Feed AriaVoiceFilter and Gate0 for multi-layer echo suppression
-                if hasattr(self, '_aria_filter') and self._aria_filter is not None:
-                    try:
-                        self._aria_filter.feed_aria_audio(mono_frame)
-                    except Exception:
-                        pass
-                if hasattr(self, '_gate0') and self._gate0 is not None:
-                    try:
-                        self._gate0.feed_tts_spectrum(mono_frame)
-                    except Exception:
-                        pass
+                # ═══════════════════════════════════════════════════════════
+                # V3: Feed AriaVoiceFilter + Gate0 with RESAMPLED audio
+                # ═══════════════════════════════════════════════════════════
+                mono_frame = frame[:, 0] if frame.ndim > 1 else frame
+                if self._aria_filter is not None or self._gate0 is not None:
+                    feed_frame = self._resample_for_filters(mono_frame)
+                    if self._aria_filter is not None:
+                        try:
+                            self._aria_filter.feed_aria_audio(feed_frame)
+                        except Exception:
+                            pass
+                    if self._gate0 is not None:
+                        try:
+                            self._gate0.feed_tts_spectrum(feed_frame)
+                        except Exception:
+                            pass
+                    self._logger.debug(
+                        "TTS chunk: %d samples → AriaFilter + Gate0 fed",
+                        len(feed_frame),
+                    )
 
                 offset = end
 
@@ -690,6 +664,23 @@ class AudioPlayer:
 
     # ── V3: Direct API for InterruptRouter ────────────────────────────────
 
+    def _resample_for_filters(self, mono_frame: np.ndarray) -> np.ndarray:
+        """Resample a mono audio frame from output_sample_rate to mic_sample_rate.
+
+        TTS output is 24kHz, but AriaVoiceFilter and Gate0 expect 16kHz (mic rate).
+        Uses simple linear interpolation — fast enough for real-time per-frame use.
+        """
+        if self.output_sample_rate == self._mic_sample_rate:
+            return mono_frame
+        n_out = int(len(mono_frame) * self._mic_sample_rate / self.output_sample_rate)
+        if n_out <= 0:
+            return mono_frame
+        return np.interp(
+            np.linspace(0, len(mono_frame) - 1, n_out),
+            np.arange(len(mono_frame)),
+            mono_frame,
+        ).astype(np.float32)
+
     def set_v3_refs(self, mic_stream, aria_filter=None, gate0=None) -> None:
         """V3: Inject direct references for filter feed control.
 
@@ -763,11 +754,11 @@ class AudioPlayer:
         self._logger.info("V3: Playback FLUSHED (filter OFF)")
 
     async def play_clip(self, clip_path: str) -> None:
-        """V3: Play a clip once with proper filter feeding to prevent mic pollution.
+        """V3: Play a short clip once WITHOUT feeding echo filters.
 
         Used for bridge clips (sure.wav, got_it.wav) and pre-pause clips.
-        Feeds AriaVoiceFilter and Gate0 so the mic doesn't pick up the clip
-        and falsely trigger gates.
+        Does NOT feed AriaVoiceFilter or Gate0 — feeding non-TTS audio
+        would pollute the echo model and cause false blocks on real user speech.
         """
         try:
             sr, audio = wavfile.read(clip_path)
@@ -778,10 +769,10 @@ class AudioPlayer:
             if audio_float.ndim == 1:
                 audio_float = audio_float.reshape(-1, 1)
 
-            was_filter_active = False
-            if self._mic_stream is not None:
-                was_filter_active = self._mic_stream._filter_active
-                self._mic_stream.set_filter_active(True)
+            # V3: Do NOT toggle filter_active for clips.
+            # Filter should stay in whatever state it was (OFF during PENDING/PAUSED).
+            # Clips don't feed AriaFilter/Gate0, so enabling filters during clips
+            # would block real user speech against stale TTS fingerprint.
 
             frame_ms = 20
             frame_samples = sr * frame_ms // 1000
@@ -804,22 +795,12 @@ class AudioPlayer:
 
                 stream.write(frame * 0.9)
 
+                # Legacy reference buffer only — NO AriaFilter/Gate0 feeds
                 mono_frame = frame[:, 0] if frame.ndim > 1 else frame
                 self._reference_buffer.extend(mono_frame.tolist())
                 if self._reference_callback is not None:
                     try:
                         self._reference_callback(mono_frame)
-                    except Exception:
-                        pass
-
-                if hasattr(self, '_aria_filter') and self._aria_filter is not None:
-                    try:
-                        self._aria_filter.feed_aria_audio(mono_frame)
-                    except Exception:
-                        pass
-                if hasattr(self, '_gate0') and self._gate0 is not None:
-                    try:
-                        self._gate0.feed_tts_spectrum(mono_frame)
                     except Exception:
                         pass
 
@@ -829,10 +810,7 @@ class AudioPlayer:
             stream.stop()
             stream.close()
 
-            if self._mic_stream is not None and not was_filter_active:
-                self._mic_stream.set_filter_active(False)
-
-            self._logger.debug("V3: played clip '%s'", clip_path)
+            self._logger.debug("V3: played clip '%s' (no filter feed)", clip_path)
         except asyncio.CancelledError:
             pass
         except Exception as e:

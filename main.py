@@ -467,6 +467,7 @@ async def initialize_system(
     mic_stream = MicStream(
         event_bus=event_bus,
         config=config["audio"],
+        echo_config=config.get("echo_suppression", {}),
     )
     vad = VADProcessor(
         event_bus=event_bus, mic_stream=mic_stream, config=config["audio"],
@@ -505,8 +506,6 @@ async def initialize_system(
         session=session, event_bus=event_bus, config=config["audio"]
     )
 
-    # V2: Wire echo suppression — AudioPlayer feeds playback reference to MicStream
-    audio_player.set_reference_callback(mic_stream.set_playback_reference)
 
     # ── V3: Echo suppression layers ───────────────────────────────────────
     echo_cfg = config.get("echo_suppression", {})

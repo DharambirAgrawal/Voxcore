@@ -214,7 +214,7 @@ class InterruptionDetector:
         self._path_a_duration_ms: int = monitor_cfg.get("gate1_path_a_min_duration_ms", 150)
         self._path_a_energy_ratio: float = monitor_cfg.get("gate1_path_a_energy_ratio", 8.0)
         self._path_b_duration_ms: int = monitor_cfg.get("gate1_path_b_min_duration_ms", 600)
-        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 3.0)
+        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 2.5)
 
         # Legacy single-path fallback (when monitor disabled)
         self._interrupt_duration_ms: int = (
@@ -223,14 +223,6 @@ class InterruptionDetector:
             else 300
         )
         self._energy_multiplier: float = 2.5
-
-        # ── AEC mode vs legacy echo EMA ───────────────────────────────
-        self._aec_enabled: bool = audio_cfg.get("echo_cancellation", True)
-        # Legacy echo baseline (only used when AEC is OFF)
-        self._echo_ema: float = 0.0
-        self._echo_ema_initialized: bool = False
-        self._echo_gate_multiplier: float = 3.0
-        self._min_absolute_rms: float = 0.005
 
         # ── Cooldown ─────────────────────────────────────────────────────
         self._state_cooldown_ms: float = 500.0
@@ -280,20 +272,7 @@ class InterruptionDetector:
     # Echo baseline
     # ─────────────────────────────────────────────────────────────────────
 
-    def _update_echo_ema(self, rms: float) -> None:
-        """Asymmetric EMA: fast rise (catch loud echo), slow decay."""
-        if not self._echo_ema_initialized:
-            self._echo_ema = rms
-            self._echo_ema_initialized = True
-        else:
-            alpha = 0.25 if rms > self._echo_ema else 0.03
-            self._echo_ema = alpha * rms + (1.0 - alpha) * self._echo_ema
 
-    def _should_update_echo_ema(self, rms: float) -> bool:
-        """Update baseline only for frames that look like echo, not user voice."""
-        if not self._echo_ema_initialized:
-            return True
-        return rms < self._echo_ema * self._echo_gate_multiplier
 
     # ─────────────────────────────────────────────────────────────────────
     # PersonaPlex pause/resume callbacks
@@ -324,24 +303,21 @@ class InterruptionDetector:
 
     async def run(self) -> None:
         self._load_own_model()
-        # V3: With AEC, use regular consumer (echo already removed).
-        # Legacy: use raw consumer + echo EMA discrimination.
-        if self._aec_enabled:
-            self._audio_queue = self.mic_stream.add_consumer()
-        else:
-            self._audio_queue = self.mic_stream.add_raw_consumer()
+        # V3 FIX: Use raw consumer — Gate0 must NOT filter InterruptionDetector's
+        # audio stream. Gate0 blocking fragments duration accumulation, preventing
+        # the two-path system from ever reaching its thresholds. InterruptionDetector
+        # has its own energy gating + VAD and doesn't need upstream echo filtering.
+        self._audio_queue = self.mic_stream.add_raw_consumer()
         self._logger.info(
-            "InterruptionDetector started (vad=%.2f, dur=%dms, "
-            "cooldown=%dms, min_rms=%.4f, monitor=%s, aec=%s)",
+            "InterruptionDetector started (vad=%.2f, "
+            "pathA=%dms/%.0f×, pathB=%dms/%.1f×, "
+            "cooldown=%dms, monitor=%s)",
             self._interrupt_threshold,
-            self._interrupt_duration_ms,
+            self._path_a_duration_ms, self._path_a_energy_ratio,
+            self._path_b_duration_ms, self._path_b_energy_ratio,
             int(self._state_cooldown_ms),
-            self._min_absolute_rms,
             "ENABLED" if self._monitor_enabled else "disabled",
-            "ON" if self._aec_enabled else "OFF",
         )
-
-        non_speech_gate = 0.35
 
         # Subscribe to pause/resume events from PersonaPlex pipeline
         self.event_bus.subscribe(EventType.PLAYBACK_PAUSE, self._on_playback_pause)
@@ -372,8 +348,6 @@ class InterruptionDetector:
                 self._speaking_since = time.monotonic()
                 self._speech_detected_at = 0.0
                 self._last_speech_at = 0.0
-                self._echo_ema = 0.0
-                self._echo_ema_initialized = False
                 # Reset pause/resume state from any previous cycle
                 self._playback_paused = False
                 self._resume_cooldown_until = 0.0
@@ -394,55 +368,26 @@ class InterruptionDetector:
 
             # ── Post-resume cooldown → recalibrate ───────────────────
             if now < self._resume_cooldown_until:
-                if not self._aec_enabled and rms > 0.0005:
-                    self._update_echo_ema(rms)
                 continue
 
             # ── Cooldown: ignore first window after entering SPEAKING ────
             elapsed_ms = (now - self._speaking_since) * 1000.0
             if elapsed_ms < self._state_cooldown_ms:
-                if not self._aec_enabled and rms > 0.0005:
-                    self._update_echo_ema(rms)
                 continue
 
             # ══════════════════════════════════════════════════════════
-            # Energy gate — AEC vs legacy path
+            # Energy gate — V3: simple threshold for all paths
             # ══════════════════════════════════════════════════════════
+            # AriaVoiceFilter + Gate0 handle echo upstream in mic_stream.
+            # We only need a noise-floor gate here, no echo_ema tracking.
             noise_floor = self.mic_stream.noise_floor
 
-            if self._aec_enabled:
-                # ── AEC mode: echo already removed ──
-                # Simple threshold: rms > noise_floor × multiplier
-                # No echo EMA needed — the signal is clean.
-                ambient_gate = (
-                    noise_floor * self._energy_multiplier
-                    if noise_floor > 0
-                    else 0
-                )
-                energy_threshold = max(ambient_gate, self._min_absolute_rms)
-            else:
-                # ── Legacy mode: echo EMA tracking ──
-                if speech_prob < non_speech_gate:
-                    if self._should_update_echo_ema(rms):
-                        self._update_echo_ema(rms)
-                elif self._echo_ema < 0.003:
-                    self._update_echo_ema(rms)
-                elif self._echo_ema > 0 and rms < self._echo_ema * 2.0:
-                    self._update_echo_ema(rms)
-
-                ambient_gate = (
-                    noise_floor * self._energy_multiplier
-                    if noise_floor > 0
-                    else 0
-                )
-                echo_gate = (
-                    self._echo_ema * self._echo_gate_multiplier
-                    if self._echo_ema > 0
-                    else 0
-                )
-                energy_threshold = max(
-                    ambient_gate, echo_gate, self._min_absolute_rms
-                )
+            ambient_gate = (
+                noise_floor * self._energy_multiplier
+                if noise_floor > 0
+                else 0
+            )
+            energy_threshold = ambient_gate
 
             if rms < energy_threshold:
                 # Don't immediately reset — brief energy dips between phonemes
@@ -461,13 +406,10 @@ class InterruptionDetector:
             if self._speech_detected_at == 0.0:
                 # First frame passing energy gate — log for visibility
                 self._logger.info(
-                    "Interrupt candidate: prob=%.3f rms=%.4f gate=%.4f "
-                    "(aec=%s, echo_ema=%.4f)",
+                    "Interrupt candidate: prob=%.3f rms=%.4f gate=%.4f",
                     speech_prob,
                     rms,
                     energy_threshold,
-                    "ON" if self._aec_enabled else "OFF",
-                    self._echo_ema,
                 )
             await self._check_interrupt(speech_prob, rms)
 
@@ -505,23 +447,25 @@ class InterruptionDetector:
                         path = "B"
 
                     if path is not None:
+                        # ── FIRE: publish GATE1_PASSED for SpeakingMonitor ──
+                        self._logger.info(
+                            "Gate 1 PASSED (path=%s, %.0fms, prob=%.2f, "
+                            "ratio=%.1f×, rms=%.4f)",
+                            path, duration_ms, speech_prob,
+                            energy_ratio, rms,
+                        )
                         await self.event_bus.publish(
                             EventType.GATE1_PASSED,
-                            data={
-                                "speech_prob": speech_prob,
-                                "rms": rms,
-                                "duration_ms": duration_ms,
-                                "echo_ema": self._echo_ema,
+                            {
                                 "path": path,
+                                "duration_ms": duration_ms,
+                                "speech_prob": speech_prob,
                                 "energy_ratio": energy_ratio,
+                                "rms": rms,
                             },
                             source="InterruptionDetector",
                         )
-                        self._logger.info(
-                            "Gate 1 PASSED path=%s (%.0fms, prob=%.2f, rms=%.4f, "
-                            "ratio=%.1f×) → SpeakingMonitor",
-                            path, duration_ms, speech_prob, rms, energy_ratio,
-                        )
+                        # Reset timers + brief cooldown to prevent re-fire
                         self._speech_detected_at = 0.0
                         self._last_speech_at = 0.0
                         await asyncio.sleep(0.5)
@@ -530,26 +474,6 @@ class InterruptionDetector:
                             "Gate 1: %.0fms (prob=%.2f, ratio=%.1f×) — waiting",
                             duration_ms, speech_prob, energy_ratio,
                         )
-                else:
-                    # ── V1 fallback: fire INTERRUPT_DETECTED directly ──
-                    if duration_ms >= self._interrupt_duration_ms:
-                        await self.event_bus.publish(
-                            EventType.INTERRUPT_DETECTED,
-                            data={
-                                "speech_prob": speech_prob,
-                                "during_sentence": -1,
-                            },
-                        )
-                        self._logger.info(
-                            "INTERRUPT detected (%.0fms, prob=%.2f, "
-                            "rms=%.4f, echo_ema=%.4f, ratio=%.1f×)",
-                            duration_ms, speech_prob, rms,
-                            self._echo_ema,
-                            rms / self._echo_ema if self._echo_ema > 0 else 0,
-                        )
-                        self._speech_detected_at = 0.0
-                        self._last_speech_at = 0.0
-                        await asyncio.sleep(0.5)
         else:
             # Non-speech frame: only reset timer if hold window expired
             if self._speech_detected_at > 0 and self._last_speech_at > 0:

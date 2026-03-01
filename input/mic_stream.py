@@ -184,7 +184,6 @@ import numpy as np
 import sounddevice as sd
 
 from core.event_bus import EventBus
-from input.echo_cancel import StreamingAEC, RefRingBuffer
 
 # V2: Default correlation threshold for echo suppression (legacy fallback)
 DEFAULT_ECHO_CORRELATION_THRESHOLD = 0.7
@@ -205,7 +204,7 @@ class MicStream:
     - last_200ms(): returns recent audio for interrupt context VAD
     """
 
-    def __init__(self, event_bus: EventBus, config: dict) -> None:
+    def __init__(self, event_bus: EventBus, config: dict, echo_config: dict | None = None) -> None:
         self.event_bus: EventBus = event_bus
         self.sample_rate: int = config.get("sample_rate", 16000)
         self.chunk_ms: int = config.get("chunk_ms", 30)
@@ -219,35 +218,12 @@ class MicStream:
         self._logger: logging.Logger = logging.getLogger("MicStream")
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # V2: Echo suppression via cross-correlation (legacy fallback)
-        self._echo_threshold: float = config.get(
-            "echo_correlation_threshold", DEFAULT_ECHO_CORRELATION_THRESHOLD
-        )
-        # Rolling reference buffer — stores ~0.5s of playback audio for correlation
-        ref_samples = int(self.sample_rate * 0.5)
-        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_samples)
-        self._echo_suppression_enabled: bool = config.get("echo_suppression", True)
+        # ── V3: Echo suppression config ──────────────────────────────────
+        _echo_cfg = echo_config or {}
 
-        # V3: WebRTC-style Acoustic Echo Cancellation (AEC)
-        self._aec_enabled: bool = config.get("echo_cancellation", True)
-        if self._aec_enabled:
-            aec_blocks = config.get("aec_filter_blocks", 12)
-            aec_mu = config.get("aec_step_size", 0.3)
-            self._aec = StreamingAEC(
-                frame_size=self.chunk_samples,
-                num_blocks=aec_blocks,
-                mu=aec_mu,
-                delta=1e-2,
-                leak=0.9995,
-            )
-            self._aec_ref_buf = RefRingBuffer(capacity=self.sample_rate * 2)
-            self._logger.info(
-                "AEC enabled (blocks=%d, tail=%dms, mu=%.2f)",
-                aec_blocks, aec_blocks * self.chunk_ms, aec_mu,
-            )
-        else:
-            self._aec = None
-            self._aec_ref_buf = None
+        self._logger.info(
+            "Legacy AEC disabled — using denoiser + AriaVoiceFilter + Gate0"
+        )
 
         # ── V3: Four-layer echo suppression filters ──────────────────────
         # Layer 2: AriaVoiceFilter (speaker-identity rejection)
@@ -311,59 +287,37 @@ class MicStream:
         if loop is None:
             return
 
-        # ── V3: AEC processing (when enabled) ────────────────────────────
-        # Apply adaptive echo cancellation BEFORE distributing to consumers.
-        # This gives ALL consumers clean audio with echo removed.
-        if self._aec is not None and self._aec_ref_buf is not None:
-            ref_frame = self._aec_ref_buf.read(len(chunk_f32))
-            clean = self._aec.process(chunk_f32, ref_frame)
+        # ── V3: Always update recent audio buffer (for last_200ms()) ─────
+        self._recent_audio.extend(chunk_f32.tolist())
 
-            # Distribute AEC-cleaned audio to ALL consumers
-            for q in self._raw_consumer_queues:
-                def _enqueue_raw(queue: asyncio.Queue = q, data: np.ndarray = clean) -> None:
-                    try:
-                        queue.put_nowait(data)
-                    except asyncio.QueueFull:
-                        pass
-                loop.call_soon_threadsafe(_enqueue_raw)
-
-            for q in self._consumer_queues:
-                def _enqueue_consumer(queue: asyncio.Queue = q, data: np.ndarray = clean) -> None:
-                    try:
-                        queue.put_nowait(data)
-                    except asyncio.QueueFull:
-                        pass
-                loop.call_soon_threadsafe(_enqueue_consumer)
-            return
-
-        # ── Legacy path: no AEC ───────────────────────────────────────────
-        # Raw consumers get ALL audio (no echo suppression).
+        # ══════════════════════════════════════════════════════════════════
+        # V3 FIX: Fan-out to RAW consumers FIRST, BEFORE echo filtering.
+        # InterruptionDetector uses a raw consumer so Gate0 blocking
+        # can't fragment its duration accumulator.
+        # ══════════════════════════════════════════════════════════════════
         for q in self._raw_consumer_queues:
-
             def _enqueue_raw(queue: asyncio.Queue = q) -> None:
                 try:
                     queue.put_nowait(chunk_f32)
                 except asyncio.QueueFull:
-                    pass  # drop silently — raw consumers can tolerate loss
-
+                    pass  # drop silently — raw consumer overwhelmed
             loop.call_soon_threadsafe(_enqueue_raw)
 
-        # V2: Echo suppression — check if mic chunk correlates with recent playback
-        if self._echo_suppression_enabled and len(self._reference_buffer) >= len(chunk_f32):
-            ref_arr = np.array(list(self._reference_buffer)[-len(chunk_f32):], dtype=np.float32)
-            correlation = self._fast_correlation(chunk_f32, ref_arr)
-            if correlation > self._echo_threshold:
-                # This chunk is likely echo — drop it for filtered consumers only
-                return
-
+        # ══════════════════════════════════════════════════════════════════
         # V3: Multi-layer echo suppression (Layer 2 + Layer 3)
-        # Only apply when filter_active is True (TTS is playing real speech)
+        # Only apply when filter_active is True (TTS real speech playing)
+        # ══════════════════════════════════════════════════════════════════
         if self._filter_active:
             # Layer 2: AriaVoiceFilter — speaker-identity rejection
             if self._aria_filter is not None:
                 try:
                     if self._aria_filter.is_aria_echo(chunk_f32):
-                        return  # Drop — sounds like Aria's voice
+                        self._logger.debug("AriaVoiceFilter BLOCKED chunk")
+                        # V3 FIX: Don't return — still need to skip filtered consumers
+                        # but raw consumers already got this chunk above
+                        for q in self._consumer_queues:
+                            pass  # Intentionally skip filtered consumers
+                        return
                 except Exception:
                     pass  # Filter error — let audio through
 
@@ -371,7 +325,8 @@ class MicStream:
             if self._gate0 is not None:
                 try:
                     if self._gate0.is_echo(chunk_f32):
-                        return  # Drop — spectral match to recent TTS
+                        self._logger.debug("Gate0 BLOCKED echo chunk")
+                        return  # Drop for filtered consumers only — raw got it above
                 except Exception:
                     pass  # Filter error — let audio through
 
@@ -455,33 +410,6 @@ class MicStream:
                     pass  # drop silently
             loop.call_soon_threadsafe(_enqueue)
 
-    def set_playback_reference(self, frame: np.ndarray, src_sample_rate: int = 24000) -> None:
-        """Feed recently played audio into the echo cancellation pipeline.
-
-        V2: Cross-correlation reference buffer (legacy).
-        V3: Resamples to mic sample rate and feeds the adaptive AEC filter.
-
-        Args:
-            frame: float32 mono audio frame from AudioPlayer's output.
-            src_sample_rate: Sample rate of the frame (default 24 kHz for Kokoro TTS).
-        """
-        # Legacy reference buffer (always updated for backwards compatibility)
-        self._reference_buffer.extend(frame.tolist())
-
-        # V3: AEC reference — resample from output rate (24 kHz) to mic rate (16 kHz)
-        if self._aec_ref_buf is not None:
-            if src_sample_rate != self.sample_rate:
-                n_out = int(len(frame) * self.sample_rate / src_sample_rate)
-                frame_resampled = np.interp(
-                    np.linspace(0, len(frame) - 1, n_out),
-                    np.arange(len(frame)),
-                    frame,
-                ).astype(np.float32)
-            else:
-                frame_resampled = frame
-            self._aec_ref_buf.write(frame_resampled)
-
-    @staticmethod
     def _fast_correlation(a: np.ndarray, b: np.ndarray) -> float:
         """V2: Fast normalized cross-correlation between two same-length arrays."""
         a_norm = np.linalg.norm(a)

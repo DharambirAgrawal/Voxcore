@@ -932,7 +932,7 @@ AriaVoiceFilter's rolling buffer still has recent Aria audio. Gate 0's EMA still
 
 ## 7. Conversation Dynamics
 
-### interrupt_router — All 7 Sub-Types
+### interrupt_router — All 7 Sub-Typesa
 
 **File:** `brain/interrupt_router.py`
 
