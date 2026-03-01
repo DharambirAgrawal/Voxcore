@@ -200,6 +200,7 @@ import asyncio
 import collections
 import logging
 import io
+import time
 from typing import Optional
 
 import numpy as np
@@ -209,9 +210,6 @@ from scipy.io import wavfile
 from core.session import Session, TurnState
 from core.event_bus import EventBus, EventType
 
-# V2: Reference buffer duration for echo suppression (seconds)
-REFERENCE_BUFFER_DURATION_S = 2.0
-
 
 class AudioPlayer:
     """Interruptible async audio player for TTS output and backchannel clips.
@@ -220,6 +218,16 @@ class AudioPlayer:
     - PAUSE_MARKER event handling: injects 300ms silence into playback queue
     - Reference signal buffer: maintains rolling 2s buffer of played audio
       for correlation-based echo suppression in MicStream
+
+    V3 additions:
+    - Playback pause/resume: on PLAYBACK_PAUSE, immediately stops writing
+      audio frames to the speaker while keeping position. On PLAYBACK_RESUME,
+      continues from the exact frame where it paused.
+    - Volume ducking kept as fallback but primary flow is pause/resume.
+    - play_clip() for one-shot clip playback without filter feeds
+    - play_clip_looping() for looping a clip until a stop event
+    - pause()/resume()/flush() as proper async methods for InterruptRouter
+    - Filter feed control: only feeds AriaVoiceFilter/Gate0 during TTS chunks
     """
 
     def __init__(self, session: Session, event_bus: EventBus, config: dict) -> None:
@@ -235,40 +243,33 @@ class AudioPlayer:
         self._interrupt_queue: asyncio.Queue = event_bus.subscribe(EventType.INTERRUPT_DETECTED)
         self._backchannel_queue: asyncio.Queue = event_bus.subscribe(EventType.BACKCHANNEL_FIRE)
         self._tts_all_done_queue: asyncio.Queue = event_bus.subscribe(EventType.TTS_ALL_DONE)
+        self._volume_duck_queue: asyncio.Queue = event_bus.subscribe(EventType.VOLUME_DUCK)
+        self._volume_restore_queue: asyncio.Queue = event_bus.subscribe(EventType.VOLUME_RESTORE)
+        self._pause_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_PAUSE)
+        self._resume_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_RESUME)
 
         # State
         self._is_playing: bool = False
         self._is_interrupted: bool = False
+        self._is_paused: bool = False           # V3: true pause — freeze in place
+        self._pause_event: asyncio.Event = asyncio.Event()  # set = not paused
+        self._pause_event.set()  # start unpaused
         self._current_stream: Optional[sd.OutputStream] = None
         self._audio_accumulator: bytearray = bytearray()
-        self._tts_stream_done: bool = False  # True once TTSClient has synthesized all sentences
+        self._tts_stream_done: bool = False
 
-        # V2: Reference signal buffer for echo suppression
-        # Stores recent playback audio so mic_stream can cross-correlate
-        ref_buffer_samples = int(self.output_sample_rate * REFERENCE_BUFFER_DURATION_S)
-        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_buffer_samples)
+        # V3: Volume ducking — applied per-frame during playback
+        self._volume: float = 1.0
+        self._target_volume: float = 1.0
+        self._volume_ramp_speed: float = 0.05
 
-        # V2: Callback for mic_stream to receive playback reference signal
-        self._reference_callback = None
+        # V3: Direct references for filter feed control
+        self._mic_stream = None     # Set via set_mic_stream()
+        self._aria_filter = None    # AriaVoiceFilter instance
+        self._gate0 = None          # Gate0EchoCheck instance
+        self._mic_sample_rate: int = 16000  # Mic rate for resampling feeds
 
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
-
-    def set_reference_callback(self, callback) -> None:
-        """V2: Register a callback that receives played audio frames for echo suppression.
-
-        The callback receives (frame: np.ndarray) of float32 audio data.
-        MicStream uses this to build its reference buffer for cross-correlation.
-        """
-        self._reference_callback = callback
-
-    def get_reference_buffer(self) -> np.ndarray:
-        """V2: Return the current reference signal buffer as a numpy array.
-
-        Used by MicStream for cross-correlation echo suppression.
-        """
-        if not self._reference_buffer:
-            return np.array([], dtype=np.float32)
-        return np.array(self._reference_buffer, dtype=np.float32)
 
     async def run(self) -> None:
         """Run all player loops concurrently."""
@@ -285,6 +286,10 @@ class AudioPlayer:
             self._process_backchannels(),
             self._playback_loop(),
             self._watch_tts_all_done(),
+            self._process_volume_duck(),
+            self._process_volume_restore(),
+            self._process_pause(),
+            self._process_resume(),
         )
 
     async def _watch_tts_all_done(self) -> None:
@@ -358,7 +363,16 @@ class AudioPlayer:
                 continue
 
             self._is_playing = True
-            await self._play_audio(audio_array)
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(True)
+            try:
+                await self._play_audio(audio_array)
+            except asyncio.CancelledError:
+                self._is_playing = False
+                break
+            finally:
+                if self._mic_stream is not None:
+                    self._mic_stream.set_filter_active(False)
             self._is_playing = False
 
             # Only fire PLAYBACK_DONE when TTS has finished synthesizing
@@ -371,7 +385,13 @@ class AudioPlayer:
                 self._logger.debug("Playback complete")
 
     async def _play_audio(self, audio: np.ndarray) -> None:
-        """Play audio array through speakers with 20ms frame interrupt granularity."""
+        """Play audio array through speakers with 20ms frame interrupt granularity.
+
+        V3: Supports true pause/resume. When _is_paused is True, the playback
+        loop waits on _pause_event instead of writing frames. When resumed,
+        it continues from the exact frame offset where it paused.
+        Also applies volume ducking per-frame for smooth transitions.
+        """
         # Normalize to float32
         if audio.dtype == np.int16:
             audio = audio.astype(np.float32) / 32768.0
@@ -399,22 +419,80 @@ class AudioPlayer:
                 if self._is_interrupted:
                     break
 
+                # V3: True pause — wait here until resumed or interrupted
+                if self._is_paused:
+                    # Stop the stream while paused to avoid underflow clicks
+                    if self._current_stream is not None:
+                        try:
+                            self._current_stream.stop()
+                        except Exception:
+                            pass
+                    self._logger.debug("Playback PAUSED at frame %d/%d", offset, total_samples)
+                    # Wait for resume or interrupt
+                    while self._is_paused and not self._is_interrupted:
+                        await asyncio.sleep(0.02)
+                    if self._is_interrupted:
+                        break
+                    # Restart the stream from where we left off
+                    self._logger.debug("Playback RESUMED at frame %d/%d", offset, total_samples)
+                    try:
+                        self._current_stream = sd.OutputStream(
+                            samplerate=self.output_sample_rate,
+                            channels=audio.shape[1],
+                            dtype="float32",
+                        )
+                        self._current_stream.start()
+                    except Exception as e:
+                        self._logger.error("Failed to restart stream after resume: %s", e)
+                        break
+
                 end = min(offset + frame_samples, total_samples)
-                frame = audio[offset:end]
+                frame = audio[offset:end].copy()
+
+                # V3: Smooth volume ramping per-frame
+                if abs(self._volume - self._target_volume) > 0.001:
+                    if self._volume < self._target_volume:
+                        self._volume = min(
+                            self._volume + self._volume_ramp_speed,
+                            self._target_volume,
+                        )
+                    else:
+                        self._volume = max(
+                            self._volume - self._volume_ramp_speed,
+                            self._target_volume,
+                        )
+
+                # Apply volume multiplier
+                if self._volume < 0.99:
+                    frame = frame * self._volume
+
                 self._current_stream.write(frame)
 
-                # V2: Feed reference buffer for echo suppression
+
+                # ═══════════════════════════════════════════════════════════
+                # V3: Feed AriaVoiceFilter + Gate0 with RESAMPLED audio
+                # ═══════════════════════════════════════════════════════════
                 mono_frame = frame[:, 0] if frame.ndim > 1 else frame
-                self._reference_buffer.extend(mono_frame.tolist())
-                if self._reference_callback is not None:
-                    try:
-                        self._reference_callback(mono_frame)
-                    except Exception:
-                        pass
+                if self._aria_filter is not None or self._gate0 is not None:
+                    feed_frame = self._resample_for_filters(mono_frame)
+                    if self._aria_filter is not None:
+                        try:
+                            self._aria_filter.feed_aria_audio(feed_frame)
+                        except Exception:
+                            pass
+                    if self._gate0 is not None:
+                        try:
+                            self._gate0.feed_tts_spectrum(feed_frame)
+                        except Exception:
+                            pass
+                    self._logger.debug(
+                        "TTS chunk: %d samples → AriaFilter + Gate0 fed",
+                        len(feed_frame),
+                    )
 
                 offset = end
 
-                # Yield to event loop so interrupts can be detected
+                # Yield to event loop so interrupts/pauses can be detected
                 await asyncio.sleep(0)
 
             stream = self._current_stream
@@ -447,6 +525,11 @@ class AudioPlayer:
             self._logger.info("INTERRUPT — stopping playback")
 
             self._is_interrupted = True
+            self._is_paused = False  # clear pause state
+
+            # V3: Reset volume to full on interrupt
+            self._volume = 1.0
+            self._target_volume = 1.0
 
             # Clear play queue
             while not self._play_queue.empty():
@@ -473,6 +556,74 @@ class AudioPlayer:
             # Brief delay then re-enable
             await asyncio.sleep(0.05)
             self._is_interrupted = False
+
+    async def _process_volume_duck(self) -> None:
+        """Listen for VOLUME_DUCK events and reduce playback volume.
+
+        When the user starts speaking (Gate 1 passes), the SpeakingMonitor
+        fires VOLUME_DUCK. We immediately set the target volume low so the
+        user feels heard. The per-frame ramp in _play_audio handles the
+        smooth transition to avoid audio clicks.
+        """
+        while True:
+            event = await self._volume_duck_queue.get()
+            level = event.data.get("level", 0.15) if event.data else 0.15
+            self._target_volume = max(0.0, min(1.0, level))
+            # Use faster ramp for ducking (immediate feedback)
+            self._volume_ramp_speed = 0.15
+            self._logger.info(
+                "Volume DUCK → %.0f%% (reason: %s)",
+                self._target_volume * 100,
+                event.data.get("reason", "unknown") if event.data else "unknown",
+            )
+
+    async def _process_volume_restore(self) -> None:
+        """Listen for VOLUME_RESTORE events and ramp volume back to 100%.
+
+        Fires after classification determines IGNORE or INJECT — the user
+        wasn't actually interrupting, so restore normal volume.
+        """
+        while True:
+            event = await self._volume_restore_queue.get()
+            self._target_volume = 1.0
+            # Use slower ramp for restore (smooth fade-in)
+            self._volume_ramp_speed = 0.05
+            self._logger.info(
+                "Volume RESTORE → 100%% (reason: %s)",
+                event.data.get("reason", "unknown") if event.data else "unknown",
+            )
+
+    async def _process_pause(self) -> None:
+        """Listen for PLAYBACK_PAUSE events — freeze playback immediately.
+
+        PersonaPlex-inspired: when user starts speaking, we don't just duck
+        the volume — we completely stop outputting audio within 20ms. This
+        gives the mic a clean signal (no echo) to transcribe the user's speech.
+        The playback position is preserved so we can resume later.
+        """
+        while True:
+            event = await self._pause_queue.get()
+            if not self._is_paused and self._is_playing:
+                self._is_paused = True
+                self._logger.info(
+                    "Playback PAUSED (reason: %s)",
+                    event.data.get("reason", "user_speaking") if event.data else "user_speaking",
+                )
+
+    async def _process_resume(self) -> None:
+        """Listen for PLAYBACK_RESUME events — continue from where we paused.
+
+        Fires when classification returns IGNORE or INJECT — the user was
+        just reacting, not interrupting. AI picks up exactly where it left off.
+        """
+        while True:
+            event = await self._resume_queue.get()
+            if self._is_paused:
+                self._is_paused = False
+                self._logger.info(
+                    "Playback RESUMED (reason: %s)",
+                    event.data.get("reason", "classification_done") if event.data else "classification_done",
+                )
 
     async def _process_backchannels(self) -> None:
         """Play backchannel audio clips (e.g. 'mhm', 'yeah') when not speaking."""
@@ -511,3 +662,133 @@ class AudioPlayer:
     def is_playing(self) -> bool:
         """Whether audio is currently being played."""
         return self._is_playing
+
+    # ── V3: Direct API for InterruptRouter ────────────────────────────────
+
+    def _resample_for_filters(self, mono_frame: np.ndarray) -> np.ndarray:
+        """Resample a mono audio frame from output_sample_rate to mic_sample_rate.
+
+        TTS output is 24kHz, but AriaVoiceFilter and Gate0 expect 16kHz (mic rate).
+        Uses simple linear interpolation — fast enough for real-time per-frame use.
+        """
+        if self.output_sample_rate == self._mic_sample_rate:
+            return mono_frame
+        n_out = int(len(mono_frame) * self._mic_sample_rate / self.output_sample_rate)
+        if n_out <= 0:
+            return mono_frame
+        return np.interp(
+            np.linspace(0, len(mono_frame) - 1, n_out),
+            np.arange(len(mono_frame)),
+            mono_frame,
+        ).astype(np.float32)
+
+    def set_v3_refs(self, mic_stream, aria_filter=None, gate0=None) -> None:
+        """V3: Inject direct references for filter feed control.
+
+        Called once during main.py initialization.
+        """
+        self._mic_stream = mic_stream
+        self._aria_filter = aria_filter
+        self._gate0 = gate0
+        self._logger.info("V3 refs attached (mic_stream, aria_filter, gate0)")
+
+    async def pause(self) -> None:
+        """V3: Freeze TTS playback in RAM. Called by InterruptRouter.
+
+        - Immediately stops audio output within 20ms
+        - Preserves playback position for resume()
+        - Toggles filter OFF (no echo suppression needed when silent)
+        """
+        if not self._is_paused and self._is_playing:
+            self._is_paused = True
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(False)
+            self._logger.info("V3: Playback PAUSED (filter OFF)")
+
+    async def resume(self) -> None:
+        """V3: Resume TTS from exact frame where it paused. Called by InterruptRouter.
+
+        - Restarts audio output from preserved position
+        - Toggles filter ON (echo suppression needed again)
+        """
+        if self._is_paused:
+            self._is_paused = False
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(True)
+            self._logger.info("V3: Playback RESUMED (filter ON)")
+
+    async def flush(self) -> None:
+        """V3: Discard ALL buffered TTS. Called by InterruptRouter for STOP/CORRECTION/etc.
+
+        - Clears play queue
+        - Clears audio accumulator
+        - Stops current audio stream
+        - Toggles filter OFF
+        """
+        self._is_interrupted = True
+        self._is_paused = False
+        self._volume = 1.0
+        self._target_volume = 1.0
+
+        while not self._play_queue.empty():
+            try:
+                self._play_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        self._audio_accumulator = bytearray()
+        sd.stop()
+
+        if self._current_stream is not None:
+            try:
+                self._current_stream.stop()
+                self._current_stream.close()
+            except Exception:
+                pass
+            self._current_stream = None
+
+        if self._mic_stream is not None:
+            self._mic_stream.set_filter_active(False)
+
+        await asyncio.sleep(0.05)
+        self._is_interrupted = False
+        self._logger.info("V3: Playback FLUSHED (filter OFF)")
+
+    async def play_clip(self, clip_path: str) -> None:
+        """V3: Play a short clip once WITHOUT feeding echo filters.
+
+        Used for bridge clips (sure.wav, got_it.wav) and pre-pause clips.
+        Does NOT feed AriaVoiceFilter or Gate0 — feeding non-TTS audio
+        would pollute the echo model and cause false blocks on real user speech.
+        """
+        try:
+            sr, audio = wavfile.read(clip_path)
+            audio_float = audio.astype(np.float32)
+            if audio.dtype == np.int16:
+                audio_float = audio_float / 32768.0
+
+            if audio_float.ndim == 1:
+                audio_float = audio_float.reshape(-1, 1)
+
+            # V3: Do NOT toggle filter_active for clips.
+            # Filter should stay in whatever state it was (OFF during PENDING/PAUSED).
+            # Clips don't feed AriaFilter/Gate0, so enabling filters during clips
+            # would block real user speech against stale TTS fingerprint.
+
+            # V3 FIX: Use sd.play instead of manual frame loops to prevent ASYNC thread underflows
+            sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
+
+            duration = len(audio_float) / sr
+            start_time = time.time()
+            
+            while time.time() - start_time < duration:
+                if self._is_interrupted:
+                    sd.stop()
+                    break
+                await asyncio.sleep(0.05)
+
+            self._logger.debug("V3: played clip '%s' (no filter feed)", clip_path)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self._logger.error("V3: clip playback failed: %s", e)

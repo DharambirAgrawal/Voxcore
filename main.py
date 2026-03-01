@@ -329,6 +329,9 @@ from input.text_injector import TextInjector
 from input.interruption_detector import InterruptionDetector
 from input.filler_detector import FillerDetector
 from input.speaking_monitor import SpeakingMonitor
+# V3: Echo suppression layers
+from input.aria_voice_filter import AriaVoiceFilter
+from input.gate0_echo_check import Gate0EchoCheck
 
 from backchannel.cue_detector import CueDetector
 from backchannel.selector import BackchannelSelector
@@ -346,6 +349,8 @@ from output.voice_profile import VoiceProfile
 from agent.text_out import TextOut
 from agent.tool_router import ToolRouter
 from agent.slow_llm import SlowLLM
+# V3: Interrupt router
+from brain.interrupt_router import InterruptRouter
 
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
@@ -462,6 +467,7 @@ async def initialize_system(
     mic_stream = MicStream(
         event_bus=event_bus,
         config=config["audio"],
+        echo_config=config.get("echo_suppression", {}),
     )
     vad = VADProcessor(
         event_bus=event_bus, mic_stream=mic_stream, config=config["audio"],
@@ -481,13 +487,7 @@ async def initialize_system(
     filler_detector = FillerDetector(
         config=config.get("speaking_monitor", {})
     )
-    speaking_monitor = SpeakingMonitor(
-        session=session,
-        event_bus=event_bus,
-        mic_stream=mic_stream,
-        filler_detector=filler_detector,
-        config=config,
-    )
+    # NOTE: SpeakingMonitor created below after audio_player + gate3_done_event
 
     # ── Brain ────────────────────────────────────────────────────────────────
     llm_client = LLMClient(event_bus=event_bus, config=config["models"])
@@ -506,8 +506,33 @@ async def initialize_system(
         session=session, event_bus=event_bus, config=config["audio"]
     )
 
-    # V2: Wire echo suppression — AudioPlayer feeds playback reference to MicStream
-    audio_player.set_reference_callback(mic_stream.set_playback_reference)
+
+    # ── V3: Echo suppression layers ───────────────────────────────────────
+    echo_cfg = config.get("echo_suppression", {})
+    aria_filter = AriaVoiceFilter(
+        similarity_threshold=echo_cfg.get("aria_similarity_threshold", 0.75),
+    )
+    gate0 = Gate0EchoCheck(
+        spectral_threshold=echo_cfg.get("gate0_spectral_threshold", 0.85),
+        temporal_gate_ms=echo_cfg.get("gate0_temporal_gate_ms", 80),
+        ema_alpha=echo_cfg.get("gate0_ema_alpha", 0.1),
+    )
+    gate3_done_event = asyncio.Event()
+
+    # Wire v3 filters into mic_stream and audio_player
+    mic_stream.set_v3_filters(aria_filter, gate0)
+    audio_player.set_v3_refs(mic_stream, aria_filter, gate0)
+
+    # V3: Create SpeakingMonitor with audio_player and gate3_done_event
+    speaking_monitor = SpeakingMonitor(
+        session=session,
+        event_bus=event_bus,
+        mic_stream=mic_stream,
+        filler_detector=filler_detector,
+        config=config,
+        audio_player=audio_player,
+        gate3_done_event=gate3_done_event,
+    )
 
     # ── Agent ────────────────────────────────────────────────────────────────
     text_out = TextOut(
@@ -563,7 +588,7 @@ async def initialize_system(
         config=config,  # V2: pass full config so it can read backchannel section
     )
 
-    # ── Turn Manager (last — orchestrates everything) ────────────────────────
+    # ── Turn Manager (last — orchestrates everything) ────────────────────
     turn_manager = TurnManager(
         session=session,
         event_bus=event_bus,
@@ -574,6 +599,20 @@ async def initialize_system(
         safety_guard=safety_guard,
         config=config,
     )
+
+    # ── V3: Interrupt Router ───────────────────────────────────────────
+    interrupt_router = InterruptRouter(
+        config=config,
+        audio_player=audio_player,
+        mic_stream=mic_stream,
+        llm_client=llm_client,
+        prompt_builder=prompt_builder,
+        event_bus=event_bus,
+        session=session,
+        tts_client=tts_client,
+        gate3_done_event=gate3_done_event,
+    )
+    turn_manager.set_interrupt_router(interrupt_router)
 
     # ── Long-term memory: always initialize for MEMORY_COMPRESSED subscription ──
     try:
@@ -624,6 +663,11 @@ async def initialize_system(
         "long_term_memory": long_term_memory,
         "compressor": compressor,
         "safety_guard": safety_guard,
+        # V3: New modules
+        "aria_filter": aria_filter,
+        "gate0": gate0,
+        "gate3_done_event": gate3_done_event,
+        "interrupt_router": interrupt_router,
     }
 
 
@@ -805,10 +849,12 @@ async def shutdown(modules: dict[str, Any]) -> None:
 
 
 async def async_main(config: dict, args: argparse.Namespace) -> None:
-    """Top-level async orchestrator: init → run → shutdown."""
+    """Top-level async orchestrator: init → warmup → run → shutdown."""
     modules: dict[str, Any] = {}
     try:
         modules = await initialize_system(config, args)
+        # V3: Startup warmup — pre-warm echo filters before conversation
+        await startup_warmup(modules, config)
         await run_pipeline(modules, config, args)
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Received shutdown signal.")
@@ -817,6 +863,61 @@ async def async_main(config: dict, args: argparse.Namespace) -> None:
     finally:
         if modules:
             await shutdown(modules)
+
+
+async def startup_warmup(modules: dict[str, Any], config: dict) -> None:
+    """V3: Pre-warm echo suppression filters before conversation starts.
+
+    Synthesizes ~3s of Aria's voice silently via Kokoro, then feeds the
+    audio to AriaVoiceFilter and Gate0EchoCheck. This ensures both filters
+    are fully calibrated before the first word is spoken.
+    """
+    from core.event_bus import EventType
+
+    echo_cfg = config.get("echo_suppression", {})
+    warmup_text = echo_cfg.get(
+        "warmup_text",
+        "Hello, how are you doing today? I hope you're having a wonderful day.",
+    )
+
+    tts_client = modules["tts_client"]
+    aria_filter = modules.get("aria_filter")
+    gate0 = modules.get("gate0")
+    event_bus = modules["event_bus"]
+
+    if aria_filter is None and gate0 is None:
+        logger.info("[Warmup] No v3 filters to warm up")
+        return
+
+    logger.info("[Warmup] Synthesizing Aria voice for echo filter calibration...")
+    try:
+        # Synthesize silently — returns float32 at 16kHz
+        audio = await tts_client.synthesize_silent(warmup_text)
+
+        # Feed to AriaVoiceFilter (builds speaker embedding)
+        if aria_filter is not None:
+            chunk_size = 3200  # 200ms chunks at 16kHz
+            for i in range(0, len(audio), chunk_size):
+                aria_filter.feed_aria_audio(audio[i:i + chunk_size])
+            logger.info(
+                "[Warmup] AriaVoiceFilter ready=%s (%d samples fed)",
+                aria_filter.is_ready, len(audio),
+            )
+
+        # Feed to Gate0EchoCheck (builds spectral fingerprint)
+        if gate0 is not None:
+            chunk_size = 480  # 30ms chunks at 16kHz
+            for i in range(0, len(audio), chunk_size):
+                gate0.feed_tts_spectrum(audio[i:i + chunk_size])
+            logger.info(
+                "[Warmup] Gate0EchoCheck ready=%s", gate0.is_ready,
+            )
+
+        await event_bus.publish(EventType.WARMUP_COMPLETE, {}, source="main")
+        logger.info("[Warmup] Echo protection fully ready")
+
+    except Exception as e:
+        logger.warning("[Warmup] Failed (continuing without warmup): %s", e)
 
 
 def main() -> None:

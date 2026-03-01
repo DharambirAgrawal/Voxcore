@@ -162,19 +162,21 @@ from input.vad import VADProcessor
 class InterruptionDetector:
     """Gate 1 — Monitors audio during SPEAKING for sustained user speech.
 
-    Without hardware AEC the mic picks up TTS echo.  Silero VAD reports
-    prob ≈ 1.0 for echo because it IS speech — just not the user's.
+    V3 two-path system:
+      Path A: HIGH_ENERGY_BURST — 150ms, 8× noise floor. Catches sharp commands
+              ("stop", "hold on"). Skips Gate 2, goes directly to Gate 3.
+      Path B: NORMAL_SPEECH — 600ms, 3× noise floor. For regular interruptions.
+              Proceeds to Gate 2 (filler check) then Gate 3 (LLM classification).
 
     Discrimination strategy:
       1. Hard cooldown (500ms) after entering SPEAKING
       2. Continuously adapting echo RMS baseline (EMA)
       3. Energy gate: rms must exceed max(ambient, echo_ema × 3, absolute_min)
       4. VAD probability gate (0.60)
-      5. Sustained speech window — configurable via speaking_monitor.gate1_min_duration_ms
-         (defaults to 600ms when monitor enabled, 300ms when disabled)
+      5. Two-path sustained speech window
 
-    When speaking_monitor is ENABLED (v2):
-      - Fires GATE1_PASSED instead of INTERRUPT_DETECTED
+    When speaking_monitor is ENABLED (v2/v3):
+      - Fires GATE1_PASSED with path='A' or path='B'
       - SpeakingMonitor handles Gate 2 (filler) and Gate 3 (LLM classification)
 
     When speaking_monitor is DISABLED:
@@ -207,20 +209,20 @@ class InterruptionDetector:
 
         # ── Tuning knobs ─────────────────────────────────────────────────
         self._interrupt_threshold: float = 0.60
-        # Gate 1 duration — SpeakingMonitor handles filler/classification on top,
-        # so Gate 1 can be sensitive (300ms catches short commands like "stop").
+
+        # V3: Two-path Gate 1 configuration
+        self._path_a_duration_ms: int = monitor_cfg.get("gate1_path_a_min_duration_ms", 150)
+        self._path_a_energy_ratio: float = monitor_cfg.get("gate1_path_a_energy_ratio", 8.0)
+        self._path_b_duration_ms: int = monitor_cfg.get("gate1_path_b_min_duration_ms", 600)
+        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 2.5)
+
+        # Legacy single-path fallback (when monitor disabled)
         self._interrupt_duration_ms: int = (
             monitor_cfg.get("gate1_min_duration_ms", 300)
             if self._monitor_enabled
             else 300
         )
         self._energy_multiplier: float = 2.5
-
-        # ── Echo baseline tracking ───────────────────────────────────────
-        self._echo_ema: float = 0.0
-        self._echo_ema_initialized: bool = False
-        self._echo_gate_multiplier: float = 3.0
-        self._min_absolute_rms: float = 0.005
 
         # ── Cooldown ─────────────────────────────────────────────────────
         self._state_cooldown_ms: float = 500.0
@@ -233,6 +235,14 @@ class InterruptionDetector:
 
         # ── FIX: Self-tracked state transitions ──────────────────────────
         self._was_speaking_state: bool = False
+
+        # ── Playback pause/resume tracking (PersonaPlex) ─────────────────
+        # When SpeakingMonitor pauses playback, Gate 1 must be suppressed
+        # to avoid re-triggering on stale audio. On resume, a cooldown
+        # lets echo_ema recalibrate to the real playback level.
+        self._playback_paused: bool = False
+        self._resume_cooldown_until: float = 0.0
+        self._resume_cooldown_ms: float = 1500.0
 
         self._logger = logging.getLogger("InterruptionDetector")
 
@@ -262,20 +272,30 @@ class InterruptionDetector:
     # Echo baseline
     # ─────────────────────────────────────────────────────────────────────
 
-    def _update_echo_ema(self, rms: float) -> None:
-        """Asymmetric EMA: fast rise (catch loud echo), slow decay."""
-        if not self._echo_ema_initialized:
-            self._echo_ema = rms
-            self._echo_ema_initialized = True
-        else:
-            alpha = 0.25 if rms > self._echo_ema else 0.03
-            self._echo_ema = alpha * rms + (1.0 - alpha) * self._echo_ema
 
-    def _should_update_echo_ema(self, rms: float) -> bool:
-        """Update baseline only for frames that look like echo, not user voice."""
-        if not self._echo_ema_initialized:
-            return True
-        return rms < self._echo_ema * self._echo_gate_multiplier
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PersonaPlex pause/resume callbacks
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _on_playback_pause(self, event) -> None:
+        """SpeakingMonitor paused playback — suppress Gate 1 detection."""
+        self._playback_paused = True
+        self._speech_detected_at = 0.0
+        self._last_speech_at = 0.0
+
+    async def _on_playback_resume(self, event) -> None:
+        """Playback resumed — recalibrate echo baseline before detecting."""
+        self._playback_paused = False
+        self._resume_cooldown_until = (
+            time.monotonic() + self._resume_cooldown_ms / 1000.0
+        )
+        self._speech_detected_at = 0.0
+        self._last_speech_at = 0.0
+        self._logger.debug(
+            "Resume → echo recalibration cooldown %.0fms",
+            self._resume_cooldown_ms,
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Main loop — self-tracks state transitions
@@ -283,22 +303,25 @@ class InterruptionDetector:
 
     async def run(self) -> None:
         self._load_own_model()
-        # V2: Use raw consumer to bypass MicStream echo suppression.
-        # This detector has its own echo EMA discrimination and needs
-        # ALL audio (including echo-heavy chunks) to work correctly.
+        # V3 FIX: Use raw consumer — Gate0 must NOT filter InterruptionDetector's
+        # audio stream. Gate0 blocking fragments duration accumulation, preventing
+        # the two-path system from ever reaching its thresholds. InterruptionDetector
+        # has its own energy gating + VAD and doesn't need upstream echo filtering.
         self._audio_queue = self.mic_stream.add_raw_consumer()
         self._logger.info(
-            "InterruptionDetector started (vad=%.2f, dur=%dms, "
-            "echo_gate=%.1f×, cooldown=%dms, min_rms=%.4f, monitor=%s)",
+            "InterruptionDetector started (vad=%.2f, "
+            "pathA=%dms/%.0f×, pathB=%dms/%.1f×, "
+            "cooldown=%dms, monitor=%s)",
             self._interrupt_threshold,
-            self._interrupt_duration_ms,
-            self._echo_gate_multiplier,
+            self._path_a_duration_ms, self._path_a_energy_ratio,
+            self._path_b_duration_ms, self._path_b_energy_ratio,
             int(self._state_cooldown_ms),
-            self._min_absolute_rms,
             "ENABLED" if self._monitor_enabled else "disabled",
         )
 
-        non_speech_gate = 0.35
+        # Subscribe to pause/resume events from PersonaPlex pipeline
+        self.event_bus.subscribe(EventType.PLAYBACK_PAUSE, self._on_playback_pause)
+        self.event_bus.subscribe(EventType.PLAYBACK_RESUME, self._on_playback_resume)
 
         while True:
             chunk = await self._audio_queue.get()
@@ -325,8 +348,9 @@ class InterruptionDetector:
                 self._speaking_since = time.monotonic()
                 self._speech_detected_at = 0.0
                 self._last_speech_at = 0.0
-                self._echo_ema = 0.0
-                self._echo_ema_initialized = False
+                # Reset pause/resume state from any previous cycle
+                self._playback_paused = False
+                self._resume_cooldown_until = 0.0
                 if self._own_model is not None:
                     self._own_model.reset_states()
                 self._logger.debug(
@@ -338,33 +362,32 @@ class InterruptionDetector:
             rms = float(np.sqrt(np.mean(chunk ** 2)))
             speech_prob = self._get_speech_probability(chunk)
 
-            # ── Cooldown: ignore first window, calibrate echo baseline ────
-            # With raw audio consumer, TTS echo arrives here too (prob > 0.35).
-            # Update echo_ema on ALL frames during cooldown so the baseline
-            # tracks the actual TTS echo level, not just ambient noise.
-            elapsed_ms = (now - self._speaking_since) * 1000.0
-            if elapsed_ms < self._state_cooldown_ms:
-                if rms > 0.0005:
-                    self._update_echo_ema(rms)
+            # ── Playback paused → suppress detection entirely ────────
+            if self._playback_paused:
                 continue
 
-            # ── Update echo EMA only on non-speech frames ────────────────
-            if speech_prob < non_speech_gate and self._should_update_echo_ema(rms):
-                self._update_echo_ema(rms)
+            # ── Post-resume cooldown → recalibrate ───────────────────
+            if now < self._resume_cooldown_until:
+                continue
 
-            # ── Energy gate ──────────────────────────────────────────────
+            # ── Cooldown: ignore first window after entering SPEAKING ────
+            elapsed_ms = (now - self._speaking_since) * 1000.0
+            if elapsed_ms < self._state_cooldown_ms:
+                continue
+
+            # ══════════════════════════════════════════════════════════
+            # Energy gate — V3: simple threshold for all paths
+            # ══════════════════════════════════════════════════════════
+            # AriaVoiceFilter + Gate0 handle echo upstream in mic_stream.
+            # We only need a noise-floor gate here, no echo_ema tracking.
             noise_floor = self.mic_stream.noise_floor
+
             ambient_gate = (
-                noise_floor * self._energy_multiplier if noise_floor > 0 else 0
-            )
-            echo_gate = (
-                self._echo_ema * self._echo_gate_multiplier
-                if self._echo_ema > 0
+                noise_floor * self._energy_multiplier
+                if noise_floor > 0
                 else 0
             )
-            energy_threshold = max(
-                ambient_gate, echo_gate, self._min_absolute_rms
-            )
+            energy_threshold = ambient_gate
 
             if rms < energy_threshold:
                 # Don't immediately reset — brief energy dips between phonemes
@@ -381,15 +404,12 @@ class InterruptionDetector:
 
             # ── Passed energy gate — check VAD + duration ────────────────
             if self._speech_detected_at == 0.0:
-                # First frame passing energy gate — log at INFO for visibility
+                # First frame passing energy gate — log for visibility
                 self._logger.info(
-                    "Interrupt candidate: prob=%.3f rms=%.4f gate=%.4f "
-                    "(echo_ema=%.4f, ratio=%.1f×)",
+                    "Interrupt candidate: prob=%.3f rms=%.4f gate=%.4f",
                     speech_prob,
                     rms,
                     energy_threshold,
-                    self._echo_ema,
-                    rms / energy_threshold if energy_threshold > 0 else 0,
                 )
             await self._check_interrupt(speech_prob, rms)
 
@@ -401,58 +421,59 @@ class InterruptionDetector:
         now = time.monotonic()
 
         if speech_prob > self._interrupt_threshold:
-            self._last_speech_at = now  # track latest high-prob speech frame
+            self._last_speech_at = now
             if self._speech_detected_at == 0.0:
                 self._speech_detected_at = now
                 self._logger.debug(
                     "Interrupt timer accumulating (prob=%.3f, rms=%.4f)",
-                    speech_prob,
-                    rms,
+                    speech_prob, rms,
                 )
             else:
                 duration_ms = (now - self._speech_detected_at) * 1000
-                self._logger.debug(
-                    "Gate 1: %.0f/%.0fms (prob=%.2f)",
-                    duration_ms, self._interrupt_duration_ms, speech_prob,
-                )
-                if duration_ms >= self._interrupt_duration_ms:
-                    if self._monitor_enabled:
-                        # ── V2: Defer to SpeakingMonitor (Gate 2 + 3) ────
+                noise_floor = self.mic_stream.noise_floor
+
+                if self._monitor_enabled:
+                    # ── V3: Two-path Gate 1 ─────────────────────────
+                    path = None
+                    energy_ratio = rms / max(noise_floor, 1e-8)
+
+                    # Path A: HIGH_ENERGY_BURST — short + very loud
+                    if (duration_ms >= self._path_a_duration_ms
+                            and energy_ratio >= self._path_a_energy_ratio):
+                        path = "A"
+                    # Path B: NORMAL_SPEECH — sustained + moderate
+                    elif (duration_ms >= self._path_b_duration_ms
+                            and energy_ratio >= self._path_b_energy_ratio):
+                        path = "B"
+
+                    if path is not None:
+                        # ── FIRE: publish GATE1_PASSED for SpeakingMonitor ──
+                        self._logger.info(
+                            "Gate 1 PASSED (path=%s, %.0fms, prob=%.2f, "
+                            "ratio=%.1f×, rms=%.4f)",
+                            path, duration_ms, speech_prob,
+                            energy_ratio, rms,
+                        )
                         await self.event_bus.publish(
                             EventType.GATE1_PASSED,
-                            data={
-                                "speech_prob": speech_prob,
-                                "rms": rms,
+                            {
+                                "path": path,
                                 "duration_ms": duration_ms,
-                                "echo_ema": self._echo_ema,
+                                "speech_prob": speech_prob,
+                                "energy_ratio": energy_ratio,
+                                "rms": rms,
                             },
                             source="InterruptionDetector",
                         )
-                        self._logger.info(
-                            "Gate 1 PASSED (%.0fms, prob=%.2f, rms=%.4f) → SpeakingMonitor",
-                            duration_ms, speech_prob, rms,
-                        )
+                        # Reset timers + brief cooldown to prevent re-fire
+                        self._speech_detected_at = 0.0
+                        self._last_speech_at = 0.0
+                        await asyncio.sleep(0.5)
                     else:
-                        # ── V1 fallback: fire INTERRUPT_DETECTED directly ─
-                        await self.event_bus.publish(
-                            EventType.INTERRUPT_DETECTED,
-                            data={
-                                "speech_prob": speech_prob,
-                                "during_sentence": -1,
-                            },
+                        self._logger.debug(
+                            "Gate 1: %.0fms (prob=%.2f, ratio=%.1f×) — waiting",
+                            duration_ms, speech_prob, energy_ratio,
                         )
-                        self._logger.info(
-                            "INTERRUPT detected (%.0fms, prob=%.2f, "
-                            "rms=%.4f, echo_ema=%.4f, ratio=%.1f×)",
-                            duration_ms,
-                            speech_prob,
-                            rms,
-                            self._echo_ema,
-                            rms / self._echo_ema if self._echo_ema > 0 else 0,
-                        )
-                    self._speech_detected_at = 0.0
-                    self._last_speech_at = 0.0
-                    await asyncio.sleep(0.5)
         else:
             # Non-speech frame: only reset timer if hold window expired
             if self._speech_detected_at > 0 and self._last_speech_at > 0:
@@ -461,5 +482,4 @@ class InterruptionDetector:
                     self._speech_detected_at = 0.0
                     self._last_speech_at = 0.0
             elif self._speech_detected_at > 0 and self._last_speech_at == 0.0:
-                # Timer started but never saw high-prob frame — reset
                 self._speech_detected_at = 0.0

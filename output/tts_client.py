@@ -192,6 +192,13 @@ KOKORO_SAMPLE_RATE = 24000
 # V2: Clip tags that should NOT be sent to Kokoro
 CLIP_TAG_PATTERN = re.compile(r'\[(laughs|chuckles|light_laugh|sighs)\]')
 
+# Strip [TOOL RESULT ...] and [TOOL ERROR ...] artifact prefixes that the LLM
+# sometimes echoes back — they should NEVER be spoken aloud.
+ARTIFACT_PREFIX_PATTERN = re.compile(
+    r'^\s*\[TOOL\s+(?:RESULT|ERROR)[^\]]*\]\s*\n?',
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 class TTSClient:
     """Kokoro-ONNX local TTS client that converts sentences to audio.
@@ -295,6 +302,8 @@ class TTSClient:
 
             # Strip LLM emotion tags — Kokoro doesn't use them
             sentence = EMOTION_TAG_PATTERN.sub("", sentence).strip()
+            # Strip any [TOOL RESULT/ERROR] prefix the LLM echoed into its response
+            sentence = ARTIFACT_PREFIX_PATTERN.sub("", sentence).strip()
             if not sentence:
                 continue
 
@@ -426,3 +435,39 @@ class TTSClient:
         buf = io.BytesIO()
         sf.write(buf, samples, sample_rate, format="WAV")
         return buf.getvalue()
+
+    async def synthesize_silent(self, text: str) -> np.ndarray:
+        """V3: Synthesize text silently — returns raw audio without playback.
+
+        Used by startup_warmup() to pre-warm AriaVoiceFilter + Gate0EchoCheck.
+        Returns numpy float32 array resampled to 16kHz (mic rate) for filter feeding.
+
+        Args:
+            text: Text to synthesize (e.g. "Hello, how are you today?")
+
+        Returns:
+            np.ndarray: float32 audio array at 16kHz
+        """
+        clean = EMOTION_TAG_PATTERN.sub("", text).strip()
+
+        loop = asyncio.get_event_loop()
+        samples, sample_rate = await loop.run_in_executor(
+            None,
+            lambda: self._kokoro.create(
+                clean,
+                voice=self.voice_profile.voice_name,
+                speed=1.0,
+                lang="en-us",
+            ),
+        )
+
+        # Kokoro outputs 24kHz — resample to 16kHz for mic-rate filter feeding
+        if sample_rate != 16000:
+            import torchaudio.functional as F
+            import torch
+            tensor = torch.from_numpy(samples).unsqueeze(0)
+            resampled = F.resample(tensor, sample_rate, 16000)
+            samples = resampled.squeeze(0).numpy()
+
+        self._logger.info("synthesize_silent: generated %d samples at 16kHz", len(samples))
+        return samples.astype(np.float32)

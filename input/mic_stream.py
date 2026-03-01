@@ -185,7 +185,7 @@ import sounddevice as sd
 
 from core.event_bus import EventBus
 
-# V2: Default correlation threshold for echo suppression
+# V2: Default correlation threshold for echo suppression (legacy fallback)
 DEFAULT_ECHO_CORRELATION_THRESHOLD = 0.7
 
 
@@ -196,9 +196,15 @@ class MicStream:
     - Cross-correlation echo suppression: maintains a reference buffer of
       recently played audio. When an incoming mic chunk correlates strongly
       (above threshold) with the reference, it's treated as echo and dropped.
+
+    V3 additions:
+    - AriaVoiceFilter integration: speaker-identity echo rejection (Layer 2)
+    - Gate0EchoCheck integration: spectral+temporal echo gate (Layer 3)
+    - set_filter_active(): scoped toggle — filters ON only during real TTS playback
+    - last_200ms(): returns recent audio for interrupt context VAD
     """
 
-    def __init__(self, event_bus: EventBus, config: dict) -> None:
+    def __init__(self, event_bus: EventBus, config: dict, echo_config: dict | None = None) -> None:
         self.event_bus: EventBus = event_bus
         self.sample_rate: int = config.get("sample_rate", 16000)
         self.chunk_ms: int = config.get("chunk_ms", 30)
@@ -212,14 +218,26 @@ class MicStream:
         self._logger: logging.Logger = logging.getLogger("MicStream")
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # V2: Echo suppression via cross-correlation
-        self._echo_threshold: float = config.get(
-            "echo_correlation_threshold", DEFAULT_ECHO_CORRELATION_THRESHOLD
+        # ── V3: Echo suppression config ──────────────────────────────────
+        _echo_cfg = echo_config or {}
+
+        self._logger.info(
+            "Legacy AEC disabled — using denoiser + AriaVoiceFilter + Gate0"
         )
-        # Rolling reference buffer — stores ~0.5s of playback audio for correlation
-        ref_samples = int(self.sample_rate * 0.5)
-        self._reference_buffer: collections.deque = collections.deque(maxlen=ref_samples)
-        self._echo_suppression_enabled: bool = config.get("echo_suppression", True)
+
+        # ── V3: Four-layer echo suppression filters ──────────────────────
+        # Layer 2: AriaVoiceFilter (speaker-identity rejection)
+        # Layer 3: Gate0EchoCheck (spectral+temporal echo gate)
+        # Set externally via set_v3_filters() after construction in main.py
+        self._aria_filter = None    # AriaVoiceFilter instance
+        self._gate0 = None          # Gate0EchoCheck instance
+
+        # V3: Scoped filter toggle — only active when TTS plays real speech
+        self._filter_active: bool = False
+
+        # V3: Rolling buffer of recent audio for last_200ms()
+        recent_samples = int(self.sample_rate * 0.2)  # 200ms
+        self._recent_audio: collections.deque = collections.deque(maxlen=recent_samples)
 
     async def run(self) -> None:
         """Start mic capture and run forever until cancelled."""
@@ -269,25 +287,48 @@ class MicStream:
         if loop is None:
             return
 
-        # V2: Raw consumers always get ALL audio (no echo suppression).
-        # InterruptionDetector uses this — it has its own echo EMA discrimination.
-        for q in self._raw_consumer_queues:
+        # ── V3: Always update recent audio buffer (for last_200ms()) ─────
+        self._recent_audio.extend(chunk_f32.tolist())
 
+        # ══════════════════════════════════════════════════════════════════
+        # V3 FIX: Fan-out to RAW consumers FIRST, BEFORE echo filtering.
+        # InterruptionDetector uses a raw consumer so Gate0 blocking
+        # can't fragment its duration accumulator.
+        # ══════════════════════════════════════════════════════════════════
+        for q in self._raw_consumer_queues:
             def _enqueue_raw(queue: asyncio.Queue = q) -> None:
                 try:
                     queue.put_nowait(chunk_f32)
                 except asyncio.QueueFull:
-                    pass  # drop silently — raw consumers can tolerate loss
-
+                    pass  # drop silently — raw consumer overwhelmed
             loop.call_soon_threadsafe(_enqueue_raw)
 
-        # V2: Echo suppression — check if mic chunk correlates with recent playback
-        if self._echo_suppression_enabled and len(self._reference_buffer) >= len(chunk_f32):
-            ref_arr = np.array(list(self._reference_buffer)[-len(chunk_f32):], dtype=np.float32)
-            correlation = self._fast_correlation(chunk_f32, ref_arr)
-            if correlation > self._echo_threshold:
-                # This chunk is likely echo — drop it for filtered consumers only
-                return
+        # ══════════════════════════════════════════════════════════════════
+        # V3: Multi-layer echo suppression (Layer 2 + Layer 3)
+        # Only apply when filter_active is True (TTS real speech playing)
+        # ══════════════════════════════════════════════════════════════════
+        if self._filter_active:
+            # Layer 2: AriaVoiceFilter — speaker-identity rejection
+            if self._aria_filter is not None:
+                try:
+                    if self._aria_filter.is_aria_echo(chunk_f32):
+                        self._logger.debug("AriaVoiceFilter BLOCKED chunk")
+                        # V3 FIX: Don't return — still need to skip filtered consumers
+                        # but raw consumers already got this chunk above
+                        for q in self._consumer_queues:
+                            pass  # Intentionally skip filtered consumers
+                        return
+                except Exception:
+                    pass  # Filter error — let audio through
+
+            # Layer 3: Gate0EchoCheck — spectral+temporal echo gate
+            if self._gate0 is not None:
+                try:
+                    if self._gate0.is_echo(chunk_f32):
+                        self._logger.debug("Gate0 BLOCKED echo chunk")
+                        return  # Drop for filtered consumers only — raw got it above
+                except Exception:
+                    pass  # Filter error — let audio through
 
         # Fan-out to every registered (echo-filtered) consumer queue
         for q in self._consumer_queues:
@@ -369,27 +410,51 @@ class MicStream:
                     pass  # drop silently
             loop.call_soon_threadsafe(_enqueue)
 
-    def set_playback_reference(self, frame: np.ndarray) -> None:
-        """V2: Called by AudioPlayer to feed recently played audio into the
-        reference buffer for cross-correlation echo suppression.
-
-        Args:
-            frame: float32 mono audio frame from AudioPlayer's output.
-        """
-        self._reference_buffer.extend(frame.tolist())
-
-    @staticmethod
     def _fast_correlation(a: np.ndarray, b: np.ndarray) -> float:
-        """V2: Fast normalized cross-correlation between two same-length arrays.
-
-        Returns a value in [-1, 1]. Values > 0.7 indicate the mic signal
-        closely matches the playback signal (likely echo).
-        """
+        """V2: Fast normalized cross-correlation between two same-length arrays."""
         a_norm = np.linalg.norm(a)
         b_norm = np.linalg.norm(b)
         if a_norm < 1e-10 or b_norm < 1e-10:
             return 0.0
         return float(np.dot(a, b) / (a_norm * b_norm))
+
+    # ── V3: Filter control + recent audio ─────────────────────────────────
+
+    def set_v3_filters(self, aria_filter, gate0) -> None:
+        """V3: Inject AriaVoiceFilter and Gate0EchoCheck after construction.
+
+        Called once during main.py initialization, after the filters are
+        created and pre-warmed.
+        """
+        self._aria_filter = aria_filter
+        self._gate0 = gate0
+        self._logger.info("V3 echo filters attached (AriaVoiceFilter + Gate0)")
+
+    def set_filter_active(self, active: bool) -> None:
+        """V3: Toggle AriaVoiceFilter + Gate0 on/off.
+
+        ON:  When TTS is actively playing *real speech* (not clips, not paused)
+        OFF: During clips, LISTENING, PAUSED, silence
+
+        Called by:
+          - AudioPlayer._play_tts_chunk() → set_filter_active(True)
+          - AudioPlayer.pause()           → set_filter_active(False)
+          - AudioPlayer.flush()           → set_filter_active(False)
+          - AudioPlayer._playback_loop()  → set_filter_active(False) when done
+        """
+        if self._filter_active != active:
+            self._filter_active = active
+            self._logger.debug("V3 filter_active = %s", active)
+
+    def last_200ms(self) -> np.ndarray:
+        """V3: Return the most recent ~200ms of mic audio.
+
+        Used by InterruptionDetector for short-burst energy analysis,
+        and by SpeakingMonitor for VAD-end checks.
+        """
+        if not self._recent_audio:
+            return np.array([], dtype=np.float32)
+        return np.array(self._recent_audio, dtype=np.float32)
 
     async def stop(self) -> None:
         """Stop and close the microphone stream."""

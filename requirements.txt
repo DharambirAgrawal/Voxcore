@@ -25,6 +25,10 @@ torch
 torchaudio
 silero-vad
 
+# --- V3: Echo Suppression Layers ---
+resemblyzer                              # AriaVoiceFilter — speaker embedding (Layer 2)
+denoiser                                 # Facebook Research speech enhancement (Layer 1)
+
 # --- Audio Analysis (Backchannel cue detection) ---
 librosa
 
@@ -52,7 +56,6 @@ pydantic
 kokoro-onnx
 soundfile
 
-dotenv
 python-dotenv
 
 aiosqlite
