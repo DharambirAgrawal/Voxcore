@@ -341,12 +341,16 @@ class VADProcessor:
         while True:
             chunk: np.ndarray = await audio_queue.get()
 
-            # ── Echo suppression: skip while AI is speaking ──
-            ai_speaking = (
+            # ── Echo suppression: skip while AI is speaking or classifying ──
+            # V3: Also skip during PENDING (Gate 3 classifying) and PAUSED
+            # to prevent the normal VAD→STT pipeline from racing with SpeakingMonitor
+            ai_active = (
                 self.session is not None
-                and self.session.state == TurnState.SPEAKING
+                and self.session.state in (
+                    TurnState.SPEAKING, TurnState.PENDING, TurnState.PAUSED,
+                )
             )
-            if ai_speaking:
+            if ai_active:
                 self._was_speaking = True
                 if self._model is not None:
                     self._model.reset_states()

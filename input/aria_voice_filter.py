@@ -22,15 +22,22 @@ logger = logging.getLogger(__name__)
 
 # Lazy-load resemblyzer to avoid import cost at module level
 _encoder = None
-
+_resemblyzer_available = True
 
 def _get_encoder():
-    """Lazy-load VoiceEncoder — ~1s one-time cost."""
-    global _encoder
+    """Lazy-load VoiceEncoder — ~1s one-time cost. Warns once if unavailable."""
+    global _encoder, _resemblyzer_available
+    if not _resemblyzer_available:
+        return None
     if _encoder is None:
-        from resemblyzer import VoiceEncoder
-        _encoder = VoiceEncoder()
-        logger.info("VoiceEncoder loaded")
+        try:
+            from resemblyzer import VoiceEncoder # type: ignore[import-untyped, import-not-found]
+            _encoder = VoiceEncoder()
+            logger.info("VoiceEncoder loaded")
+        except ImportError:
+            _resemblyzer_available = False
+            logger.warning("resemblyzer not installed — AriaVoiceFilter will be disabled")
+            return None
     return _encoder
 
 
@@ -77,7 +84,9 @@ class AriaVoiceFilter:
             self._samples_since_update = 0
             try:
                 encoder = _get_encoder()
-                from resemblyzer import preprocess_wav
+                if encoder is None:
+                    return
+                from resemblyzer import preprocess_wav # type: ignore[import-untyped, import-not-found]
                 combined = np.concatenate(list(self._aria_chunks))
                 wav = preprocess_wav(combined, source_sr=16000)
                 if len(wav) > 0:
@@ -103,7 +112,9 @@ class AriaVoiceFilter:
 
         try:
             encoder = _get_encoder()
-            from resemblyzer import preprocess_wav
+            if encoder is None:
+                return False
+            from resemblyzer import preprocess_wav # type: ignore[import-untyped, import-not-found]
             wav = preprocess_wav(chunk, source_sr=16000)
             if len(wav) == 0:
                 return False

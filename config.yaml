@@ -98,7 +98,7 @@ audio:
   noise_floor_calibration_s: 0.5     # Seconds of silence at startup for noise floor calibration
   echo_correlation_threshold: 0.7    # V2: Cross-correlation threshold for echo suppression (legacy fallback)
   echo_suppression: true             # V2: Enable/disable legacy cross-correlation echo suppression
-  echo_cancellation: true            # V3: WebRTC-style adaptive AEC (recommended — replaces echo_suppression)
+  echo_cancellation: false           # V3: WebRTC-style adaptive AEC (disabled, rely on Gate0 and Aria)
   aec_filter_blocks: 12              # V3: AEC filter partitions (12 × 30ms = 360ms echo tail)
   aec_step_size: 0.3                 # V3: AEC NLMS step size (0.0–1.0, 0.3 = safe for most rooms)
 

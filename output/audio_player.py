@@ -389,7 +389,13 @@ class AudioPlayer:
                 continue
 
             self._is_playing = True
-            await self._play_audio(audio_array)
+            if self._mic_stream is not None:
+                self._mic_stream.set_filter_active(True)
+            try:
+                await self._play_audio(audio_array)
+            finally:
+                if self._mic_stream is not None:
+                    self._mic_stream.set_filter_active(False)
             self._is_playing = False
 
             # Only fire PLAYBACK_DONE when TTS has finished synthesizing
@@ -782,7 +788,7 @@ class AudioPlayer:
                 audio_float = audio_float / 32768.0
 
             clip_duration = len(audio_float) / sr
-            max_loops = 10  # safety limit
+            max_loops = 4  # ~2s max for a 0.5s clip
 
             for _ in range(max_loops):
                 if stop_event.is_set():
