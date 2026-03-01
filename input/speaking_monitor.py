@@ -437,11 +437,12 @@ class SpeakingMonitor:
 
             # ── Step 2b: Wait for user to finish speaking ────────────────
             # V3 FIX: No hard max_wait — the user can speak as long as they
-            # want.  We just wait for 700ms of contiguous silence (matches
-            # the normal VAD's silence=700ms setting).  Previous values of
-            # 200-500ms were cutting off mid-sentence on natural inter-word
-            # pauses.  The 10s safety cap only triggers in pathological cases.
-            await self._wait_for_speech_end(max_wait_s=10.0, silence_ms=700)
+            # want.  We just wait for 1000ms of contiguous silence so users
+            # can breathe or pause naturally between phrases ("after this...
+            # [breath] ...can you tell me...") without getting cut off.
+            # Previous 700ms was clipping at natural inter-phrase pauses.
+            # The 10s safety cap only triggers in pathological cases.
+            await self._wait_for_speech_end(max_wait_s=10.0, silence_ms=1000)
 
             if self.session.state not in (
                 TurnState.SPEAKING, TurnState.PENDING, TurnState.PAUSED,

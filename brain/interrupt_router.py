@@ -191,6 +191,11 @@ class InterruptRouter:
             # Deferred request: store transcript so TurnManager can trigger it
             # once the current TTS playback finishes — don't inject mid-stream.
             self._pending_deferred_task = transcript
+            # Play a brief bridge clip so the user knows we heard them.
+            bridge_clip = self._bridge_clips.get("new_question", "sure.wav")
+            bridge_path = os.path.join(self._clips_dir, bridge_clip)
+            if os.path.isfile(bridge_path):
+                asyncio.create_task(self._audio_player.play_clip(bridge_path))
             self._logger.info(
                 "INJECT (deferred) — stored task '%s', resuming TTS",
                 transcript[:60],

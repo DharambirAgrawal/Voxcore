@@ -494,6 +494,19 @@ class TurnManager:
             # Wait briefly for the TextInjector to finish adding to text_in_queue
             await asyncio.sleep(0.05)
 
+            # Inject a guard so the LLM answers directly from the result and
+            # does NOT call the same tool again (llama-3.1-8b-instant tends to
+            # repeat the tool call when it sees a prior agent tag in history).
+            await self.session.inject_text(
+                content=(
+                    f"[INSTRUCTION]: The '{action}' result above is ready. "
+                    "Answer the user's question directly using this data. "
+                    "Do NOT call any tools again for this response."
+                ),
+                priority="high",
+                source="tool_result_guard",
+            )
+
             # Cancel the previous LLM task so we don't have two streams running
             # at the same time (which causes raw tool result text to be spoken).
             if self._current_llm_task is not None and not self._current_llm_task.done():
