@@ -551,6 +551,16 @@ class SpeakingMonitor:
                     )
                     decision, interrupt_type = "INTERRUPT", "PAUSE"
 
+                # Safety net: if LLM returned IGNORE but we already confirmed a
+                # deferral phrase ("after this / when you're done / ..."), the
+                # model either returned empty or misclassified.  Force INJECT so
+                # the deferred request is not silently dropped.
+                if decision == "IGNORE" and has_deferral:
+                    self._logger.warning(
+                        "LLM returned IGNORE but deferral phrase confirmed — overriding to INJECT"
+                    )
+                    decision, interrupt_type = "INJECT", "null"
+
                 self._logger.info(
                     "Gate 3: decision=%s type=%s (transcript='%s')",
                     decision, interrupt_type, transcript,
@@ -579,7 +589,7 @@ class SpeakingMonitor:
             if decision == "IGNORE":
                 # V3: Play a soft acknowledgment so user feels heard
                 if self._audio_player is not None:
-                    ack_clip = os.path.join(self._clips_dir, "mm_hmm.wav")
+                    ack_clip = os.path.join(self._clips_dir, "got_it.wav")
                     if os.path.exists(ack_clip):
                         try:
                             await self._audio_player.play_clip(ack_clip)
@@ -1049,18 +1059,28 @@ class SpeakingMonitor:
         )
 
         try:
-            response = await self._groq_client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.0,
-                max_tokens=50,
-                stream=False,
-            )
-
-            raw_result = response.choices[0].message.content.strip()
+            raw_result = ""
+            # Retry once on empty response — cold endpoints (GPT-4o-mini, etc.)
+            # occasionally return blank on the first call.
+            for attempt in range(2):
+                response = await self._groq_client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.0,
+                    max_tokens=50,
+                    stream=False,
+                )
+                raw_result = response.choices[0].message.content.strip()
+                if raw_result:
+                    break
+                if attempt == 0:
+                    self._logger.warning(
+                        "Classifier returned empty (attempt 1/2) — retrying after 300ms"
+                    )
+                    await asyncio.sleep(0.3)
 
             # Strip <think>...</think> tags from thinking models (qwen3, etc.)
             cleaned = re.sub(

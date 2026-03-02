@@ -180,7 +180,6 @@ class InterruptRouter:
         rather than being injected mid-stream.
         """
         self._gate3_done_event.set()  # stop filler clip
-        await self._audio_player.resume()
         self._mic_stream.set_filter_active(True)
 
         transcript = classified.get("transcript", "")
@@ -188,20 +187,25 @@ class InterruptRouter:
         is_deferred = classified.get("deferred", False)
 
         if is_deferred:
-            # Deferred request: store transcript so TurnManager can trigger it
-            # once the current TTS playback finishes — don't inject mid-stream.
+            # Deferred request: play bridge clip first so the user knows we
+            # heard them, THEN resume TTS — avoids the clip and TTS overlapping.
             self._pending_deferred_task = transcript
-            # Play a brief bridge clip so the user knows we heard them.
             bridge_clip = self._bridge_clips.get("new_question", "sure.wav")
             bridge_path = os.path.join(self._clips_dir, bridge_clip)
             if os.path.isfile(bridge_path):
-                asyncio.create_task(self._audio_player.play_clip(bridge_path))
+                try:
+                    await self._audio_player.play_clip(bridge_path)
+                except Exception:
+                    pass
+            await self._audio_player.resume()
             self._logger.info(
                 "INJECT (deferred) — stored task '%s', resuming TTS",
                 transcript[:60],
             )
         else:
-            # Immediate inject: add context to LLM session now.
+            # Immediate inject: resume TTS first (no clip needed mid-stream),
+            # then add context to LLM session.
+            await self._audio_player.resume()
             await self._session.inject_text(
                 content=f"[User interjected: {transcript}]",
                 priority="high",

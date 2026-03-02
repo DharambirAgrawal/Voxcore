@@ -101,7 +101,7 @@ audio:
 # V2/V3: Speaking Monitor — multi-gate interrupt classification during AI speech
 speaking_monitor:
   enabled: true                        # Enable/disable the speaking monitor
-  model: "llama-3.1-8b-instant"        # LLM model for semantic interrupt classification (Gate 3)
+  model: "llama-3.1-8b-instant"       # LLM model for semantic interrupt classification (Gate 3)
   # ── V3: Two-path Gate 1 ──
   gate1_path_a_min_duration_ms: 150    # Path A: HIGH_ENERGY_BURST — short, loud (shout/command)
   gate1_path_a_energy_ratio: 8         # Path A: 8× noise floor required

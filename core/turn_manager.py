@@ -206,6 +206,7 @@ States: LISTENING → THINKING → SPEAKING → (PAUSED → SPEAKING | SOFT_INJE
 
 import asyncio
 import logging
+import re
 from typing import Optional
 
 from core.session import Session, TurnState
@@ -522,6 +523,19 @@ class TurnManager:
             # will flush it into the [CONTEXT] block)
             await self.session.set_state(TurnState.THINKING)
             messages = self.prompt_builder.build(self.session)
+
+            # Strip <agent>…</agent> from the last assistant message so the
+            # LLM doesn't see itself as mid-tool-call and repeat the same
+            # tool invocation even though the result is already in context.
+            _AGENT_TAG_RE = re.compile(r'\n?<agent>.*?</agent>', re.DOTALL)
+            for _i in range(len(messages) - 1, -1, -1):
+                if messages[_i]["role"] == "assistant":
+                    messages[_i] = {
+                        **messages[_i],
+                        "content": _AGENT_TAG_RE.sub("", messages[_i]["content"]).strip(),
+                    }
+                    break
+
             model = self.brain_router.route("tool result", self.session)
             self._current_llm_task = asyncio.create_task(
                 self._stream_and_parse(messages, model)
