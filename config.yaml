@@ -35,12 +35,15 @@ persona:
 
     WHEN TO USE TOOLS:
     - User asks for current prices, weather, news, scores, stock prices → USE web_search
-    - User asks you to remember or recall something → USE memory
-    - User asks about their schedule → USE calendar
+    - User shares a URL or article link and wants to hear what it says → USE article_fetch
     - User asks a question you can answer from general knowledge → do NOT use tools
 
     HOW TO USE TOOLS — output this EXACT format (no markdown, no extra text around the tag):
-    <agent>{"action": "web_search", "params": {"query": "current bitcoin price USD"}}</agent>
+    <agent>{"action": "web_search", "params": {"query": "SEARCH QUERY HERE"}}</agent>
+    <agent>{"action": "article_fetch", "params": {"url": "COPY URL FROM USER MESSAGE", "instruction": "WHAT TO DO WITH IT"}}</agent>
+
+    CRITICAL FOR article_fetch: The URL in the params MUST be copied exactly — from the current message OR from earlier in conversation history.
+    If NO URL has appeared anywhere in the conversation yet, do NOT call article_fetch — ask them to share the link.
 
     EXAMPLES:
     User: "What's the bitcoin price right now?"
@@ -49,8 +52,18 @@ persona:
     User: "How's the weather in Delhi?"
     You: [cheerful] Let me check! <agent>{"action": "web_search", "params": {"query": "weather in Delhi today"}}</agent>
 
-    User: "Remember that my favorite color is blue"
-    You: [calm] Got it, I'll save that. <agent>{"action": "memory", "params": {"operation": "store", "content": "User's favorite color is blue"}}</agent>
+    User: "Can you read this? https://bbc.com/news/tech-article-12345678"
+    You: [calm] Sure, pulling that up now. <agent>{"action": "article_fetch", "params": {"url": "https://bbc.com/news/tech-article-12345678", "instruction": "summarize the article naturally in about 150 spoken words"}}</agent>
+    (Note: URL was copied exactly from what the user said — not invented)
+
+    [Previous message] User: "Don't check now, I'll ask later — https://www.britannica.com/place/Mars-planet"
+    [Current message]  User: "Can you read that article?"
+    You: [calm] Sure, let me read that for you! <agent>{"action": "article_fetch", "params": {"url": "https://www.britannica.com/place/Mars-planet", "instruction": "summarize the article naturally in about 150 spoken words"}}</agent>
+    (Note: URL came from the previous message — look back in history when user says 'that article', 'the link', 'that URL', etc.)
+
+    User: "Someone sent me a link, can you read it?"
+    You: [calm] Sure! Go ahead and share the link and I'll read it for you.
+    (Note: No URL anywhere in conversation — do NOT call any tool, just ask for the URL)
 
     User: "How are you?"
     You: [cheerful] I'm doing great, thanks for asking! How about you?
@@ -58,8 +71,13 @@ persona:
     RULES:
     - NEVER make up factual information (prices, weather, news). If you don't know, use a tool.
     - When using a tool, say a SHORT acknowledgment BEFORE the <agent> tag (e.g., "Let me check.")
+    - CRITICAL: Only call article_fetch if a real URL (starting with http:// or https://) appears in the user's current message OR in recent conversation history. Copy it exactly. Never invent or guess a URL.
+    - If someone says they have a link but hasn’t shared it yet, just ask: "Go ahead and share the link!"
     - After a tool result arrives as [TOOL RESULT], speak the answer naturally — do NOT repeat the raw data verbatim.
-    - If the user tells you their name or personal info, just remember it in conversation — do NOT call the memory tool unless they explicitly ask you to save something.
+    - When presenting NEWS results: mention at least 3 different headlines with a brief detail for each. Don't just summarize one item — cover the breadth of what the search returned.
+    - If the user asks for "more news" or follow-ups, search with a DIFFERENT query angle (e.g. "world news", "technology news", specific topic) — don't repeat the same query.
+    - If the user tells you their name or personal info, just remember it in conversation naturally.
+    - NEVER output lines starting with "User:", "You:", "Human:", or "Assistant:" in your response. Your output is ONLY your spoken words. Do NOT simulate conversation history or example dialogues.
   voice: "af_heart"   # Kokoro-ONNX voice ID — see backchannel/generator.py for full list
   language: "en"                     # "en" for English
 
@@ -105,9 +123,13 @@ speaking_monitor:
   # ── V3: Two-path Gate 1 ──
   gate1_path_a_min_duration_ms: 150    # Path A: HIGH_ENERGY_BURST — short, loud (shout/command)
   gate1_path_a_energy_ratio: 8         # Path A: 8× noise floor required
-  gate1_path_b_min_duration_ms: 600    # Path B: NORMAL_SPEECH — sustained, moderate
-  gate1_path_b_energy_ratio: 3         # Path B: 3× noise floor required
-  gate1_path_b_energy_ratio: 3         # Path B: 3× noise floor required
+  gate1_path_b_min_duration_ms: 750    # Path B: NORMAL_SPEECH — sustained, moderate
+                                       # (raised 600→750: echo pops are shorter than speech)
+  gate1_path_b_energy_ratio: 4.5       # Path B: 5.0× noise floor required
+                                       # (raised 3→5.0: observed echo ceiling=4.6×, observed
+                                       #  real-speech floor=5.3×; 5.0 sits in the middle of
+                                       #  the 0.7× gap, safely blocking echo without clipping
+                                       #  genuine user speech)
   # ── Gate 2/3 ──
   gate2_filler_list: []                # Gate 2: additional filler words
   gate3_debounce_s: 1.5                # Gate 3: min seconds between LLM calls
@@ -130,7 +152,9 @@ echo_suppression:
                                        # (raised from 0.85 — 6-bin truncation bug caused
                                        #  false positives on user speech; now with 257 bins
                                        #  0.92 is safe and precise)
-  gate0_temporal_gate_ms: 80           # TTS played < N ms ago → automatic echo
+  gate0_temporal_gate_ms: 400          # TTS played < N ms ago → automatic echo
+                                       # (raised 80→400: covers inter-sentence synthesis
+                                       #  gaps and room echo tail after each sentence)
   gate0_ema_alpha: 0.1                 # EMA smoothing for TTS spectrum fingerprint
   # Startup warmup
   warmup_text: "Hello, how are you doing today? I hope you're having a wonderful day."
@@ -176,12 +200,27 @@ memory:
 agent:
   enabled: true                      # Enable/disable agentic tool execution
   text_out_webhook: null             # (optional) POST URL for agent JSON output
-  max_concurrent_tools: 3            # Max tools running in parallel
+  max_concurrent_tools: 2            # Max tools running in parallel
   tool_timeout_s: 30                 # Timeout for individual tool execution
   tools:                             # List of enabled tool names (must match files in agent/tools/)
     - web_search
-    - memory
-    - calendar
+    - article_fetch
+
+  web_search:                        # Tool-specific config
+    default_num_results: 5
+    search_depth: "basic"
+
+  article_fetch:                     # Tool-specific config
+    fetch_timeout_seconds: 10
+    max_article_words: 8000
+    long_article_threshold: 3000
+    summary_model: "meta-llama/llama-4-scout-17b-16e-instruct"  # 30K TPM — 5× more headroom than 8b-instant
+    long_article_model: "moonshotai/kimi-k2-instruct"           # 10K TPM — good for long analysis
+    fallback_models:                                             # Tried in order when primary hits 429
+      - "moonshotai/kimi-k2-instruct"
+      - "llama-3.3-70b-versatile"
+      - "meta-llama/llama-4-maverick-17b-128e-instruct"
+    default_summary_max_words: 150
 
 safety:
   enabled: true                      # Enable/disable Llama Guard safety layer

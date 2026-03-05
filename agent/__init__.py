@@ -18,6 +18,6 @@ USAGE:
     from agent import TextOut, ToolRouter, SlowLLM
 """
 
-# from agent.text_out import TextOut
-# from agent.tool_router import ToolRouter
-# from agent.slow_llm import SlowLLM
+from agent.text_out import TextOut
+from agent.tool_router import ToolRouter
+from agent.slow_llm import SlowLLM

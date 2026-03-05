@@ -559,11 +559,6 @@ async def initialize_system(
         event_bus=event_bus, config=config.get("memory")
     )
 
-    # Wire MemoryTool to LongTermMemory so the tool can actually read/write
-    mem_tool = tool_router._tools.get("memory")
-    if mem_tool is not None and hasattr(mem_tool, "set_memory"):
-        mem_tool.set_memory(long_term_memory)
-
     compressor = MemoryCompressor(
         event_bus=event_bus, llm_client=llm_client
     )

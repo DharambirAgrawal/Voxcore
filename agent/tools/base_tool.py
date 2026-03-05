@@ -100,24 +100,38 @@ EXPORTS:
 
 
 from abc import ABC, abstractmethod
-from typing import Any
 import logging
 
 
 class BaseTool(ABC):
-    """Abstract base class for all VoxCore tools."""
+    """Abstract base class for all VoxCore tools.
+
+    Every tool must set:
+        name             — Unique action name (routing key in <agent> JSON)
+        description      — LLM reads this to decide when to call the tool
+        required_params  — Router validates these before calling execute()
+        optional_params  — Tool handles defaults internally
+        produces_spoken_output — If True, result goes straight to TTS (skips main LLM)
+    """
 
     name: str = ""
     description: str = ""
     required_params: list[str] = []
     optional_params: list[str] = []
+    produces_spoken_output: bool = False
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
+        self.config: dict = config or {}
         self._logger: logging.Logger = logging.getLogger(f"Tool.{self.name}")
 
     @abstractmethod
-    async def execute(self, params: dict) -> Any:
-        """Execute the tool's main action. Must be implemented by subclasses."""
+    async def execute(self, params: dict) -> str:
+        """Run the tool. Always returns a plain string.
+
+        If produces_spoken_output is True: return natural spoken text ready for TTS.
+        If produces_spoken_output is False: return factual result for main LLM to synthesize.
+        Never raise — catch all errors internally and return a spoken-friendly error string.
+        """
         ...
 
     def validate_params(self, params: dict) -> tuple[bool, str]:
@@ -134,4 +148,5 @@ class BaseTool(ABC):
             "description": self.description,
             "required_params": self.required_params,
             "optional_params": self.optional_params,
+            "produces_spoken_output": self.produces_spoken_output,
         }

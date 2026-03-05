@@ -359,6 +359,18 @@ class ResponseParser:
         if not sentence:
             return
 
+        # ── Guard: drop hallucinated conversation-turn lines ─────────────
+        # The LLM sometimes copies the few-shot example format from the
+        # system prompt and generates spurious "User: X" or "You: Y" lines.
+        # These must NEVER reach TTS.
+        _lower = sentence.lower()
+        if (_lower.startswith(("user:", "you:", "human:", "assistant:"))
+                or _lower.startswith(("[user]", "[you]", "[human]", "[assistant]"))):
+            self._logger.warning(
+                "Dropped hallucinated turn line: '%s'", sentence[:120]
+            )
+            return
+
         # ── V2: Check for pause markers [...] ────────────────────────────
         # Split sentence around [...] and process each part
         parts = sentence.split("[...]")

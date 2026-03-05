@@ -61,6 +61,7 @@ ENUM: EventType(str, Enum)
         # --- Agent Events ---
         TOOL_RESULT_READY    = "tool_result_ready"     # Tool execution completed, result available
         AGENT_JSON_OUT       = "agent_json_out"        # Validated agent JSON ready for external consumers
+        SPOKEN_TOOL_OUTPUT   = "spoken_tool_output"    # Tool produced spoken text — send directly to TTS
 
         # --- Safety Events ---
         SAFETY_FLAGGED       = "safety_flagged"        # Content flagged by Llama Guard
@@ -99,6 +100,7 @@ DATACLASS: Event
         BACKCHANNEL_FIRE:       data = {"clip_name": str, "clip_path": str}
         TOOL_RESULT_READY:      data = {"action": str, "result": Any, "success": bool}
         AGENT_JSON_OUT:         data = {"action": str, "params": dict, "session_id": str, "turn_id": int, "timestamp": float}
+        SPOKEN_TOOL_OUTPUT:     data = {"text": str, "action": str}
         SAFETY_FLAGGED:         data = {"direction": str, "category": str, "content": str}  # direction = "input" or "output"
         MEMORY_COMPRESSED:      data = {"turns_compressed": int, "summary": str}
 
@@ -275,6 +277,7 @@ class EventType(str, Enum):
     # --- Agent Events ---
     TOOL_RESULT_READY = "tool_result_ready"
     AGENT_JSON_OUT = "agent_json_out"
+    SPOKEN_TOOL_OUTPUT = "spoken_tool_output"
 
     # --- Safety Events ---
     SAFETY_FLAGGED = "safety_flagged"

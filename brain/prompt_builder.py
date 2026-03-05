@@ -315,6 +315,20 @@ class PromptBuilder:
             "- Use [chuckles] for mild amusement.\n"
             "- Use [sighs] when being thoughtful or empathetic.\n"
             "- Never use these tags back-to-back. One per response maximum.\n"
+            # ── V5: Tool usage and routing rules ──
+            "\n\nTOOL ROUTING RULES:\n"
+            "- web_search: Use when you need to FIND current info and no URL is given.\n"
+            "- article_fetch: Use when the user gives a specific URL they want read.\n"
+            "- Do NOT use web_search when a URL is provided — use article_fetch.\n"
+            "- Do NOT use article_fetch when no URL is provided — use web_search.\n"
+            "- When calling article_fetch, write an 'instruction' field in plain English\n"
+            "  describing exactly what the user wants. Examples:\n"
+            '  "user wants a quick 2-sentence overview"\n'
+            '  "user wants the full article walked through section by section"\n'
+            '  "focus only on the clinical findings, user is a doctor"\n'
+            '  "extract only the numbers and statistics mentioned"\n'
+            "  Be specific. The instruction goes directly to the summarizing model.\n"
+            "- For web_search, write the query as you would type into a search engine.\n"
             "\n\nTOOL RESULT RULES:\n"
             "- When context contains a tool result, answer IN ONE SENTENCE using only the key fact.\n"
             "- NEVER speak URLs, raw list text, decimal-precise numbers unless asked, or any context block formatting.\n"

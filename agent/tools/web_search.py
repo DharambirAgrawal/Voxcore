@@ -135,7 +135,6 @@ EXPORTS:
 
 import logging
 import os
-from typing import Any
 
 import aiohttp
 
@@ -146,12 +145,21 @@ class WebSearchTool(BaseTool):
     """Web search tool using Tavily search API."""
 
     name = "web_search"
-    description = "Search the web for current information"
+    description = (
+        "Search the internet for current information, news, facts, prices, "
+        "or events that may have changed recently. Use when you need to FIND "
+        "information and no URL has been provided. "
+        "Do NOT use when the user has given a specific URL — use article_fetch for that."
+    )
     required_params = ["query"]
     optional_params = ["num_results", "search_depth"]
+    produces_spoken_output = False  # Result goes to main LLM for synthesis
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__(config)
+        cfg = self.config.get("web_search", {}) if self.config else {}
+        self.default_num_results: int = cfg.get("default_num_results", 3)
+        self.default_search_depth: str = cfg.get("search_depth", "basic")
         self.api_key: str = os.environ.get("TAVILY_API_KEY", "")
         self._logger: logging.Logger = logging.getLogger("Tool.web_search")
         if not self.api_key:
@@ -170,11 +178,11 @@ class WebSearchTool(BaseTool):
         query = params["query"]
 
         try:
-            num_results = int(params.get("num_results", 3))
+            num_results = int(params.get("num_results", self.default_num_results))
         except (TypeError, ValueError):
-            num_results = 3
+            num_results = self.default_num_results
 
-        search_depth = params.get("search_depth", "basic")
+        search_depth = params.get("search_depth", self.default_search_depth)
         if search_depth not in ("basic", "advanced"):
             search_depth = "basic"
 

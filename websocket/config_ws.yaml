@@ -1,0 +1,16 @@
+# ╔══════════════════════════════════════════════════════════════════════════════════╗
+# ║                    VOXCORE v4 — WebSocket Configuration                         ║
+# ║            Merged on top of config.yaml when running websocket/run.py           ║
+# ╚══════════════════════════════════════════════════════════════════════════════════╝
+#
+# This file is ONLY used by websocket/run.py. main.py never reads it.
+# Values here override/extend config.yaml for WebSocket mode.
+
+websocket:
+  host: "0.0.0.0"                     # Bind address (0.0.0.0 for all interfaces)
+  port: 8765                           # WebSocket port
+  api_key: "voxcore-dev-key-change-me" # Auth key — change in production
+  max_sessions: 8                      # Max concurrent WebSocket connections
+  ping_interval: 10                    # Seconds between server pings
+  ping_timeout: 30                     # Seconds before client considered dead
+  max_frame_size: 65536                # Max binary frame size in bytes

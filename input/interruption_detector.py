@@ -402,6 +402,17 @@ class InterruptionDetector:
                     pass  # not timing, nothing to reset
                 continue
 
+            # ── Echo guard: skip AI's own voice (raw consumer + query filters) ──
+            # InterruptionDetector uses add_raw_consumer() so upstream echo
+            # filtering does not apply here. Call mic_stream.check_echo() to
+            # query the same AriaVoiceFilter + Gate0 directly.
+            # Reset the duration timer on echo so trailing edge doesn't
+            # accumulate and trigger a false Gate 1 fire.
+            if self.mic_stream.check_echo(chunk):
+                self._speech_detected_at = 0.0
+                self._last_speech_at = 0.0
+                continue
+
             # ── Passed energy gate — check VAD + duration ────────────────
             if self._speech_detected_at == 0.0:
                 # First frame passing energy gate — log for visibility

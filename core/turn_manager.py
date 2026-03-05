@@ -219,6 +219,35 @@ from brain.router import BrainRouter
 
 from safety.guard import SafetyGuard
 
+# ── Deferral phrase stripping ─────────────────────────────────────────────────
+# When a user says "after this, can you X" the SpeakingMonitor stores the full
+# transcript as a deferred task. Before passing it to the LLM we strip the
+# lead-in so the model sees a clean imperative ("tell me the Bitcoin price")
+# rather than the conditional form which confused it into continuing the story.
+_DEFERRAL_PREFIXES = re.compile(
+    r'^(?:'
+    r'after (?:this|that|you(?:\'re)? done|you finish(?:ing)?|the story)|'
+    r'when you(?:\'re)? (?:done|finished)|'
+    r'once you(?:\'re)? (?:done|finished)|'
+    r'after you(?:\'re)? (?:done|finished)|'
+    r'then'
+    r')[,\s]+(?:can you |could you |would you |please )?',
+    re.IGNORECASE,
+)
+
+
+def _strip_deferral_prefix(text: str) -> str:
+    """Remove lead-in deferral phrases and return the clean request.
+
+    E.g. "After this, can you tell me the Bitcoin price?"
+         → "tell me the Bitcoin price?"
+    """
+    cleaned = _DEFERRAL_PREFIXES.sub("", text).strip()
+    # Capitalise first letter after stripping
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned or text
+
 
 class TurnManager:
     """State machine that drives the entire conversational flow."""
@@ -261,6 +290,8 @@ class TurnManager:
         self._playback_done_queue = event_bus.subscribe(EventType.PLAYBACK_DONE)
         self._safety_queue = event_bus.subscribe(EventType.SAFETY_FLAGGED)
         self._tool_result_queue = event_bus.subscribe(EventType.TOOL_RESULT_READY)
+        # V5: Spoken tool output (article_fetch etc) — goes directly to TTS
+        self._spoken_tool_queue = event_bus.subscribe(EventType.SPOKEN_TOOL_OUTPUT)
         # V3: CLASSIFIED events from SpeakingMonitor's Gate 3
         self._classified_queue = event_bus.subscribe(EventType.CLASSIFIED)
 
@@ -277,6 +308,7 @@ class TurnManager:
             self._handle_playback_done(),
             self._handle_safety_flags(),
             self._handle_tool_results(),
+            self._handle_spoken_tool_output(),  # V5
             self._handle_classified(),  # V3
         )
 
@@ -440,11 +472,15 @@ class TurnManager:
                 if self._interrupt_router is not None:
                     deferred = self._interrupt_router.pop_deferred_task()
                     if deferred:
+                        # Strip deferral lead-in phrases so the LLM sees the
+                        # clean request rather than "after this, can you…"
+                        clean = _strip_deferral_prefix(deferred)
                         self._logger.info(
-                            "Executing deferred task: '%s'", deferred[:60],
+                            "Executing deferred task: '%s' (cleaned: '%s')",
+                            deferred[:60], clean[:60],
                         )
-                        await self.session.add_turn("user", deferred)
-                        await self._start_llm_response(deferred)
+                        await self.session.add_turn("user", clean)
+                        await self._start_llm_response(clean)
 
             elif self.session.state == TurnState.PAUSED:
                 # V3: PAUSED stays PAUSED — playback done doesn't exit PAUSED
@@ -484,11 +520,23 @@ class TurnManager:
         the session's text_in_queue by TextInjector.  We fire a fresh LLM
         call so the AI can read the result and speak it to the user.
         The tool result appears as [CONTEXT] in the prompt via PromptBuilder.
+
+        V5: Tools with produces_spoken_output=True are handled by
+        _handle_spoken_tool_output() instead — skip auto-LLM-call for them.
         """
         while True:
             event = await self._tool_result_queue.get()
             action = event.data.get("action", "unknown")
             success = event.data.get("success", True)
+            spoken_output = event.data.get("spoken_output", False)
+
+            if spoken_output:
+                # Spoken tool output is handled by _handle_spoken_tool_output
+                # — the result goes directly to TTS, no LLM re-call needed.
+                self._logger.info(
+                    "Tool '%s' is spoken output — skipping auto-LLM-call", action
+                )
+                continue
 
             self._logger.info("Tool '%s' result received (success=%s) — auto-responding", action, success)
 
@@ -539,6 +587,67 @@ class TurnManager:
             model = self.brain_router.route("tool result", self.session)
             self._current_llm_task = asyncio.create_task(
                 self._stream_and_parse(messages, model)
+            )
+
+    # ── V5: spoken tool output handling ───────────────────────────────────
+
+    async def _handle_spoken_tool_output(self) -> None:
+        """Feed spoken tool output directly to TTS — same path as main LLM.
+
+        When a tool with produces_spoken_output=True finishes (e.g. article_fetch),
+        its result is already polished spoken text. We feed it through the same
+        response_parser → LLM_SPEECH_TOKEN → TTS pipeline as the main LLM,
+        so downstream (TTS, audio player, state machine) sees no difference.
+
+        Flow: SPOKEN_TOOL_OUTPUT → cancel LLM bridge → SPEAKING →
+              response_parser.parse_stream(text) → LLM_SPEECH_TOKEN events →
+              TTS generates audio → PLAYBACK_DONE → LISTENING
+        """
+        while True:
+            event = await self._spoken_tool_queue.get()
+            text = event.data.get("text", "")
+            action = event.data.get("action", "unknown")
+
+            if not text or not text.strip():
+                self._logger.warning("Empty spoken tool output from '%s' — ignoring", action)
+                continue
+
+            self._logger.info(
+                "Spoken tool output from '%s' (%d chars) — feeding to TTS",
+                action, len(text),
+            )
+
+            # Cancel any running LLM task (the bridge phrase stream may still
+            # be active — "Let me read that for you..." was streamed by the
+            # main LLM before emitting the agent tag).  Already-queued TTS
+            # audio for the bridge will finish playing; the spoken output
+            # sentences queue naturally after it.
+            if self._current_llm_task is not None and not self._current_llm_task.done():
+                self._current_llm_task.cancel()
+                try:
+                    await self._current_llm_task
+                except asyncio.CancelledError:
+                    pass
+                self._interrupted_content = ""
+
+            # Transition to SPEAKING (if not already — bridge may still be playing)
+            await self.session.set_state(TurnState.SPEAKING)
+
+            # Feed the spoken text through response_parser — identical pipeline
+            # to main LLM output.  parse_stream splits into sentences, detects
+            # emotion/pause tags, and fires LLM_SPEECH_TOKEN events.  The TTS
+            # pipeline subscribes to those events and treats them identically
+            # to sentences from the main LLM.
+            async def _text_as_stream():
+                yield text
+
+            full_text = await self.response_parser.parse_stream(_text_as_stream())
+
+            # Record as an assistant turn in session history
+            await self.session.add_turn("assistant", full_text)
+
+            self._logger.info(
+                "Spoken tool output from '%s' fully emitted to TTS", action
             )
 
     # ── V3: CLASSIFIED event handling ────────────────────────────────────

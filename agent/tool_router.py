@@ -32,8 +32,7 @@ from input.text_injector import TextInjector
 # Tool imports
 from agent.tools.base_tool import BaseTool
 from agent.tools.web_search import WebSearchTool
-from agent.tools.memory_tool import MemoryTool
-from agent.tools.calendar_tool import CalendarTool
+from agent.tools.article_fetch import ArticleFetchTool
 
 ═══════════════════════════════════════════════════════════════════════════════════
 CLASSES:
@@ -76,14 +75,13 @@ CLASS: ToolRouter
 
     def _register_tools(self, enabled_tools: list[str]) -> None
         INPUTS:
-            - enabled_tools: list[str] — Tool names from config (e.g. ["web_search", "memory", "calendar"])
+            - enabled_tools: list[str] — Tool names from config (e.g. ["web_search", "article_fetch"])
         OUTPUT: None (populates self._tools)
         WHAT IT DOES:
             1. Available tool mapping:
                TOOL_MAP = {
-                   "web_search": WebSearchTool,
-                   "memory": MemoryTool,
-                   "calendar": CalendarTool,
+                   "web_search":    WebSearchTool,
+                   "article_fetch": ArticleFetchTool,
                }
             2. For each name in enabled_tools:
                If name in TOOL_MAP:
@@ -189,8 +187,7 @@ from input.text_injector import TextInjector
 
 from agent.tools.base_tool import BaseTool
 from agent.tools.web_search import WebSearchTool
-from agent.tools.memory_tool import MemoryTool
-from agent.tools.calendar_tool import CalendarTool
+from agent.tools.article_fetch import ArticleFetchTool
 
 
 class ToolRouter:
@@ -209,19 +206,19 @@ class ToolRouter:
 
         self._logger: logging.Logger = logging.getLogger("ToolRouter")
 
+        self._config: dict = config  # Full agent config — passed to tool constructors
         self._register_tools(config.get("tools", []))
 
     def _register_tools(self, enabled_tools: list[str]) -> None:
         """Register enabled tools from config into the internal registry."""
         TOOL_MAP: dict[str, type[BaseTool]] = {
-            "web_search": WebSearchTool,
-            "memory": MemoryTool,
-            "calendar": CalendarTool,
+            "web_search":    WebSearchTool,
+            "article_fetch": ArticleFetchTool,
         }
 
         for name in enabled_tools:
             if name in TOOL_MAP:
-                self._tools[name] = TOOL_MAP[name]()
+                self._tools[name] = TOOL_MAP[name](config=self._config)
                 self._logger.info("Registered tool: %s", name)
             else:
                 self._logger.warning("Unknown tool: %s", name)
@@ -251,7 +248,12 @@ class ToolRouter:
             task.add_done_callback(lambda t: self._active_tasks.remove(t))
 
     async def _execute_tool(self, action: str, params: dict) -> None:
-        """Execute a single tool call with timeout, inject result back into conversation."""
+        """Execute a single tool call with timeout.
+
+        Routing after execution:
+        - produces_spoken_output=True  → publish SPOKEN_TOOL_OUTPUT (TTS directly)
+        - produces_spoken_output=False → inject result for main LLM to synthesize
+        """
         tool = self._tools[action]
         start = time.time()
         self._logger.info("Executing tool '%s' with params: %s", action, params)
@@ -264,11 +266,25 @@ class ToolRouter:
             duration = time.time() - start
             self._logger.info("Tool '%s' completed in %.1fs", action, duration)
 
-            await self.text_injector.inject_tool_result(action, str(result), success=True)
+            if tool.produces_spoken_output:
+                # Result IS the answer — send straight to TTS, skip main LLM
+                await self.event_bus.publish(
+                    EventType.SPOKEN_TOOL_OUTPUT,
+                    {"text": str(result), "action": action},
+                    source="ToolRouter",
+                )
+            else:
+                # Result is context — inject for main LLM to read on next turn
+                await self.text_injector.inject_tool_result(action, str(result), success=True)
 
             await self.event_bus.publish(
                 EventType.TOOL_RESULT_READY,
-                {"action": action, "result": result, "success": True},
+                {
+                    "action": action,
+                    "result": result,
+                    "success": True,
+                    "spoken_output": tool.produces_spoken_output,
+                },
                 source="ToolRouter",
             )
 

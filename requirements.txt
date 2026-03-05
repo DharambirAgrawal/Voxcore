@@ -50,6 +50,9 @@ python-dotenv
 # --- Async HTTP (for tool calls, webhook, HF fallback) ---
 aiohttp
 
+# --- HTML Parsing (article_fetch tool) ---
+beautifulsoup4
+
 # --- Utilities ---
 pydantic
 

@@ -239,10 +239,26 @@ class MicStream:
         recent_samples = int(self.sample_rate * 0.2)  # 200ms
         self._recent_audio: collections.deque = collections.deque(maxlen=recent_samples)
 
+        # ── V4: WebSocket audio source ───────────────────────────────────
+        # When set, read from this asyncio queue instead of sounddevice.
+        # When None (default), use sounddevice as today.
+        self._audio_source_queue: Optional[asyncio.Queue] = None
+
     async def run(self) -> None:
         """Start mic capture and run forever until cancelled."""
         self._loop = asyncio.get_running_loop()
 
+        # ── V4: WebSocket mode — skip sounddevice entirely ───────────────
+        if self._audio_source_queue is not None:
+            self._running = True
+            self._logger.info(
+                "Mic stream started (WebSocket source, 16kHz, mono, %dms chunks)",
+                self.chunk_ms,
+            )
+            await self._ws_audio_loop()
+            return
+
+        # ── Original sounddevice path — UNCHANGED ────────────────────────
         await self._calibrate_noise_floor()
 
         self._stream = sd.InputStream(
@@ -418,6 +434,76 @@ class MicStream:
             return 0.0
         return float(np.dot(a, b) / (a_norm * b_norm))
 
+    # ── V4: WebSocket audio source ─────────────────────────────────────────
+
+    def set_audio_source(self, queue: asyncio.Queue) -> None:
+        """V4: Route audio from a WebSocket queue instead of sounddevice.
+
+        When set, run() will skip sounddevice entirely and read PCM bytes
+        from this queue. When not set (default), sounddevice is used.
+
+        Called by PipelineInstance to wire the AudioBridge mic queue.
+
+        Args:
+            queue: asyncio.Queue providing raw 16-bit PCM bytes from client.
+        """
+        self._audio_source_queue = queue
+        self._logger.info("V4: Audio source set to WebSocket queue")
+
+    async def _ws_audio_loop(self) -> None:
+        """V4: Read audio from WebSocket queue and distribute to consumers.
+
+        Replaces _audio_callback for WebSocket mode. Same fan-out logic:
+        raw consumers first, then echo filtering, then filtered consumers.
+        """
+        while self._running:
+            try:
+                raw = await self._audio_source_queue.get()
+            except asyncio.CancelledError:
+                break
+
+            # Convert raw 16-bit PCM bytes to float32 normalised
+            chunk_f32: np.ndarray = np.frombuffer(
+                raw, dtype=np.int16
+            ).astype(np.float32) / 32768.0
+
+            # Update recent audio buffer (for last_200ms())
+            self._recent_audio.extend(chunk_f32.tolist())
+
+            # Fan-out to raw consumers FIRST (before echo filtering)
+            for q in self._raw_consumer_queues:
+                try:
+                    q.put_nowait(chunk_f32)
+                except asyncio.QueueFull:
+                    pass  # drop silently — raw consumer overwhelmed
+
+            # Echo filtering (same logic as _audio_callback)
+            if self._filter_active:
+                blocked = False
+                if self._aria_filter is not None:
+                    try:
+                        if self._aria_filter.is_aria_echo(chunk_f32):
+                            self._logger.debug("V4/WS: AriaVoiceFilter BLOCKED chunk")
+                            blocked = True
+                    except Exception:
+                        pass
+                if not blocked and self._gate0 is not None:
+                    try:
+                        if self._gate0.is_echo(chunk_f32):
+                            self._logger.debug("V4/WS: Gate0 BLOCKED echo chunk")
+                            blocked = True
+                    except Exception:
+                        pass
+                if blocked:
+                    continue  # Skip filtered consumers, raw already got it
+
+            # Fan-out to filtered consumer queues
+            for q in self._consumer_queues:
+                try:
+                    q.put_nowait(chunk_f32)
+                except asyncio.QueueFull:
+                    self._logger.warning("V4/WS: Consumer audio queue full — dropping chunk")
+
     # ── V3: Filter control + recent audio ─────────────────────────────────
 
     def set_v3_filters(self, aria_filter, gate0) -> None:
@@ -445,6 +531,36 @@ class MicStream:
         if self._filter_active != active:
             self._filter_active = active
             self._logger.debug("V3 filter_active = %s", active)
+
+    def check_echo(self, chunk: np.ndarray) -> bool:
+        """V3: Query whether a chunk is AI echo — for raw-consumer callers.
+
+        InterruptionDetector uses add_raw_consumer() so echo filtering does
+        not happen upstream. This method lets it query the same filters
+        directly without routing through the filtered consumer path.
+
+        Returns True only when echo suppression is active (during real TTS
+        playback) AND at least one filter identifies the chunk as Aria's
+        voice / TTS spectral echo. Safe to call frequently — exceptions are
+        caught and treated as non-echo.
+
+        Returns:
+            True  → chunk is AI echo, caller should discard it.
+            False → chunk is not echo (or filter inactive), caller handles it.
+        """
+        if not self._filter_active:
+            return False
+        try:
+            if self._aria_filter is not None and self._aria_filter.is_aria_echo(chunk):
+                return True
+        except Exception:
+            pass
+        try:
+            if self._gate0 is not None and self._gate0.is_echo(chunk):
+                return True
+        except Exception:
+            pass
+        return False
 
     def last_200ms(self) -> np.ndarray:
         """V3: Return the most recent ~200ms of mic audio.

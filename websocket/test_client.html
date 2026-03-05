@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoxCore v4 — WebSocket Test Client</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0a0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+        h1 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #7ecfff; }
+        .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 2rem; }
+
+        .led {
+            width: 80px; height: 80px;
+            border-radius: 50%;
+            margin: 1.5rem auto;
+            background: #1a1a2e;
+            border: 3px solid #333;
+            transition: all 0.3s ease;
+        }
+        .led.listening { background: #00cc66; box-shadow: 0 0 30px #00cc6688; animation: breathe 2s infinite; }
+        .led.thinking  { background: #ffaa00; box-shadow: 0 0 30px #ffaa0088; animation: pulse 0.5s infinite; }
+        .led.speaking  { background: #3399ff; box-shadow: 0 0 30px #3399ff88; }
+        .led.off       { background: #1a1a2e; box-shadow: none; }
+
+        @keyframes breathe {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
+        .state-label {
+            text-align: center;
+            font-size: 0.9rem;
+            color: #888;
+            margin-bottom: 2rem;
+            min-height: 1.2em;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+        }
+        input[type="text"] {
+            background: #1a1a2e;
+            border: 1px solid #333;
+            color: #e0e0e0;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            width: 280px;
+            font-size: 0.85rem;
+        }
+        button {
+            background: #2a2a4a;
+            color: #e0e0e0;
+            border: 1px solid #444;
+            padding: 0.5rem 1.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+        }
+        button:hover { background: #3a3a5a; }
+        button.active { background: #cc3333; border-color: #cc3333; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .log-container {
+            width: 100%;
+            max-width: 700px;
+            margin-top: 1rem;
+        }
+        .log-container h3 {
+            font-size: 0.8rem;
+            color: #555;
+            margin-bottom: 0.5rem;
+        }
+        #log {
+            background: #0d0d18;
+            border: 1px solid #222;
+            border-radius: 6px;
+            padding: 1rem;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.75rem;
+            height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .log-info { color: #7ecfff; }
+        .log-warn { color: #ffaa00; }
+        .log-error { color: #ff4444; }
+        .log-cmd { color: #00cc66; }
+    </style>
+</head>
+<body>
+    <h1>VoxCore v4 — WebSocket Test Client</h1>
+    <p class="subtitle">Browser mic → WebSocket → VoxCore pipeline → TTS audio back</p>
+
+    <div class="led off" id="led"></div>
+    <div class="state-label" id="stateLabel">Disconnected</div>
+
+    <div class="controls">
+        <input type="text" id="serverUrl" value="ws://localhost:8765/?user_id=browser_test&token=voxcore-dev-key-change-me" placeholder="ws://host:port/?user_id=...&token=...">
+        <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+        <button id="muteBtn" onclick="toggleMute()" disabled>Unmuted</button>
+    </div>
+
+    <div class="log-container">
+        <h3>Event Log</h3>
+        <div id="log"></div>
+    </div>
+
+    <script>
+    // ═══════════════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════════════
+    let ws = null;
+    let audioCtx = null;
+    let micStream = null;
+    let micProcessor = null;
+    let isMuted = false;
+    let isConnected = false;
+    let playbackQueue = [];
+    let isPlaying = false;
+    let isPaused = false;
+
+    const logEl = document.getElementById('log');
+    const ledEl = document.getElementById('led');
+    const stateEl = document.getElementById('stateLabel');
+    const connectBtn = document.getElementById('connectBtn');
+    const muteBtn = document.getElementById('muteBtn');
+
+    function log(msg, cls = 'log-info') {
+        const ts = new Date().toLocaleTimeString('en-US', {hour12: false, fractionalSecondDigits: 1});
+        logEl.innerHTML += `<span class="${cls}">[${ts}] ${msg}</span>\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setLed(state) {
+        ledEl.className = 'led ' + state;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // WEBSOCKET CONNECTION
+    // ═══════════════════════════════════════════════════════════════════
+    function toggleConnection() {
+        if (isConnected) {
+            disconnect();
+        } else {
+            connect();
+        }
+    }
+
+    function connect() {
+        const url = document.getElementById('serverUrl').value;
+        log(`Connecting to ${url}...`);
+
+        ws = new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            isConnected = true;
+            connectBtn.textContent = 'Disconnect';
+            connectBtn.classList.add('active');
+            muteBtn.disabled = false;
+            log('WebSocket connected — waiting for "ready"...');
+            setLed('off');
+            stateEl.textContent = 'Connected (warming up)';
+        };
+
+        ws.onmessage = async (event) => {
+            if (event.data instanceof ArrayBuffer) {
+                // Binary = TTS PCM audio from server
+                handleAudioChunk(event.data);
+            } else {
+                // JSON control message
+                const msg = JSON.parse(event.data);
+                handleJson(msg);
+            }
+        };
+
+        ws.onclose = (event) => {
+            log(`Disconnected (code=${event.code})`, 'log-warn');
+            cleanup();
+        };
+
+        ws.onerror = (event) => {
+            log('WebSocket error', 'log-error');
+        };
+    }
+
+    function disconnect() {
+        if (ws) ws.close(1000);
+        cleanup();
+    }
+
+    function cleanup() {
+        isConnected = false;
+        connectBtn.textContent = 'Connect';
+        connectBtn.classList.remove('active');
+        muteBtn.disabled = true;
+        setLed('off');
+        stateEl.textContent = 'Disconnected';
+        stopMic();
+        playbackQueue = [];
+        isPlaying = false;
+        isPaused = false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // JSON MESSAGE HANDLER
+    // ═══════════════════════════════════════════════════════════════════
+    function handleJson(msg) {
+        if (msg.type === 'ready') {
+            log('Server ready — starting mic capture', 'log-cmd');
+            stateEl.textContent = 'LISTENING';
+            setLed('listening');
+            startMic();
+        }
+        else if (msg.type === 'pong') {
+            // keepalive response, ignore
+        }
+        else if (msg.type === 'state_change') {
+            const state = msg.state || '';
+            stateEl.textContent = state.toUpperCase();
+            log(`State → ${state.toUpperCase()}`, 'log-cmd');
+        }
+        else if (msg.type === 'command') {
+            handleCommand(msg.action);
+        }
+        else if (msg.type === 'error') {
+            log(`Server error: ${msg.code} — ${msg.message}`, 'log-error');
+        }
+        else {
+            log(`Unknown message: ${JSON.stringify(msg)}`);
+        }
+    }
+
+    function handleCommand(action) {
+        log(`CMD ← ${action}`, 'log-cmd');
+        switch (action) {
+            case 'led_listening': setLed('listening'); break;
+            case 'led_thinking':  setLed('thinking');  break;
+            case 'led_speaking':  setLed('speaking');  break;
+            case 'led_off':       setLed('off');       break;
+            case 'speaker_pause':
+                isPaused = true;
+                break;
+            case 'speaker_resume':
+                isPaused = false;
+                playNext();
+                break;
+            case 'speaker_flush':
+                isPaused = false;
+                playbackQueue = [];
+                isPlaying = false;
+                break;
+            case 'mute_mic':
+                isMuted = true;
+                muteBtn.textContent = 'Muted';
+                break;
+            case 'unmute_mic':
+                isMuted = false;
+                muteBtn.textContent = 'Unmuted';
+                break;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MIC CAPTURE (16kHz mono, 512 samples = 32ms per frame)
+    // ═══════════════════════════════════════════════════════════════════
+    async function startMic() {
+        try {
+            audioCtx = new AudioContext({ sampleRate: 16000 });
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+            });
+
+            const source = audioCtx.createMediaStreamSource(micStream);
+
+            // ScriptProcessorNode (simple, works everywhere)
+            // bufferSize=512 matches the 32ms frame the server expects
+            micProcessor = audioCtx.createScriptProcessor(512, 1, 1);
+            micProcessor.onaudioprocess = (e) => {
+                if (!isConnected || isMuted || !ws || ws.readyState !== 1) return;
+
+                const float32 = e.inputBuffer.getChannelData(0);
+                // Convert float32 → int16
+                const int16 = new Int16Array(float32.length);
+                for (let i = 0; i < float32.length; i++) {
+                    int16[i] = Math.max(-32768, Math.min(32767, Math.round(float32[i] * 32767)));
+                }
+                ws.send(int16.buffer);
+            };
+
+            source.connect(micProcessor);
+            micProcessor.connect(audioCtx.destination);  // required for processing
+
+            log(`Mic started (${audioCtx.sampleRate}Hz, 512 samples/frame)`);
+        } catch (err) {
+            log(`Mic error: ${err.message}`, 'log-error');
+        }
+    }
+
+    function stopMic() {
+        if (micProcessor) {
+            micProcessor.disconnect();
+            micProcessor = null;
+        }
+        if (micStream) {
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+        }
+        if (audioCtx) {
+            audioCtx.close();
+            audioCtx = null;
+        }
+    }
+
+    function toggleMute() {
+        isMuted = !isMuted;
+        muteBtn.textContent = isMuted ? 'Muted' : 'Unmuted';
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AUDIO PLAYBACK (24kHz mono PCM from server)
+    // ═══════════════════════════════════════════════════════════════════
+    const playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+
+    function handleAudioChunk(arrayBuffer) {
+        if (isPaused) return;
+
+        // Raw 16-bit signed PCM at 24kHz
+        const int16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0;
+        }
+
+        playbackQueue.push(float32);
+        if (!isPlaying) playNext();
+    }
+
+    function playNext() {
+        if (playbackQueue.length === 0 || isPaused) {
+            isPlaying = false;
+            return;
+        }
+        isPlaying = true;
+        const samples = playbackQueue.shift();
+
+        const buffer = playCtx.createBuffer(1, samples.length, 24000);
+        buffer.getChannelData(0).set(samples);
+
+        const source = playCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(playCtx.destination);
+        source.onended = () => playNext();
+        source.start();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // KEEPALIVE PING (every 10s)
+    // ═══════════════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+        }
+    }, 10000);
+
+    log('Test client loaded. Enter server URL and click Connect.');
+    </script>
+</body>
+</html>

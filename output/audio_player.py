@@ -269,6 +269,11 @@ class AudioPlayer:
         self._gate0 = None          # Gate0EchoCheck instance
         self._mic_sample_rate: int = 16000  # Mic rate for resampling feeds
 
+        # ── V4: WebSocket audio sink ─────────────────────────────────────
+        # When set, push PCM chunks to this queue instead of sounddevice.
+        # When None (default), use sounddevice as today.
+        self._audio_sink_queue: Optional[asyncio.Queue] = None
+
         self._logger: logging.Logger = logging.getLogger("AudioPlayer")
 
     async def run(self) -> None:
@@ -407,12 +412,14 @@ class AudioPlayer:
         total_samples = audio.shape[0]
 
         try:
-            self._current_stream = sd.OutputStream(
-                samplerate=self.output_sample_rate,
-                channels=audio.shape[1],
-                dtype="float32",
-            )
-            self._current_stream.start()
+            # V4: Skip sounddevice OutputStream in WebSocket mode
+            if self._audio_sink_queue is None:
+                self._current_stream = sd.OutputStream(
+                    samplerate=self.output_sample_rate,
+                    channels=audio.shape[1],
+                    dtype="float32",
+                )
+                self._current_stream.start()
 
             offset = 0
             while offset < total_samples:
@@ -422,7 +429,7 @@ class AudioPlayer:
                 # V3: True pause — wait here until resumed or interrupted
                 if self._is_paused:
                     # Stop the stream while paused to avoid underflow clicks
-                    if self._current_stream is not None:
+                    if self._audio_sink_queue is None and self._current_stream is not None:
                         try:
                             self._current_stream.stop()
                         except Exception:
@@ -435,16 +442,17 @@ class AudioPlayer:
                         break
                     # Restart the stream from where we left off
                     self._logger.debug("Playback RESUMED at frame %d/%d", offset, total_samples)
-                    try:
-                        self._current_stream = sd.OutputStream(
-                            samplerate=self.output_sample_rate,
-                            channels=audio.shape[1],
-                            dtype="float32",
-                        )
-                        self._current_stream.start()
-                    except Exception as e:
-                        self._logger.error("Failed to restart stream after resume: %s", e)
-                        break
+                    if self._audio_sink_queue is None:
+                        try:
+                            self._current_stream = sd.OutputStream(
+                                samplerate=self.output_sample_rate,
+                                channels=audio.shape[1],
+                                dtype="float32",
+                            )
+                            self._current_stream.start()
+                        except Exception as e:
+                            self._logger.error("Failed to restart stream after resume: %s", e)
+                            break
 
                 end = min(offset + frame_samples, total_samples)
                 frame = audio[offset:end].copy()
@@ -466,7 +474,30 @@ class AudioPlayer:
                 if self._volume < 0.99:
                     frame = frame * self._volume
 
-                self._current_stream.write(frame)
+                # V4: write to sounddevice only in local mode
+                if self._audio_sink_queue is None:
+                    self._current_stream.write(frame)
+
+                # ═══════════════════════════════════════════════════════════
+                # V4: Push to WebSocket sink queue instead of sounddevice
+                # ═══════════════════════════════════════════════════════════
+                if self._audio_sink_queue is not None:
+                    mono_out = frame[:, 0] if frame.ndim > 1 else frame
+                    pcm_bytes = (
+                        (mono_out * 32767).clip(-32768, 32767)
+                        .astype(np.int16).tobytes()
+                    )
+                    try:
+                        self._audio_sink_queue.put_nowait(pcm_bytes)
+                    except asyncio.QueueFull:
+                        try:
+                            self._audio_sink_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            self._audio_sink_queue.put_nowait(pcm_bytes)
+                        except asyncio.QueueFull:
+                            pass
 
 
                 # ═══════════════════════════════════════════════════════════
@@ -496,7 +527,7 @@ class AudioPlayer:
                 await asyncio.sleep(0)
 
             stream = self._current_stream
-            if stream is not None:
+            if stream is not None and self._audio_sink_queue is None:
                 stream.stop()
                 stream.close()
         except Exception as e:
@@ -541,8 +572,9 @@ class AudioPlayer:
             # Clear accumulator
             self._audio_accumulator = bytearray()
 
-            # Stop sounddevice immediately
-            sd.stop()
+            # Stop sounddevice immediately (skip in WebSocket mode)
+            if self._audio_sink_queue is None:
+                sd.stop()
 
             # Close current stream if active
             if self._current_stream is not None:
@@ -643,14 +675,33 @@ class AudioPlayer:
                 audio_float = audio.astype(np.float32)
                 if audio.dtype == np.int16:
                     audio_float = audio_float / 32768.0
-                sd.play(audio_float * 0.8, samplerate=sr, blocking=False)
+
+                # V4: WebSocket sink mode — push clip audio to queue
+                if self._audio_sink_queue is not None:
+                    if audio_float.ndim > 1:
+                        audio_float = audio_float[:, 0]  # mono
+                    pcm_bytes = (
+                        (audio_float * 0.8 * 32767).clip(-32768, 32767)
+                        .astype(np.int16).tobytes()
+                    )
+                    # Push in small chunks to interleave with other audio
+                    chunk_size = 1024  # 512 samples at 16-bit
+                    for i in range(0, len(pcm_bytes), chunk_size):
+                        try:
+                            self._audio_sink_queue.put_nowait(pcm_bytes[i:i + chunk_size])
+                        except asyncio.QueueFull:
+                            break
+                else:
+                    sd.play(audio_float * 0.8, samplerate=sr, blocking=False)
+
                 self._logger.debug("Backchannel: played '%s'", clip_name)
             except Exception as e:
                 self._logger.error("Backchannel playback failed: %s", e)
 
     async def stop(self) -> None:
         """Stop all playback and clear the queue."""
-        sd.stop()
+        if self._audio_sink_queue is None:
+            sd.stop()
         self._is_playing = False
         while not self._play_queue.empty():
             try:
@@ -691,6 +742,21 @@ class AudioPlayer:
         self._aria_filter = aria_filter
         self._gate0 = gate0
         self._logger.info("V3 refs attached (mic_stream, aria_filter, gate0)")
+
+    def set_audio_sink(self, queue: asyncio.Queue) -> None:
+        """V4: Route TTS audio to a WebSocket queue instead of sounddevice.
+
+        When set, _play_audio() pushes PCM bytes to this queue instead of
+        writing to an sd.OutputStream. Pause/resume/flush logic is unchanged
+        — the TTS buffer in RAM works the same regardless of sink.
+
+        Called by PipelineInstance to wire the AudioBridge speaker queue.
+
+        Args:
+            queue: asyncio.Queue that receives raw 16-bit PCM bytes.
+        """
+        self._audio_sink_queue = queue
+        self._logger.info("V4: Audio sink set to WebSocket queue")
 
     async def pause(self) -> None:
         """V3: Freeze TTS playback in RAM. Called by InterruptRouter.
@@ -737,7 +803,8 @@ class AudioPlayer:
                 break
 
         self._audio_accumulator = bytearray()
-        sd.stop()
+        if self._audio_sink_queue is None:
+            sd.stop()
 
         if self._current_stream is not None:
             try:
@@ -775,17 +842,42 @@ class AudioPlayer:
             # Clips don't feed AriaFilter/Gate0, so enabling filters during clips
             # would block real user speech against stale TTS fingerprint.
 
-            # V3 FIX: Use sd.play instead of manual frame loops to prevent ASYNC thread underflows
-            sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
+            # V4: WebSocket sink mode — push clip audio to queue
+            if self._audio_sink_queue is not None:
+                mono_out = audio_float[:, 0] if audio_float.ndim > 1 else audio_float
+                pcm_bytes = (
+                    (mono_out * 0.9 * 32767).clip(-32768, 32767)
+                    .astype(np.int16).tobytes()
+                )
+                # Push in chunks to allow interleaving
+                chunk_size = 1024
+                for i in range(0, len(pcm_bytes), chunk_size):
+                    if self._is_interrupted:
+                        break
+                    try:
+                        self._audio_sink_queue.put_nowait(pcm_bytes[i:i + chunk_size])
+                    except asyncio.QueueFull:
+                        try:
+                            self._audio_sink_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            self._audio_sink_queue.put_nowait(pcm_bytes[i:i + chunk_size])
+                        except asyncio.QueueFull:
+                            pass
+                    await asyncio.sleep(0)
+            else:
+                # V3 FIX: Use sd.play instead of manual frame loops to prevent ASYNC thread underflows
+                sd.play(audio_float * 0.9, samplerate=sr, blocking=False)
 
-            duration = len(audio_float) / sr
-            start_time = time.time()
-            
-            while time.time() - start_time < duration:
-                if self._is_interrupted:
-                    sd.stop()
-                    break
-                await asyncio.sleep(0.05)
+                duration = len(audio_float) / sr
+                start_time = time.time()
+
+                while time.time() - start_time < duration:
+                    if self._is_interrupted:
+                        sd.stop()
+                        break
+                    await asyncio.sleep(0.05)
 
             self._logger.debug("V3: played clip '%s' (no filter feed)", clip_path)
         except asyncio.CancelledError:

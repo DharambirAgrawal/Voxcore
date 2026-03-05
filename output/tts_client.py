@@ -236,6 +236,15 @@ class TTSClient:
         self._logger: logging.Logger = logging.getLogger("TTSClient")
         self._logger.info("Kokoro-ONNX TTS loaded (voice=%s)", voice_profile.voice_name)
 
+    def set_kokoro(self, kokoro: Kokoro) -> None:
+        """V4: Use a shared Kokoro model instead of loading a new one.
+
+        Called by PipelineInstance to replace the per-instance model with
+        the shared one from SharedResources. Saves ~300MB RAM per user.
+        """
+        self._kokoro = kokoro
+        self._logger.info("V4: Using shared Kokoro model")
+
     async def run(self) -> None:
         """Main loop — consume LLM_SPEECH_TOKEN events and synthesize audio.
 

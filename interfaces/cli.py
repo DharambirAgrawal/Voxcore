@@ -294,12 +294,12 @@ class CLIInterface:
         self._bus.subscribe(EventType.AGENT_JSON_OUT, self._on_agent_action)
         self._bus.subscribe(EventType.TOOL_RESULT_READY, self._on_tool_result)
 
-        # 3. Optional text-input loop
+        # 3. Text-input loop — always active so you can type while mic runs
+        asyncio.create_task(self._text_input_loop())
         if self._text_mode:
-            asyncio.create_task(self._text_input_loop())
-            print(f"{COLORS['BOLD']}Text mode. Type messages:{COLORS['RESET']}")
+            print(f"{COLORS['BOLD']}Text mode. Type messages (Enter to send, /help for commands):{COLORS['RESET']}")
         else:
-            print(f"{COLORS['BOLD']}Ready. Listening...{COLORS['RESET']}")
+            print(f"{COLORS['BOLD']}Ready. Listening... (type text + Enter to inject, /help for commands){COLORS['RESET']}")
 
         # 4. Block forever
         await asyncio.Event().wait()
@@ -325,9 +325,10 @@ class CLIInterface:
                     self._print_history()
                     continue
                 if line.startswith("/"):
-                    self._handle_command(line)
+                    await self._handle_command(line)
                     continue
-                # Normal text → publish as transcript
+                # Normal text → publish as transcript (as if user spoke it)
+                print(f"{COLORS['GREEN']}[CLI → user] {line}{COLORS['RESET']}")
                 await self._bus.publish(
                     EventType.TRANSCRIPT_READY,
                     {"text": line, "is_final": True, "source": "cli"},
@@ -432,8 +433,11 @@ class CLIInterface:
             print(f"  {i + 1}. [{role}] {text}")
         print(f"{COLORS['BOLD']}───────────────────────────{COLORS['RESET']}")
 
-    def _handle_command(self, command: str) -> None:
-        cmd = command.lower().strip()
+    async def _handle_command(self, command: str) -> None:
+        parts = command.strip().split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
         if cmd == "/status":
             self._print_status()
         elif cmd == "/history":
@@ -441,14 +445,45 @@ class CLIInterface:
         elif cmd == "/clear":
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
+        elif cmd == "/fetch":
+            # Directly test article_fetch with a URL
+            if not arg:
+                print(f"{COLORS['YELLOW']}Usage: /fetch <url> [instruction]{COLORS['RESET']}")
+                print(f"{COLORS['GRAY']}  Example: /fetch https://example.com/article{COLORS['RESET']}")
+                print(f"{COLORS['GRAY']}  Example: /fetch https://example.com/article summarize briefly{COLORS['RESET']}")
+                return
+            # Split URL from optional instruction
+            url_parts = arg.split(None, 1)
+            url = url_parts[0]
+            instruction = url_parts[1] if len(url_parts) > 1 else "summarize the article naturally in about 150 spoken words"
+            fake_user_msg = f"Can you read this article for me? {url}"
+            print(f"{COLORS['GREEN']}[CLI → user] {fake_user_msg}{COLORS['RESET']}")
+            print(f"{COLORS['GRAY']}  (instruction: {instruction}){COLORS['RESET']}")
+            await self._bus.publish(
+                EventType.TRANSCRIPT_READY,
+                {"text": fake_user_msg, "is_final": True, "source": "cli"},
+            )
+        elif cmd == "/search":
+            # Directly test web_search with a query
+            if not arg:
+                print(f"{COLORS['YELLOW']}Usage: /search <query>{COLORS['RESET']}")
+                print(f"{COLORS['GRAY']}  Example: /search latest news today{COLORS['RESET']}")
+                return
+            print(f"{COLORS['GREEN']}[CLI → user] {arg}{COLORS['RESET']}")
+            await self._bus.publish(
+                EventType.TRANSCRIPT_READY,
+                {"text": arg, "is_final": True, "source": "cli"},
+            )
         elif cmd in ("/help", "/?"):
             print(
                 f"{COLORS['BOLD']}Available commands:{COLORS['RESET']}\n"
-                "  /status   — Show current system state\n"
-                "  /history  — Show last 10 conversation turns\n"
-                "  /clear    — Clear terminal\n"
-                "  /help     — This message\n"
-                "  /quit     — Exit CLI"
+                "  /status    — Show current system state\n"
+                "  /history   — Show last 10 conversation turns\n"
+                "  /fetch URL [instruction] — Test article_fetch with a URL\n"
+                "  /search QUERY — Send a search query as user input\n"
+                "  /clear     — Clear terminal\n"
+                "  /help      — This message\n"
+                "  /quit      — Exit CLI"
             )
         elif cmd in ("/quit", "/exit"):
             pass  # handled in _text_input_loop
