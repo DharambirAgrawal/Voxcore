@@ -224,6 +224,10 @@ EMOTION_TAG_PATTERN = re.compile(r'\[(\w+)\]')
 CLIP_TAGS = frozenset({"laughs", "chuckles", "light_laugh", "sighs"})
 PAUSE_TAG = "..."  # [...] → 300ms silence insertion
 
+# ── V5: Session cache reference tags ────────────────────────────────────
+# [ref:sc_XXXX] tags are kept in working memory but stripped from TTS output
+REF_TAG_PATTERN = re.compile(r'\s*\[ref:sc_[a-f0-9_]+\]')
+
 
 class ResponseParser:
     """Real-time LLM output parser that splits speech and agent output."""
@@ -424,8 +428,15 @@ class ResponseParser:
         if not sentence:
             return
 
+        # ── V5: Strip [ref:sc_...] tags from TTS output ─────────────────
+        # These tags are kept in self._full_response (stored in working memory)
+        # but must NOT be spoken aloud.
+        tts_text = REF_TAG_PATTERN.sub("", sentence).strip()
+        if not tts_text:
+            return
+
         # Extract emotion tag if present
-        match = EMOTION_TAG_PATTERN.search(sentence)
+        match = EMOTION_TAG_PATTERN.search(tts_text)
         if match:
             tag = match.group(1)
             # Only set emotion if it's an actual emotion, not a clip tag
@@ -433,7 +444,7 @@ class ResponseParser:
                 self._current_emotion = tag
 
         await self.event_bus.publish(EventType.LLM_SPEECH_TOKEN, {
-            "text": sentence,
+            "text": tts_text,
             "sentence_index": self._sentence_index,
             "emotion": self._current_emotion,
         })

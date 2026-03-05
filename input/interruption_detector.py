@@ -212,9 +212,9 @@ class InterruptionDetector:
 
         # V3: Two-path Gate 1 configuration
         self._path_a_duration_ms: int = monitor_cfg.get("gate1_path_a_min_duration_ms", 150)
-        self._path_a_energy_ratio: float = monitor_cfg.get("gate1_path_a_energy_ratio", 8.0)
-        self._path_b_duration_ms: int = monitor_cfg.get("gate1_path_b_min_duration_ms", 600)
-        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 2.5)
+        self._path_a_energy_ratio: float = monitor_cfg.get("gate1_path_a_energy_ratio", 13.0)
+        self._path_b_duration_ms: int = monitor_cfg.get("gate1_path_b_min_duration_ms", 750)
+        self._path_b_energy_ratio: float = monitor_cfg.get("gate1_path_b_energy_ratio", 6.0)
 
         # Legacy single-path fallback (when monitor disabled)
         self._interrupt_duration_ms: int = (
@@ -222,14 +222,26 @@ class InterruptionDetector:
             if self._monitor_enabled
             else 300
         )
-        self._energy_multiplier: float = 2.5
+        # Entry gate: noise_floor × this must be exceeded before any
+        # accumulation window opens. Configurable so room conditions
+        # can be tuned without code changes.
+        self._energy_multiplier: float = monitor_cfg.get("gate1_entry_multiplier", 4.0)
 
         # ── Cooldown ─────────────────────────────────────────────────────
         self._state_cooldown_ms: float = 500.0
 
         self._speech_detected_at: float = 0.0
         self._last_speech_at: float = 0.0       # last frame with prob > threshold
-        self._speech_hold_ms: float = 400.0     # hold window: natural pauses between words
+        self._speech_hold_ms: float = 1200.0    # hold window: natural pauses between words
+                                                 # (raised 400→1200ms: V5 echo correlation can
+                                                 #  block user+echo mixed frames for 400-800ms
+                                                 #  causing premature accumulation reset.
+                                                 #  1200ms gives real speech time to punch through
+                                                 #  the echo without the timer expiring.
+                                                 #  Pure echo still expires after 1200ms of only
+                                                 #  echo-blocked frames — no false fire since a
+                                                 #  non-echo frame at ≥7× is needed to actually
+                                                 #  trigger Path A.)
         self._speaking_since: float = 0.0
         self._audio_queue: asyncio.Queue = None
 
@@ -405,12 +417,35 @@ class InterruptionDetector:
             # ── Echo guard: skip AI's own voice (raw consumer + query filters) ──
             # InterruptionDetector uses add_raw_consumer() so upstream echo
             # filtering does not apply here. Call mic_stream.check_echo() to
-            # query the same AriaVoiceFilter + Gate0 directly.
-            # Reset the duration timer on echo so trailing edge doesn't
-            # accumulate and trigger a false Gate 1 fire.
+            # query the same AriaVoiceFilter + Gate0 + V5 playback-ref directly.
+            #
+            # IMPORTANT: During a real interrupt the mic captures a MIX of user
+            # voice + TTS echo.  Some 30ms frames will have high enough echo
+            # correlation to trip V5 / Gate0 even though the user IS speaking.
+            # Hard-resetting the accumulation timer on every echo frame prevents
+            # the two-path system from ever reaching 150ms / 750ms.
+            #
+            # Fix: during an active accumulation window, don't hard-reset.
+            # Just skip the frame (don't advance timers).  The existing 400ms
+            # speech-hold window will naturally expire and reset if only echo
+            # is present (no real speech frames refreshing _last_speech_at).
             if self.mic_stream.check_echo(chunk):
-                self._speech_detected_at = 0.0
-                self._last_speech_at = 0.0
+                if self._speech_detected_at > 0 and self._last_speech_at > 0:
+                    # Active accumulation — check hold window instead of hard reset
+                    gap_ms = (now - self._last_speech_at) * 1000.0
+                    if gap_ms > self._speech_hold_ms:
+                        # No real speech for 400ms+ during echo → probably just echo
+                        self._logger.debug(
+                            "Echo during accumulation: hold window expired (%.0fms) — reset",
+                            gap_ms,
+                        )
+                        self._speech_detected_at = 0.0
+                        self._last_speech_at = 0.0
+                    else:
+                        self._logger.debug(
+                            "Echo frame skipped during active accumulation (hold %.0fms)",
+                            gap_ms,
+                        )
                 continue
 
             # ── Passed energy gate — check VAD + duration ────────────────

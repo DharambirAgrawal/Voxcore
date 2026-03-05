@@ -355,6 +355,12 @@ from brain.interrupt_router import InterruptRouter
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 from memory.compressor import MemoryCompressor
+from memory.fact_store import FactStore
+from memory.procedural import ProceduralStore
+from memory.session_cache import SessionCache
+from memory.background_llm import BackgroundLLM
+from memory.loader import MemoryLoader
+from memory.retriever import MemoryRetriever
 
 from safety.guard import SafetyGuard
 
@@ -551,16 +557,44 @@ async def initialize_system(
     )
 
     # ── Memory ───────────────────────────────────────────────────────────────
+    mem_cfg = config.get("memory", {})
     short_term_memory = ShortTermMemory(
         event_bus=event_bus,
-        max_turns=config.get("memory", {}).get("short_term_turns", 20),
+        max_turns=mem_cfg.get("short_term_turns", 20),
     )
     long_term_memory = LongTermMemory(
-        event_bus=event_bus, config=config.get("memory")
+        event_bus=event_bus, config=mem_cfg
     )
 
     compressor = MemoryCompressor(
-        event_bus=event_bus, llm_client=llm_client
+        event_bus=event_bus,
+        short_term=short_term_memory,
+        long_term=long_term_memory,
+        config=config,
+    )
+
+    # V5: New memory tiers
+    fact_store = FactStore(config=config)
+    procedural = ProceduralStore(config=config)
+    session_cache = SessionCache()
+    background_llm = BackgroundLLM(config=config)
+    loader = MemoryLoader(
+        fact_store=fact_store,
+        procedural=procedural,
+        long_term=long_term_memory,
+        config=mem_cfg,
+    )
+    retriever = MemoryRetriever(
+        short_term=short_term_memory,
+        long_term=long_term_memory,
+        fact_store=fact_store,
+    )
+
+    # V5: Register new tools that need memory components
+    tool_router.set_memory_components(
+        session_cache=session_cache,
+        retriever=retriever,
+        config=config,
     )
 
     # ── Safety ───────────────────────────────────────────────────────────────
@@ -612,21 +646,32 @@ async def initialize_system(
     # ── Long-term memory: always initialize for MEMORY_COMPRESSED subscription ──
     try:
         await long_term_memory.initialize()
+
+        # V5: Initialize SQLite stores
+        await fact_store.initialize()
+        await procedural.initialize()
+
         mem_cfg = config.get("memory", {})
         if mem_cfg.get("long_term_enabled", False):
-            # Query for recent conversations to restore context
-            past = await long_term_memory.query(
-                "user name preferences conversation summary", top_k=3
-            )
-            if past:
-                # Inject restored context into session compressed_summary
-                restored = "\n".join(item["content"] for item in past)
-                session.compressed_summary = restored
+            # V5: Build session-start memory block from all stores
+            memory_block = await loader.build_session_block()
+            if memory_block:
+                prompt_builder.set_memory_block(memory_block)
                 logger.info(
-                    "Restored %d context items from long-term memory", len(past)
+                    "Session memory block set (%d chars, ~%d tokens)",
+                    len(memory_block), len(memory_block) // 4,
                 )
     except Exception as exc:
-        logger.warning("Could not initialize long-term memory: %s", exc)
+        logger.warning("Could not initialize memory system: %s", exc)
+
+    # V5: Wire memory components to TurnManager for background extraction
+    turn_manager.set_memory_components(
+        background_llm=background_llm,
+        short_term=short_term_memory,
+        fact_store=fact_store,
+        procedural=procedural,
+        long_term=long_term_memory,
+    )
 
     logger.info("All modules initialized.")
 
@@ -657,6 +702,12 @@ async def initialize_system(
         "short_term_memory": short_term_memory,
         "long_term_memory": long_term_memory,
         "compressor": compressor,
+        "fact_store": fact_store,
+        "procedural": procedural,
+        "session_cache": session_cache,
+        "background_llm": background_llm,
+        "loader": loader,
+        "retriever": retriever,
         "safety_guard": safety_guard,
         # V3: New modules
         "aria_filter": aria_filter,
@@ -808,6 +859,22 @@ async def shutdown(modules: dict[str, Any]) -> None:
             await ltm.save_session(session)
     except Exception as exc:
         logger.warning("Long-term memory save error: %s", exc)
+
+    # V5: Flush remaining turns via compressor
+    try:
+        compressor = modules.get("compressor")
+        if compressor and hasattr(compressor, "compress_session_end"):
+            await compressor.compress_session_end()
+    except Exception as exc:
+        logger.warning("Session-end compression error: %s", exc)
+
+    # V5: Clear session cache (RAM only, no persistence needed)
+    try:
+        sc = modules.get("session_cache")
+        if sc:
+            sc.clear()
+    except Exception as exc:
+        logger.warning("Session cache clear error: %s", exc)
 
     # Close mic stream
     try:

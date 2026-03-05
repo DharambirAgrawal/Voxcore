@@ -8,11 +8,12 @@ A black box you speak into. It speaks back. It understands, reasons, acts, and n
 ## ✨ Features
 
 - **Full-duplex conversation**: Simulated via VAD + interrupt handling.
+- **Five-layer echo suppression**: RNNoise → AriaVoiceFilter → Gate 0 spectral check → V5 playback reference cross-correlation → Gate 1 energy thresholds. Prevents AI speech from triggering false interrupts.
 - **Backchanneling**: Simulated natural conversational cues (e.g., "uh-huh", "go on") via a parallel track.
 - **Agentic JSON output**: Emits JSON tool calls dynamically based on voice requests.
 - **Text-in injection**: Inject real-time external data (e.g., tool results, notifications) effortlessly into the ongoing conversation.
-- **Tool calling / agent tasks**: LLM is equipped to trigger async tool execution.
-- **Memory across sessions**: Powered by ChromaDB for persistent, long-term memory.
+- **Tool calling / agent tasks**: LLM is equipped to trigger async tool execution (web search, article fetch, memory recall, session cache Q&A).
+- **Five-tier memory system**: Working memory (RAM deque) → Session cache (RAM dict) → Fact store (SQLite) → Procedural store (SQLite) → Long-term (ChromaDB with typed entries and re-ranking). Background LLM extracts facts and procedures automatically.
 - **Free to run**: Leverages Groq’s free-tier models natively.
 - **Emotional TTS tags**: Expressive speech via prompt emotion tagging (e.g., `[cheerful]`, `[sad]`).
 

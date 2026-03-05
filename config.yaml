@@ -121,15 +121,21 @@ speaking_monitor:
   enabled: true                        # Enable/disable the speaking monitor
   model: "llama-3.1-8b-instant"       # LLM model for semantic interrupt classification (Gate 3)
   # ── V3: Two-path Gate 1 ──
+  gate1_entry_multiplier: 4.0           # Entry gate: rms must exceed noise_floor × this before
+                                       # entering any accumulation window (replaces hardcoded 2.5).
+                                       # Raise this first if echo leaks through on a quiet mic.
   gate1_path_a_min_duration_ms: 150    # Path A: HIGH_ENERGY_BURST — short, loud (shout/command)
-  gate1_path_a_energy_ratio: 8         # Path A: 8× noise floor required
+  gate1_path_a_energy_ratio: 7         # Path A: 7× noise floor required
+                                       # (lowered 13→7: echo-timer-reset bug fixed;
+                                       #  echo frames no longer accumulate duration.
+                                       #  V5 correlation + hold-window handle echo.)
   gate1_path_b_min_duration_ms: 750    # Path B: NORMAL_SPEECH — sustained, moderate
                                        # (raised 600→750: echo pops are shorter than speech)
-  gate1_path_b_energy_ratio: 4.5       # Path B: 5.0× noise floor required
-                                       # (raised 3→5.0: observed echo ceiling=4.6×, observed
-                                       #  real-speech floor=5.3×; 5.0 sits in the middle of
-                                       #  the 0.7× gap, safely blocking echo without clipping
-                                       #  genuine user speech)
+  gate1_path_b_energy_ratio: 3.5       # Path B: 3.5× noise floor required
+                                       # (lowered 6.0→3.5: echo-timer-reset bug fixed;
+                                       #  normal speech at conversational volume sits
+                                       #  at ~5-6×, echo frames are now skipped not
+                                       #  accumulated, so 3.5× is safe and accessible)
   # ── Gate 2/3 ──
   gate2_filler_list: []                # Gate 2: additional filler words
   gate3_debounce_s: 1.5                # Gate 3: min seconds between LLM calls
@@ -156,6 +162,11 @@ echo_suppression:
                                        # (raised 80→400: covers inter-sentence synthesis
                                        #  gaps and room echo tail after each sentence)
   gate0_ema_alpha: 0.1                 # EMA smoothing for TTS spectrum fingerprint
+  # Layer 4 (V5): Playback reference correlation
+  playback_correlation_threshold: 0.45  # Peak normalised cross-correlation above this → echo
+                                       # Works on 30ms mic chunks (unlike AriaFilter which
+                                       # needs 200ms). Catches echo that AriaFilter misses.
+                                       # 0.45: pure echo ≈ 0.6–0.9, user+echo ≈ 0.2–0.35
   # Startup warmup
   warmup_text: "Hello, how are you doing today? I hope you're having a wonderful day."
 
@@ -190,12 +201,28 @@ backchannel:
     - understood
 
 memory:
+  # Working memory
   short_term_turns: 20               # Number of recent turns to keep in rolling window
   compress_after_turns: 20           # Trigger compression when history exceeds this count
+
+  # ChromaDB — keep existing path
   long_term_enabled: true            # Enable/disable ChromaDB persistent memory
-  long_term_db: "./data/memory.db"   # ChromaDB persistent storage path
-  retrieval_top_k: 5                 # Number of past memory chunks to retrieve at session start
+  long_term_db: "./data/memory.db"   # ChromaDB persistent storage path — do not change
+  retrieval_top_k: 5                 # Number of past memory chunks to retrieve
   embedding_model: "default"         # ChromaDB default embedding or custom model name
+  similarity_threshold: 0.65         # Minimum similarity for recall results
+
+  # New SQLite stores
+  fact_store_db: "data/memory/facts.db"
+  procedural_db: "data/memory/procedural.db"
+
+  # Session-start loader
+  loader_max_tokens: 350             # Hard cap on session-start memory block
+  relationship_recency_days: 14      # Only load relationships mentioned within N days
+  reminder_window_days: 7            # Only load reminders expiring within N days
+
+  # Background LLM
+  background_enabled: true           # Set false to disable during testing
 
 agent:
   enabled: true                      # Enable/disable agentic tool execution
@@ -205,6 +232,8 @@ agent:
   tools:                             # List of enabled tool names (must match files in agent/tools/)
     - web_search
     - article_fetch
+    - memory_recall                  # V5: Search past sessions / user facts
+    - session_cache_qa               # V5: QA over cached content from this session
 
   web_search:                        # Tool-specific config
     default_num_results: 5

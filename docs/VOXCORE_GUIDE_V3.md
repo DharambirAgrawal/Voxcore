@@ -16,6 +16,7 @@ Memory improvements (fact_store, extractor, retrieval re-ranking) are deferred t
 |---|---|
 | **Startup warmup** | Aria's voice synthesized silently at boot — AriaVoiceFilter + Gate 0 both pre-warmed before first word. Zero gap. |
 | **Gate 0 (new)** | Spectral + temporal echo check runs before Gate 1. Catches loud echo residual that survived denoiser + AriaVoiceFilter. |
+| **Layer 4 — V5 playback ref correlation (new)** | Cross-correlates mic chunks against recently played TTS audio. Works on 30ms chunks (unlike AriaFilter's 200ms minimum). Catches echo that AriaFilter misses for InterruptionDetector's raw consumer path. |
 | **Neural echo removal** | `denoiser` + `AriaVoiceFilter` — before VAD, works on all hardware, any room |
 | **Full PAUSE on PENDING** | TTS fully stops at PENDING — not ducked |
 | **Instant filler at PENDING** | Pre-generated clip plays immediately while Gate 3 classifies in background |
@@ -55,9 +56,9 @@ VoxCore is a **voice-first, full-duplex conversational AI**. The user can speak 
 
 | Feature | Description |
 |---|---|
-| **Four-layer echo suppression** | denoiser → AriaVoiceFilter → Gate 0 — each layer catches what the previous missed |
+| **Five-layer echo suppression** | denoiser → AriaVoiceFilter → Gate 0 → V5 playback reference correlation — each layer catches what the previous missed |
 | **Zero-gap warmup** | All echo protection layers pre-warmed at startup — fully ready before first word |
-| **Two-path Gate 1** | Short commands (~150ms) on Path A; conversational speech at 600ms on Path B |
+| **Two-path Gate 1** | Short commands (~150ms) on Path A (13× energy); sustained speech at 750ms on Path B (6.0× energy). Entry gate at 4.0× noise floor. |
 | **Instant filler at PENDING** | Pre-generated clip plays within ~3ms of Gate 2 pass — fills silence while Gate 3 classifies |
 | **VAD-end Gate 3 action** | Gate 3 reads early but only acts when user finishes speaking — prevents loop |
 | **PAUSED state** | TTS frozen in RAM — resumes without LLM if user says "go ahead" |
@@ -81,6 +82,7 @@ VoxCore is a **voice-first, full-duplex conversational AI**. The user can speak 
 | Echo layer 1 | denoiser (local) | Free, CPU |
 | Echo layer 2 | AriaVoiceFilter / resemblyzer (local) | Free, CPU |
 | Echo layer 3 | Gate 0 spectral check (local) | Free, CPU, ~0.5ms |
+| Echo layer 4 | V5 playback reference correlation (local) | Free, CPU, ~1ms |
 | Memory | ChromaDB (local) | Free |
 | Safety | Groq Llama Guard 4 | Free tier |
 
@@ -122,9 +124,16 @@ VoxCore is a **voice-first, full-duplex conversational AI**. The user can speak 
                                     YES → drop (echo residual)
                                     NO  → continue
                                          │
+                                    V5 — Playback ref correlation
+                                         (~1ms, only SPEAKING)
+                                    Cross-correlate mic chunk against
+                                    recently played TTS audio buffer
+                                    Peak correlation > 0.45 → drop
+                                    NO  → continue
+                                         │
                                     GATE 1 — Energy + Duration
-                                    Path A (150ms, 8× energy) or
-                                    Path B (600ms, 3× energy) or DROP
+                                    Path A (150ms, 13× energy) or
+                                    Path B (750ms, 6.0× energy) or DROP
                                          │
                                     GATE 2 — Filler word check
                                     Filler → FILLER_REACTION, drop
@@ -203,7 +212,7 @@ voxcore/
 │   └── turn_manager.py                  # [UPDATED] — PAUSED logic, routing
 │
 ├── input/
-│   ├── mic_stream.py                    # [UPDATED] — denoiser + gate0 + scoped filter
+│   ├── mic_stream.py                    # [UPDATED] — denoiser + gate0 + V5 playback ref correlation
 │   ├── aria_voice_filter.py             # [NEW] — resemblyzer, self-learning
 │   ├── gate0_echo_check.py              # [NEW] — spectral + temporal echo gate
 │   ├── vad.py                           # unchanged — receives clean audio only
@@ -215,24 +224,32 @@ voxcore/
 │
 ├── brain/
 │   ├── llm_client.py                    # unchanged
-│   ├── prompt_builder.py                # [UPDATED] — yield + emotional rules
-│   ├── response_parser.py               # [UPDATED] — inject_point tracking
+│   ├── prompt_builder.py                # [UPDATED] — memory block injection, [ref:] handling
+│   ├── response_parser.py               # [UPDATED] — [ref:sc_...] stripping, inject_point
 │   ├── interrupt_router.py              # [NEW] — all 7 sub-type actions
 │   ├── emotion_tagger.py                # unchanged
-│   └── router.py                        # unchanged
+│   └── router.py                        # [UPDATED] — background_llm.create_task()
 │
 ├── output/
 │   ├── tts_client.py                    # [UPDATED] — pause/resume + synthesize_silent()
-│   ├── audio_player.py                  # [UPDATED] — pause/resume/flush, filter control
+│   ├── audio_player.py                  # [UPDATED] — pause/resume/flush, filter control,
+│   │                                    #   V5 playback ref feeding + clearing
 │   ├── voice_profile.py                 # unchanged
 │   └── pre_pause_clips/                 # [NEW]
 │       ├── breath.wav                   # ~200ms soft breath
 │       └── mm.wav                       # ~300ms acknowledgment
 │
-├── memory/                              # unchanged in v3 — deferred to v4
-│   ├── short_term.py
-│   ├── long_term.py
-│   └── compressor.py
+├── memory/                              # [REBUILT v3.6] — five-tier memory system
+│   ├── __init__.py                      # [UPDATED] — exports all new classes
+│   ├── short_term.py                    # Tier 1: RAM deque, 20 turns + emotions
+│   ├── session_cache.py                 # [NEW] Tier 2: RAM dict, full tool results
+│   ├── fact_store.py                    # [NEW] Tier 3: SQLite, permanent user facts
+│   ├── procedural.py                    # [NEW] Tier 4: SQLite, instructions/reminders
+│   ├── long_term.py                     # [UPDATED] Tier 5: ChromaDB, typed + re-ranked
+│   ├── compressor.py                    # [UPDATED] — bug fix: clears working memory
+│   ├── background_llm.py                # [NEW] — fire-and-forget extraction
+│   ├── loader.py                        # [NEW] — session-start memory block assembly
+│   └── retriever.py                     # [NEW] — parallel recall across all tiers
 │
 ├── safety/
 │   └── guard.py                         # unchanged
@@ -250,6 +267,19 @@ voxcore/
 │       ├── light_laugh.wav
 │       └── sighs.wav
 │
+├── agent/
+│   ├── __init__.py
+│   ├── text_out.py                      # Parses <agent> JSON tags
+│   ├── tool_router.py                   # [UPDATED] — memory_recall + session_cache_qa
+│   ├── slow_llm.py                      # Background heavy model calls
+│   └── tools/
+│       ├── __init__.py
+│       ├── base_tool.py                 # Abstract base for all tools
+│       ├── web_search.py                # Tavily / DuckDuckGo
+│       ├── article_fetch.py             # [UPDATED] — session cache integration
+│       ├── memory_recall.py             # [NEW] — search across memory tiers
+│       └── session_cache_qa.py          # [NEW] — QA over cached content
+│
 └── interfaces/
     ├── cli.py
     ├── websocket_server.py
@@ -258,11 +288,11 @@ voxcore/
 
 ---
 
-## 3. Echo Suppression — Four Layers
+## 3. Echo Suppression — Five Layers
 
 The mic picks up a mix during SPEAKING: Aria's voice from the speaker (echo), room reflections, and background noise. Echo must be removed before it reaches Gate 1. If it reaches Gate 1 with high energy, it can pass all the way to Gate 3, get classified as INJECT or INTERRUPT, and break the conversation.
 
-Four independent layers each catch what the previous one missed.
+Five independent layers each catch what the previous one missed.
 
 ### Why Previous Approaches Failed
 
@@ -460,7 +490,92 @@ class Gate0EchoCheck:
 **Why exponential moving average for the TTS spectrum:**
 A simple last-chunk approach would only represent what Aria just said. The EMA weights recent chunks more but keeps a memory of the last few seconds. This means Gate 0 correctly identifies echo even when the room reverb includes reflections from a few sentences ago.
 
-**File:** `input/mic_stream.py` — the complete processing chain:
+### Layer 4 — V5 Playback Reference Correlation (During SPEAKING Only)
+
+**The problem Layers 2 and 3 leave unsolved:**
+
+AriaVoiceFilter (`is_aria_echo()`) requires `len(chunk) >= 3200` samples (200ms of audio at 16kHz). But InterruptionDetector's raw mic consumer receives chunks of only 480 samples (30ms). AriaVoiceFilter **never fires** for the InterruptionDetector path. Gate 0's spectral check at 0.92 threshold is unreliable through acoustic path distortion. Result: echo leaks through to Gate 1, causing false interrupts during AI speech.
+
+**The solution:** Cross-correlate each mic chunk against a rolling buffer of recently played TTS audio.
+
+**File:** `input/mic_stream.py` — new methods:
+
+```python
+# Constructor additions:
+self._playback_ref: collections.deque = collections.deque(maxlen=8000)  # ~500ms at 16kHz
+self._playback_ref_lock: threading.Lock = threading.Lock()
+self._playback_corr_threshold: float = config.get("playback_correlation_threshold", 0.45)
+
+def feed_playback_reference(self, chunk: np.ndarray):
+    """Called by AudioPlayer per frame during real TTS playback.
+    Extends the rolling reference buffer with resampled 16kHz TTS audio."""
+    with self._playback_ref_lock:
+        self._playback_ref.extend(chunk.astype(np.float32).tolist())
+
+def clear_playback_reference(self):
+    """Called when TTS stops (pause/flush/playback-end). Clears stale reference."""
+    with self._playback_ref_lock:
+        self._playback_ref.clear()
+
+def _check_playback_correlation(self, mic_chunk: np.ndarray) -> bool:
+    """Normalized cross-correlation of mic chunk against reference buffer.
+    Pure echo correlates at 0.6–0.9; user speaking over echo drops to ~0.25–0.35.
+    Returns True if peak correlation exceeds threshold (echo detected)."""
+    with self._playback_ref_lock:
+        if len(self._playback_ref) < len(mic_chunk):
+            return False
+        ref = np.array(self._playback_ref, dtype=np.float32)
+    mic = mic_chunk.astype(np.float32)
+    mic_power = float(np.dot(mic, mic))
+    if mic_power < 1e-8:
+        return False
+    # Sliding window correlation using cumsum for efficiency
+    corr = np.correlate(ref, mic, mode='valid')
+    cum = np.cumsum(np.concatenate(([0.0], ref ** 2)))
+    seg_len = len(mic)
+    seg_power = cum[seg_len:] - cum[:len(corr)]
+    denom = np.sqrt(seg_power * mic_power) + 1e-12
+    norm_corr = corr / denom
+    return float(np.max(np.abs(norm_corr))) > self._playback_corr_threshold
+```
+
+**How it's called in `check_echo()`:**
+
+```python
+def check_echo(self, chunk) -> bool:
+    # V5: Playback reference correlation — works on 30ms chunks
+    if self._check_playback_correlation(chunk):
+        return True
+    # Layer 2: AriaVoiceFilter (needs 200ms — may not fire on short chunks)
+    if self._aria_filter and self._aria_filter.is_aria_echo(chunk):
+        return True
+    # Layer 3: Gate 0 spectral check
+    if self._gate0 and self._gate0.is_echo(chunk):
+        return True
+    return False
+```
+
+**How AudioPlayer feeds the reference:**
+
+```python
+# In audio_player._play_audio(), after existing AriaFilter + Gate0 feeds:
+self._mic_stream.feed_playback_reference(feed_frame)
+
+# In audio_player.pause(), flush(), and _playback_loop finally:
+self._mic_stream.clear_playback_reference()
+```
+
+**Why this works:**
+
+| Scenario | Peak Correlation | Result |
+|---|---|---|
+| Pure echo (user silent) | 0.6–0.9 | **Blocked** (above 0.45) |
+| User speaking over echo | 0.2–0.35 | **Passes** (below 0.45) |
+| User speaking, no echo | ~0.0 | **Passes** |
+
+The playback reference buffer holds ~500ms of recently played TTS audio (8000 samples at 16kHz). This is enough to catch echo at any reasonable room delay. When TTS stops (pause/flush/end), the buffer is cleared immediately to prevent stale data from blocking real user speech.
+
+**File:** `input/mic_stream.py` — the complete processing chain (updated):
 
 ```python
 async def _process_chunk(self, raw: bytes) -> bytes | None:
@@ -472,7 +587,7 @@ async def _process_chunk(self, raw: bytes) -> bytes | None:
         clean = self._enhancer(audio)[0]
     clean_np = (clean.squeeze().numpy() * 32768).astype('int16')
 
-    # --- Layers 2 + 3: Only during SPEAKING (filter_active=True) ---
+    # --- Layers 2 + 3 + 4: Only during SPEAKING (filter_active=True) ---
     if self._filter_active:
 
         # Layer 2: AriaVoiceFilter — speaker identity check
@@ -480,15 +595,15 @@ async def _process_chunk(self, raw: bytes) -> bytes | None:
             return None   # sounds like Aria → drop
 
         # Layer 3: Gate 0 — spectral echo check
-        # Catches loud echo residual that survived Layer 2
         if self._gate0.is_echo(clean_np):
             return None   # spectrally matches recent TTS → drop
 
-    return clean_np.tobytes()
+    # --- Raw consumer path uses check_echo() which includes Layer 4 ---
+    # InterruptionDetector's raw consumer calls check_echo(chunk)
+    # which runs V5 playback correlation first (works on 30ms chunks),
+    # then falls back to AriaVoiceFilter + Gate 0
 
-def set_filter_active(self, active: bool):
-    """Called by AudioPlayer. True = TTS real speech playing. False = stopped."""
-    self._filter_active = active
+    return clean_np.tobytes()
 ```
 
 ---
@@ -613,17 +728,30 @@ Catches loud echo residual that survived denoiser and AriaVoiceFilter. Two check
 
 ```
 Check 1 — Temporal:
-  Was a TTS chunk played in the last 80ms?
+  Was a TTS chunk played in the last 400ms?
   YES → almost certainly echo → drop
-  (Echo cannot arrive before it was played. 80ms covers room travel time.)
+  (400ms covers inter-sentence synthesis gaps and room echo tail.)
 
 Check 2 — Spectral:
   Does mic chunk's frequency profile match rolling TTS spectrum EMA?
-  Cosine similarity > 0.85 → spectrally matches Aria's voice → drop
-  (Room acoustics change amplitude, not frequency profile)
+  Cosine similarity > 0.92 → spectrally matches Aria's voice → drop
+  (Raised from 0.85 to 0.92 with full 257-bin FFT for precision.)
 ```
 
-If either check returns True → drop chunk. Gate 1 never sees it.
+If either check returns True → drop chunk.
+
+### V5 Layer — Playback Reference Correlation (Before Gate 1)
+
+**File:** `input/mic_stream.py` (documented in Section 3)
+
+Catches echo that passes Gate 0 by cross-correlating mic audio against recently played TTS. Works on 30ms chunks — critical for InterruptionDetector's raw consumer path where AriaVoiceFilter's 200ms minimum means it never fires.
+
+```
+Peak normalized cross-correlation > 0.45 → echo → drop
+(Pure echo: 0.6–0.9, user+echo: 0.2–0.35)
+```
+
+If correlation exceeds threshold → drop chunk. Gate 1 never sees it.
 
 ### Gate 1 — Two Paths (Energy + Duration)
 
@@ -631,17 +759,26 @@ If either check returns True → drop chunk. Gate 1 never sees it.
 
 After echo is removed, what remains is genuine audio from the room. Gate 1 separates real user speech from incidental sounds (coughs, bumps, distant noise).
 
+**Entry gate:** Before entering any accumulation window, chunk RMS must exceed `noise_floor × 4.0` (configurable via `gate1_entry_multiplier`). This prevents low-energy echo residual from even starting the accumulation timer.
+
 ```
 PATH A — High Energy Burst
   Catches: "stop!", "no!", "wait!" — short sharp command words
-  Trigger: energy > noise_floor × 8  AND  duration ≥ 150ms
+  Trigger: energy > noise_floor × 13  AND  duration ≥ 150ms
   Next: skip Gate 2 (urgency — don't risk dropping command as filler)
         go straight to Gate 3 with urgency_hint=True
 
+  (Threshold raised 8→13: observed echo ceiling was 8.6×;
+   real near-field speech easily exceeds 20×)
+
 PATH B — Normal Conversational Speech
   Catches: questions, sentences, explanations
-  Trigger: duration ≥ 600ms  AND  energy > noise_floor × 3
+  Trigger: duration ≥ 750ms  AND  energy > noise_floor × 6.0
   Next: proceed to Gate 2
+
+  (Duration raised 600→750ms: echo bursts are shorter than real speech.
+   Threshold raised 3→6.0: observed echo ceiling was 4.9×;
+   real speech is comfortably above 6×)
 
 DROP
   Everything else: coughs, bumps, breaths, residual sounds
@@ -655,10 +792,14 @@ def check(self, chunk: bytes, duration_ms: int) -> str:
     rms = compute_rms(chunk)
     ratio = rms / (self._noise_floor + 1e-8)
 
-    if duration_ms >= 150 and ratio > 8.0:
+    # Entry gate: must exceed noise floor × entry_multiplier
+    if ratio < self._energy_multiplier:  # default 4.0
+        return "DROP"
+
+    if duration_ms >= 150 and ratio > 13.0:
         return "HIGH_ENERGY_BURST"
 
-    if duration_ms >= 600 and ratio > 3.0:
+    if duration_ms >= 750 and ratio > 6.0:
         return "NORMAL_SPEECH"
 
     return "DROP"
@@ -1087,11 +1228,14 @@ Result injected → next primary LLM call
 
 ### Built-in Tools
 
-| Tool | Key Params |
-|---|---|
-| `web_search` | `query` |
-| `memory` | `operation` (read/write), `content` or `query` |
-| `calendar` | `action` (create/list/delete), `title`, `event_time` |
+| Tool | Key Params | Output |
+|---|---|---|
+| `web_search` | `query` | Result text → main LLM synthesizes spoken response |
+| `article_fetch` | `url`, `instruction` | Spoken summary → TTS directly; full text → session cache |
+| `memory_recall` | `query`, optional `memory_type` | Facts/episodic results → main LLM synthesizes |
+| `session_cache_qa` | `cache_id`, `question` | Answer from cached content → TTS directly |
+
+**New in v3.6:** `memory_recall` searches across the five-tier memory system (fact store, procedural, long-term ChromaDB). `session_cache_qa` answers follow-up questions about articles or search results from the current session using the RAM session cache — no re-fetch needed, ~250ms latency.
 
 ---
 
@@ -1173,27 +1317,35 @@ echo_suppression:
   aria_similarity_threshold: 0.75       # cosine similarity above = Aria echo
 
   # Layer 3 — Gate 0
-  gate0_spectral_threshold: 0.85        # cosine similarity above = TTS echo
-  gate0_temporal_gate_ms: 80            # ms since last TTS chunk → drop as echo
+  gate0_spectral_threshold: 0.92        # cosine similarity above = TTS echo
+                                        # (raised 0.85→0.92: 257-bin FFT for precision)
+  gate0_temporal_gate_ms: 400           # TTS played < N ms ago → echo
+                                        # (raised 80→400: covers inter-sentence gaps)
   gate0_ema_alpha: 0.1                  # EMA weight for spectral fingerprint
 
+  # Layer 4 — V5 Playback reference correlation
+  playback_correlation_threshold: 0.45  # Peak cross-correlation above this = echo
+                                        # Pure echo: 0.6–0.9, user+echo: 0.2–0.35
+                                        # Works on 30ms chunks (unlike AriaFilter's 200ms)
+
   # Startup warmup
-  warmup_text: >
-    Hello, I am getting ready for our conversation.
-    Just a moment while I initialize.
-    Almost ready now, thank you for waiting.
+  warmup_text: "Hello, how are you doing today? I hope you're having a wonderful day."
 
 speaking_monitor:
   enabled: true
-  model: "allam-2-7b"
+  model: "llama-3.1-8b-instant"          # Gate 3 classifier (was allam-2-7b)
+
+  # Gate 1 — Entry gate
+  gate1_entry_multiplier: 4.0            # RMS must exceed noise_floor × this
+                                         # before any accumulation starts
 
   # Gate 1 — Path A (short command words)
   gate1_path_a_min_duration_ms: 150
-  gate1_path_a_energy_multiplier: 8.0
+  gate1_path_a_energy_ratio: 13          # 13× noise floor (raised from 8×)
 
   # Gate 1 — Path B (normal speech)
-  gate1_path_b_min_duration_ms: 600
-  gate1_path_b_energy_multiplier: 3.0
+  gate1_path_b_min_duration_ms: 750      # (raised from 600ms)
+  gate1_path_b_energy_ratio: 6.0         # 6.0× noise floor (raised from 3×)
 
   # Gate 2
   gate2_filler_list:
@@ -1236,20 +1388,38 @@ backchannel:
     same_topic_redirect: "sure.wav"
 
 memory:
+  # Working memory (Tier 1)
   short_term_turns: 20
   compress_after_turns: 20
+
+  # ChromaDB long-term (Tier 5)
   long_term_enabled: true
-  long_term_db: "./data/chromadb/"
+  long_term_db: "./data/memory.db"
   retrieval_top_k: 5
+  embedding_model: "default"
+  similarity_threshold: 0.65
+
+  # SQLite stores (Tiers 3 & 4)
+  fact_store_db: "data/memory/facts.db"     # Tier 3: permanent user facts
+  procedural_db: "data/memory/procedural.db" # Tier 4: instructions & reminders
+
+  # Session-start loader
+  loader_max_tokens: 350             # Hard cap on memory block in system prompt
+  relationship_recency_days: 14
+  reminder_window_days: 7
+
+  # Background LLM extraction
+  background_enabled: true
 
 agent:
   enabled: true
-  max_concurrent_tools: 3
+  max_concurrent_tools: 2
   tool_timeout_s: 30
   tools:
     - web_search
-    - memory
-    - calendar
+    - article_fetch
+    - memory_recall                  # Search past sessions / user facts
+    - session_cache_qa               # QA over cached content this session
 
 safety:
   enabled: true
@@ -1338,15 +1508,23 @@ audio_player signals: set_filter_active(False)
 
 ```
 Aria speaking, echo hits mic
+
+FILTERED CONSUMER PATH (VAD/STT):
   → denoiser: removes most of it (Layer 1)
   → AriaVoiceFilter: similarity > 0.75 → drop (Layer 2)
+  If echo residual survives Layer 2:
+    → Gate 0 temporal: TTS chunk played < 400ms ago → drop (Layer 3)
+    OR
+    → Gate 0 spectral: similarity to TTS EMA > 0.92 → drop (Layer 3)
 
-If echo residual survives Layer 2:
-  → Gate 0 temporal: TTS chunk played < 80ms ago → drop (Layer 3)
-  OR
-  → Gate 0 spectral: similarity to TTS EMA > 0.85 → drop (Layer 3)
+RAW CONSUMER PATH (InterruptionDetector):
+  → V5 playback reference correlation: mic chunk cross-correlated against
+    recently played TTS audio buffer. Peak correlation > 0.45 → drop (Layer 4)
+    (This is critical: AriaVoiceFilter needs 200ms chunks but raw consumer
+     receives 30ms chunks — AriaFilter never fires on this path.
+     V5 works on 30ms chunks and catches what AriaFilter cannot.)
 
-Gate 1 never sees echo.
+Gate 1 never sees echo on either path.
 User never gets falsely interrupted.
 AI speaks without looping.
 ```
@@ -1358,7 +1536,8 @@ t=0      User: "stop!" — high energy
 t=200ms  Gate 0: TTS played recently → temporal check drops?
          Actually no — the user's voice is high energy, different spectrum
          Gate 0 spectral: user's voice ≠ Aria's TTS spectrum → passes Gate 0
-         Gate 1 Path A: duration=200ms, energy=10×noise → HIGH_ENERGY_BURST
+         V5 correlation: user's voice ≠ recently played TTS → passes
+         Gate 1 Path A: duration=200ms, energy=20×noise > 13× → HIGH_ENERGY_BURST
          Skip Gate 2 (urgency)
 t=203ms  PENDING:
            audio_player.pause() — TTS freezes
@@ -1378,9 +1557,10 @@ t=453ms  gate3_done_event.set() → breath clip stops
 
 ```
 t=0      User starts speaking
-t=0-600ms  Gate 0 checks each chunk:
+t=0-750ms  Gate 0 checks each chunk:
            User voice spectrum ≠ Aria TTS spectrum → passes Gate 0
-t=600ms  Gate 1 Path B: sustained 600ms, normal energy → NORMAL_SPEECH
+           V5 correlation: user voice ≠ recently played TTS → passes
+t=750ms  Gate 1 Path B: sustained 750ms, energy > 6.0× noise → NORMAL_SPEECH
 t=602ms  Gate 2: partial transcript not filler → passes
 t=603ms  PENDING: TTS pauses, filter OFF, breath.wav starts
          Gate 3 starts on first 600ms audio
@@ -1403,7 +1583,7 @@ t=1503ms gate3_done_event.set() → breath clip stops
 ```
 t=0      User: "actually I was thinking about something different,
                 I've been wondering about X, and what if..."
-t=600ms  Path B → PENDING → TTS pauses → filler clip starts
+t=750ms  Path B → PENDING → TTS pauses → filler clip starts
 t=1000ms Gate 3 early read: "actually I was thinking" → INJECT
          _wait: user still speaking → HOLD
 t=2500ms Accumulated 1.5s → re-classifies:
@@ -1420,10 +1600,10 @@ t=4500ms 300ms silence → _wait exits → acts on NEW_QUESTION
 
 ```
 t=0      User: "haha yeah" — ~400ms, normal energy
-t=400ms  Path A check: energy=2×noise → not 8× → not Path A
-t=600ms  Path B check: duration only 400ms → DROP
+t=400ms  Path A check: energy=2×noise → not 13× → not Path A
+t=750ms  Path B check: duration only 400ms < 750ms → DROP
          Audio discarded — AI never paused, never interrupted
-         (Note: very loud "HAHA!" at 8× energy might hit Path A
+         (Note: very loud "HAHA!" at 13× energy might hit Path A
           → Gate 3 with urgency_hint → IGNORE → resume, no interruption)
 ```
 
@@ -1492,6 +1672,7 @@ Per-chunk audio cleaning:
   denoiser                              ~5ms  (always)
   AriaVoiceFilter check                 ~10ms (filter_active only)
   Gate 0 spectral check                 ~0.5ms (filter_active only)
+  V5 playback ref correlation           ~1ms  (raw consumer, SPEAKING only)
 
 Gate timings from speech start:
   Path A fires at                       ~150-200ms
@@ -1552,6 +1733,7 @@ Emotional clips (laughs, chuckles, sighs) and backchannel clips:
 _play_tts_chunk() is the ONLY function that calls:
   aria_filter.feed_aria_audio(chunk)
   gate0.feed_tts_spectrum(chunk)
+  mic_stream.feed_playback_reference(chunk)   # V5 — feeds playback ref buffer
 
 set_filter_active(True) is called from:
   audio_player.resume()
@@ -1561,6 +1743,11 @@ set_filter_active(False) is called from:
   audio_player.pause()
   audio_player.flush()
   audio_player.play_clip() does NOT change filter_active
+
+mic_stream.clear_playback_reference() is called from:
+  audio_player.pause()    # TTS paused — clear stale reference
+  audio_player.flush()    # TTS discarded — clear reference
+  audio_player._playback_loop finally  # playback ended — clear reference
 ```
 
 ### New Files to Create
@@ -1572,6 +1759,14 @@ set_filter_active(False) is called from:
 | `brain/interrupt_router.py` | All 7 interrupt_type routing actions — single source of truth |
 | `output/pre_pause_clips/breath.wav` | Generated by `backchannel.generator` |
 | `output/pre_pause_clips/mm.wav` | Generated by `backchannel.generator` |
+| `memory/fact_store.py` | SQLite-backed permanent user facts (name, city, prefs) |
+| `memory/procedural.py` | SQLite-backed standing instructions & reminders |
+| `memory/session_cache.py` | RAM dict for full tool results (articles, search) |
+| `memory/background_llm.py` | Fire-and-forget extraction from turns into memory |
+| `memory/loader.py` | Session-start memory block assembly (350 token cap) |
+| `memory/retriever.py` | Parallel recall across all memory tiers |
+| `agent/tools/memory_recall.py` | Tool wrapper over retriever for on-demand recall |
+| `agent/tools/session_cache_qa.py` | QA over cached content via llm_fast |
 
 ### Files to Update
 
@@ -1581,17 +1776,19 @@ set_filter_active(False) is called from:
 | `core/event_bus.py` | Add events: `PENDING`, `CLASSIFIED`, `FILLER_REACTION`, `FILTER_ACTIVE_CHANGE`, `WARMUP_COMPLETE` |
 | `core/session.py` | Add to TurnState enum: `PAUSED`, `SOFT_INJECT` |
 | `core/turn_manager.py` | PAUSED state handler + 3s auto-resume with VAD check + resume phrase detection + interrupt_type routing |
-| `input/mic_stream.py` | Add denoiser pipeline; add Gate 0 call after AriaVoiceFilter; add `set_filter_active()`; remove any old warmup fallback |
-| `input/interruption_detector.py` | Two-path Gate 1: `HIGH_ENERGY_BURST` (150ms, 8×) and `NORMAL_SPEECH` (600ms, 3×) |
+| `input/mic_stream.py` | Add denoiser pipeline; add Gate 0 call after AriaVoiceFilter; add `set_filter_active()`; add V5 playback reference correlation (`feed_playback_reference()`, `clear_playback_reference()`, `_check_playback_correlation()`) |
+| `input/interruption_detector.py` | Two-path Gate 1: `HIGH_ENERGY_BURST` (150ms, 13×) and `NORMAL_SPEECH` (750ms, 6.0×); entry gate at 4.0× (configurable) |
 | `input/speaking_monitor.py` | Full pause (not duck) on PENDING; `play_clip_looping` with `gate3_done_event`; Gate 3 as `asyncio.create_task`; `_wait_for_user_to_finish` with 300ms interrupt silence; 1.5s re-classify; 3s timeout → PAUSE |
-| `output/audio_player.py` | `pause()`/`resume()` with position tracking; `flush()`; separate `_play_tts_chunk()` vs `play_clip()` vs `play_clip_looping()`; `set_filter_active()` calls; `feed_aria_audio()` + `feed_tts_spectrum()` in `_play_tts_chunk()` only |
+| `output/audio_player.py` | `pause()`/`resume()` with position tracking; `flush()`; separate `_play_tts_chunk()` vs `play_clip()` vs `play_clip_looping()`; `set_filter_active()` calls; `feed_aria_audio()` + `feed_tts_spectrum()` + `feed_playback_reference()` in `_play_tts_chunk()` only; `clear_playback_reference()` in pause/flush/playback-end |
 | `output/tts_client.py` | Add `synthesize_silent(text, voice) → np.ndarray` for startup warmup; mid-stream pause/resume support |
 | `input/text_injector.py` | Add `inject_point` parameter |
-| `brain/response_parser.py` | Track current sentence position → `inject_point` value; detect `sentence_boundary` when buffer empty |
+| `brain/response_parser.py` | Track current sentence position → `inject_point` value; detect `sentence_boundary` when buffer empty; strip `[ref:sc_...]` from TTS output while keeping in stored turn |
+| `brain/router.py` | Add `background_llm.create_task()` after each turn; pass session_cache to article_fetch |
+| `brain/prompt_builder.py` | Remove per-turn long_term.recall(); add `set_memory_block()` for session-start injection |
 | `backchannel/generator.py` | Add `breath.wav` and `mm.wav` generation pass |
 | `backchannel/selector.py` | Handle `FILLER_REACTION` event sentiment |
-| `config.yaml` | Add `echo_suppression` block; update `speaking_monitor` with gate params and timeout; add `vad_interrupt_threshold` and `vad_interrupt_silence_ms` |
-| `main.py` | Add `startup_warmup()` function; call it after TTS + VoiceEncoder load; wire `gate3_done_event` as shared `asyncio.Event` |
+| `config.yaml` | Add `echo_suppression` block (incl. V5 `playback_correlation_threshold`); update `speaking_monitor` with gate params and timeout; add memory block (five tiers); add `memory_recall` + `session_cache_qa` to agent tools |
+| `main.py` | Add `startup_warmup()` function; call it after TTS + VoiceEncoder load; wire `gate3_done_event` as shared `asyncio.Event`; wire `FactStore`, `ProceduralStore`, `BackgroundLLM`, `SessionCache`, `MemoryLoader`, `MemoryRetriever` |
 
 ### Shared Objects — Wire in main.py
 

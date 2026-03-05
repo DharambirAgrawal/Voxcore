@@ -271,10 +271,25 @@ class TurnManager:
         self.brain_router = brain_router
         self.safety_guard = safety_guard
         self._logger = logging.getLogger("TurnManager")
+        # Fallback model chain for rate-limit recovery (fast → smart → deep)
+        _mcfg = (config or {}).get("models", {})
+        self._llm_fallback_chain: list[str] = [
+            m for m in (
+                _mcfg.get("llm_smart"),
+                _mcfg.get("llm_deep"),
+                _mcfg.get("llm_agentic"),
+            ) if m
+        ]
 
         self._current_llm_task: Optional[asyncio.Task] = None
         self._interrupted_content: str = ""
         self._just_interrupted: bool = False  # True when previous turn was interrupted
+
+        # V5: Set True while _handle_spoken_tool_output is feeding article/tool
+        # text to TTS.  Prevents the PLAYBACK_DONE from the short bridge
+        # phrase ("Sure, let me read that...") from transitioning the state
+        # to LISTENING before the article audio has even started queuing.
+        self._spoken_tool_in_flight: bool = False
 
         # Stop words — user says these to silence the AI.  No LLM call needed.
         self._stop_phrases: set[str] = {
@@ -298,6 +313,13 @@ class TurnManager:
         # V3: InterruptRouter reference (set via set_interrupt_router after construction)
         self._interrupt_router = None
 
+        # V5: Memory components (set via set_memory_components after construction)
+        self._background_llm = None
+        self._short_term = None
+        self._fact_store = None
+        self._procedural = None
+        self._long_term = None
+
     # ── main entry point ───────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -316,6 +338,16 @@ class TurnManager:
         """V3: Inject InterruptRouter after construction."""
         self._interrupt_router = router
         self._logger.info("V3: InterruptRouter attached to TurnManager")
+
+    def set_memory_components(self, *, background_llm=None, short_term=None,
+                              fact_store=None, procedural=None, long_term=None) -> None:
+        """V5: Inject memory components for background fact extraction after each turn."""
+        self._background_llm = background_llm
+        self._short_term = short_term
+        self._fact_store = fact_store
+        self._procedural = procedural
+        self._long_term = long_term
+        self._logger.info("V5: Memory components attached to TurnManager")
 
     # ── transcript handling ────────────────────────────────────────────────
 
@@ -370,7 +402,19 @@ class TurnManager:
         await self.session.set_state(TurnState.THINKING)
 
         messages = self.prompt_builder.build(self.session)
-        model = self.brain_router.route(user_text, self.session)
+        primary_model = self.brain_router.route(user_text, self.session)
+
+        # Auto-fallback: if primary model is already rate-limited, pick the
+        # first available model in the fallback chain so the turn responds
+        # immediately rather than blocking for 20-30 s internally.
+        model = self.llm_client.pick_available(
+            primary_model, *self._llm_fallback_chain
+        )
+        if model != primary_model:
+            self._logger.warning(
+                "Model %s rate limited → falling back to %s",
+                primary_model, model,
+            )
 
         self._current_llm_task = asyncio.create_task(
             self._stream_and_parse(messages, model)
@@ -389,6 +433,25 @@ class TurnManager:
 
             # Stream complete — record assistant turn
             await self.session.add_turn("assistant", full_text)
+
+            # V5: Fire background fact extraction (never awaited — zero latency impact)
+            if (self._background_llm is not None
+                    and self._short_term is not None
+                    and self._fact_store is not None
+                    and self._procedural is not None
+                    and self._long_term is not None):
+                turns = self._short_term.get_recent(10)
+                turn_dicts = [{"role": t.role, "content": t.content} for t in turns]
+                existing_summary = self.session.compressed_summary or ""
+                asyncio.create_task(
+                    self._background_llm.process_turn_background(
+                        turns=turn_dicts,
+                        fact_store=self._fact_store,
+                        procedural=self._procedural,
+                        long_term=self._long_term,
+                        existing_summary=existing_summary,
+                    )
+                )
 
             if self.safety_guard is not None:
                 asyncio.create_task(self.safety_guard.check(full_text, direction="output"))
@@ -460,6 +523,16 @@ class TurnManager:
     async def _handle_playback_done(self) -> None:
         while True:
             await self._playback_done_queue.get()
+
+            # Guard: spoken tool output is still being fed to TTS.
+            # The PLAYBACK_DONE here belongs to the short bridge phrase
+            # ("Sure, let me read that for you!") — not to the article.
+            # Ignore it; the article's own PLAYBACK_DONE will fire normally.
+            if self._spoken_tool_in_flight:
+                self._logger.debug(
+                    "PLAYBACK_DONE ignored — spoken tool output still in flight"
+                )
+                continue
 
             if self.session.state in (TurnState.SPEAKING, TurnState.SOFT_INJECT):
                 await self.session.set_state(TurnState.LISTENING)
@@ -584,7 +657,15 @@ class TurnManager:
                     }
                     break
 
-            model = self.brain_router.route("tool result", self.session)
+            primary_model = self.brain_router.route("tool result", self.session)
+            model = self.llm_client.pick_available(
+                primary_model, *self._llm_fallback_chain
+            )
+            if model != primary_model:
+                self._logger.warning(
+                    "Tool follow-up: %s rate limited → falling back to %s",
+                    primary_model, model,
+                )
             self._current_llm_task = asyncio.create_task(
                 self._stream_and_parse(messages, model)
             )
@@ -633,15 +714,15 @@ class TurnManager:
             # Transition to SPEAKING (if not already — bridge may still be playing)
             await self.session.set_state(TurnState.SPEAKING)
 
-            # Feed the spoken text through response_parser — identical pipeline
-            # to main LLM output.  parse_stream splits into sentences, detects
-            # emotion/pause tags, and fires LLM_SPEECH_TOKEN events.  The TTS
-            # pipeline subscribes to those events and treats them identically
-            # to sentences from the main LLM.
-            async def _text_as_stream():
-                yield text
+            # Flag: prevent bridge-phrase PLAYBACK_DONE from going to LISTENING
+            self._spoken_tool_in_flight = True
+            try:
+                async def _text_as_stream():
+                    yield text
 
-            full_text = await self.response_parser.parse_stream(_text_as_stream())
+                full_text = await self.response_parser.parse_stream(_text_as_stream())
+            finally:
+                self._spoken_tool_in_flight = False
 
             # Record as an assistant turn in session history
             await self.session.add_turn("assistant", full_text)

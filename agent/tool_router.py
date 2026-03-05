@@ -188,6 +188,8 @@ from input.text_injector import TextInjector
 from agent.tools.base_tool import BaseTool
 from agent.tools.web_search import WebSearchTool
 from agent.tools.article_fetch import ArticleFetchTool
+from agent.tools.memory_recall import MemoryRecallTool
+from agent.tools.session_cache_qa import SessionCacheQATool
 
 
 class ToolRouter:
@@ -212,8 +214,10 @@ class ToolRouter:
     def _register_tools(self, enabled_tools: list[str]) -> None:
         """Register enabled tools from config into the internal registry."""
         TOOL_MAP: dict[str, type[BaseTool]] = {
-            "web_search":    WebSearchTool,
-            "article_fetch": ArticleFetchTool,
+            "web_search":       WebSearchTool,
+            "article_fetch":    ArticleFetchTool,
+            "memory_recall":    MemoryRecallTool,
+            "session_cache_qa": SessionCacheQATool,
         }
 
         for name in enabled_tools:
@@ -224,6 +228,35 @@ class ToolRouter:
                 self._logger.warning("Unknown tool: %s", name)
 
         self._logger.info("Registered %d tools", len(self._tools))
+
+    def set_memory_components(self, *, session_cache=None, retriever=None, config=None) -> None:
+        """V5: Re-register memory-aware tools with their dependencies injected.
+
+        Called from main.py after memory components are created, because
+        ToolRouter is instantiated before memory components exist.
+        """
+        full_config = config or {}
+
+        # Re-register article_fetch with session_cache
+        if "article_fetch" in self._tools and session_cache is not None:
+            self._tools["article_fetch"] = ArticleFetchTool(
+                config=self._config, session_cache=session_cache,
+            )
+            self._logger.info("Re-registered article_fetch with session_cache")
+
+        # Re-register memory_recall with retriever
+        if "memory_recall" in self._tools and retriever is not None:
+            self._tools["memory_recall"] = MemoryRecallTool(
+                config=self._config, retriever=retriever,
+            )
+            self._logger.info("Re-registered memory_recall with retriever")
+
+        # Re-register session_cache_qa with session_cache
+        if "session_cache_qa" in self._tools and session_cache is not None:
+            self._tools["session_cache_qa"] = SessionCacheQATool(
+                config=full_config, session_cache=session_cache,
+            )
+            self._logger.info("Re-registered session_cache_qa with session_cache")
 
     async def run(self) -> None:
         """Main loop — consumes AGENT_JSON_OUT events and dispatches tool execution."""

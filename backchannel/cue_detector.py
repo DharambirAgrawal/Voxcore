@@ -343,7 +343,11 @@ class CueDetector:
         return recent > earlier
 
     async def _on_speech_start_event(self, data: dict) -> None:
-        """Callback for SPEECH_START event."""
+        """Callback for SPEECH_START event — only track when user is actually speaking."""
+        # Ignore SPEECH_START fired during AI speaking/thinking/pending states;
+        # those come from echo picked up by the mic and must not prime backchannel tracking.
+        if self.session.state != TurnState.LISTENING:
+            return
         self._on_speech_start()
 
     def _on_speech_start(self) -> None:

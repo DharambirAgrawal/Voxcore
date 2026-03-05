@@ -271,7 +271,16 @@ class LLMClient:
     def __init__(self, event_bus: EventBus, config: dict) -> None:
         self.event_bus = event_bus
         self.config = config
-        self._groq_client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+        # max_retries=0: disable Groq SDK's internal retry-on-429 loop.
+        # Without this, a rate-limit response causes the SDK to block for
+        # 20–30 s per retry before surfacing RateLimitError to our handler.
+        # With max_retries=0 the error surfaces immediately so our
+        # pick_available() / fallback logic in TurnManager can cut over
+        # to a non-rate-limited model within the same turn.
+        self._groq_client = AsyncGroq(
+            api_key=os.environ.get("GROQ_API_KEY"),
+            max_retries=0,
+        )
 
         # Usage tracking
         self._session_token_count: int = 0
@@ -428,6 +437,20 @@ class LLMClient:
 
     def is_rate_limited(self, model: str) -> bool:
         return model in self._rate_limited and time.time() < self._rate_limited[model]
+
+    def pick_available(self, *models: str) -> str:
+        """Return the first non-rate-limited model from the list.
+
+        If every model in the list is currently rate-limited, returns
+        the first (primary) model so the call still goes through and
+        our RateLimitError handler records the retry-after time.
+        Empty/None entries in the list are silently skipped.
+        """
+        candidates = [m for m in models if m]
+        for m in candidates:
+            if not self.is_rate_limited(m):
+                return m
+        return candidates[0] if candidates else (models[0] if models else "")
 
     def reset_usage(self) -> None:
         self._session_token_count = 0

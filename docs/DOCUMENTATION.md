@@ -33,11 +33,13 @@ For the general vision, capabilities, install instructions, and models used, ple
 
 ## ⚙️ Core Turn State Machine
 
-VoxCore continuously operates in a 4-state asynchronous loop responding to VAD triggers and LLM inference.
+VoxCore continuously operates in a 6-state asynchronous loop responding to VAD triggers and LLM inference.
 - **`LISTENING`**: VAD active. Active buffer collecting audio. **Exit Trigger:** 400ms of VAD silence.
 - **`THINKING`**: VAD loop completes. LLM context processing begins. Text starts streaming. **Exit Trigger:** First sentence returned from the Fast Brain LLM.
-- **`SPEAKING`**: Audio output streams to speaker. VAD continues running in the background. **Exit Trigger:** LLM playback finishes `OR` user interrupts (speaks over audio).
-- **`INTERRUPTED`**: Audio loop killed abruptly. Audio interruption captured. User input directed back to the STT model. **Exit Trigger:** STT finishes transcript mapping back to `THINKING`.
+- **`SPEAKING`**: Audio output streams to speaker. VAD continues running in the background. Five-layer echo suppression active (denoiser, AriaVoiceFilter, Gate 0 spectral, V5 playback reference correlation). Multi-gate interrupt pipeline (Gate 1 → Gate 2 → Gate 3) monitors for user interrupts. **Exit Trigger:** LLM playback finishes `OR` user interrupts (speaks over audio).
+- **`PAUSED`**: TTS frozen in RAM at exact frame boundary. Resumable without LLM call if user says "go ahead". 3s auto-resume timer. **Exit Trigger:** Resume phrase detected `OR` new user question `OR` 3s silence.
+- **`SOFT_INJECT`**: Brief state during text injection while TTS continues. AI weaves injected content at correct sentence position. **Exit Trigger:** Immediately transitions to SPEAKING.
+- **`INTERRUPTED`**: Audio loop killed. Filler clip plays as bridge. User input directed back to the STT model. **Exit Trigger:** STT finishes transcript → primary LLM starts → `THINKING`.
 
 ---
 
@@ -61,9 +63,12 @@ During the system inspection phase, the internal files mapped successfully match
 - **`turn_manager.py`**: Holds state flow instructions managing transitions between the 4 native states listed above.
 
 ### `input/` (Ears)
-- **`mic_stream.py`**: Runs PyAudio/SoundDevice bindings natively managing constant PCM data.
+- **`mic_stream.py`**: Runs SoundDevice bindings natively managing constant PCM data. Includes five-layer echo suppression: denoiser (always on), AriaVoiceFilter (speaker identity), Gate 0 (spectral + temporal), V5 playback reference correlation (cross-correlates mic against recent TTS audio). Maintains filtered consumers (clean audio for VAD/STT) and raw consumers (for InterruptionDetector, with `check_echo()` providing V5 protection).
+- **`aria_voice_filter.py`**: Resemblyzer-based speaker embedding — identifies and rejects mic chunks that sound like Aria's voice. Pre-warmed at startup.
+- **`gate0_echo_check.py`**: Spectral cosine similarity + temporal proximity check against rolling TTS spectrum EMA.
 - **`vad.py`**: Pysilero-vad wrappers checking for the 400ms buffer silence gap.
 - **`stt.py`**: Converts soundwaves to Groq STT APIs. Handles the fallback execution loops.
+- **`interruption_detector.py`**: Two-path Gate 1 interrupt detection — Path A (short energy bursts, 150ms/13×) and Path B (sustained speech, 750ms/6.0×). Entry gate at noise_floor × 4.0×.
 - **`text_injector.py`**: Appends async commands to the Session.
 
 ### `backchannel/` (Natural Conversation)
@@ -73,18 +78,32 @@ During the system inspection phase, the internal files mapped successfully match
 
 ### `brain/` (The Mind)
 - **`llm_client.py`**: Custom AsyncGroq API implementation parsing `yield` tokens.
-- **`prompt_builder.py`**: Prepares prompt structure (Persona + History + Injection + Input).
-- **`response_parser.py`**: Splits XML logic. Conversational data → `output/tts_client.py`, Agent parameters → `agent/text_out.py`.
+- **`prompt_builder.py`**: Prepares prompt structure (Persona + Memory Block + History + Injection + Input). Memory block injected once at session start via `set_memory_block()`.
+- **`response_parser.py`**: Splits XML logic. Conversational data → `output/tts_client.py`, Agent parameters → `agent/text_out.py`. Strips `[ref:sc_...]` tags from TTS output while keeping them in stored turns for session cache reference.
+- **`router.py`**: Orchestrates turn processing. Fires `background_llm.create_task()` after each turn for memory extraction.
 - **`emotion_tagger.py`**: Prepends emotion instructions matching the text.
 
 ### `output/` (The Mouth)
-- **`tts_client.py`**: Streams raw text into Orpheus endpoints.
-- **`audio_player.py`**: Python SoundDevice executor. 
+- **`tts_client.py`**: Streams raw text into Kokoro-ONNX TTS engine (local, 24kHz). Supports `synthesize_silent()` for startup warmup.
+- **`audio_player.py`**: SoundDevice executor with pause/resume/flush. Feeds TTS chunks to AriaVoiceFilter, Gate 0, and V5 playback reference buffer. Clears playback reference on pause/flush/end.
+
+### `memory/` (Five-Tier Memory System)
+- **`short_term.py`**: Tier 1 — RAM deque with last 20 turns + emotion history. Instant access, session-only.
+- **`session_cache.py`**: Tier 2 — RAM dict keyed by cache_id. Stores full article text, search results. Wiped on shutdown.
+- **`fact_store.py`**: Tier 3 — SQLite-backed permanent user facts (name, city, preferences, relationships).
+- **`procedural.py`**: Tier 4 — SQLite-backed standing instructions, pending reminders, relay messages.
+- **`long_term.py`**: Tier 5 — ChromaDB with typed entries (`memory_type` + `category`), recency-weighted re-ranking, access tracking.
+- **`compressor.py`**: Threshold-triggered compression — summarizes and stores to ChromaDB, then clears working memory (keeps last 3 turns).
+- **`background_llm.py`**: Fire-and-forget `asyncio.create_task()` extraction from recent turns. Signal pre-filter avoids API calls on filler turns.
+- **`loader.py`**: Session-start memory block assembly (350 token hard cap). Loads facts, instructions, relays, recent relationships.
+- **`retriever.py`**: Parallel recall across fact_store, procedural, and long_term via `asyncio.gather()`.
 
 ### `agent/` (Logic Executions)
 - **`text_out.py`**: Parses `<agent>` loops, tests valid JSON syntax.
-- **`tool_router.py`**: Receives correct logic blocks mapping execution routes.
+- **`tool_router.py`**: Receives correct logic blocks mapping execution routes. Registered tools: `web_search`, `article_fetch`, `memory_recall`, `session_cache_qa`.
 - **`slow_llm.py`**: Non-blocking asynchronous inference to the `kimi-k2` and `scout-17b` models returning JSON to the session queue.
+- **`tools/memory_recall.py`**: On-demand recall across all memory tiers. Result → text_injector → main LLM synthesizes spoken response.
+- **`tools/session_cache_qa.py`**: QA over cached content (articles, search results) from current session. Uses `llm_fast` for ~250ms latency. Result → TTS directly via SPOKEN_TOOL_OUTPUT.
 
 ---
 

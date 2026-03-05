@@ -230,7 +230,13 @@ class PromptBuilder:
         self.persona_name: str = config.get("name", "Aria")
         self.system_prompt: str = config.get("system_prompt", "")
         self.language: str = config.get("language", "en")
+        self._memory_block: str = ""  # Set once at session start by loader
         self._logger: logging.Logger = logging.getLogger("PromptBuilder")
+
+    def set_memory_block(self, block: str) -> None:
+        """Set the session-start memory block (from loader.py)."""
+        self._memory_block = block
+        self._logger.debug("Memory block set: ~%d tokens", len(block) // 4)
 
     # ───────────────────────────────────────────────────────────────────────
     # Public API
@@ -303,6 +309,13 @@ class PromptBuilder:
         parts = [
             self.system_prompt,
             f"\nCurrent date and time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+
+        # ── V5: Inject memory block from loader (session-start context) ──
+        if self._memory_block:
+            parts.append(f"\n\n{self._memory_block}")
+
+        parts.append(
             # ── V2: Yield point and emotional tag instructions ──
             "\n\nCONVERSATION RHYTHM RULES:\n"
             "- Keep each spoken response to 2-3 sentences maximum before pausing.\n"
@@ -329,13 +342,28 @@ class PromptBuilder:
             '  "extract only the numbers and statistics mentioned"\n'
             "  Be specific. The instruction goes directly to the summarizing model.\n"
             "- For web_search, write the query as you would type into a search engine.\n"
+            "\n- User asks a follow-up question about an article or search from THIS conversation\n"
+            "  → USE session_cache_qa with the cache_id visible in conversation history\n"
+            "\n- User asks what you remember about them, past conversations, or previous sessions\n"
+            "  → USE memory_recall\n"
+            "\n- User says 'remember this', 'save this link', 'don't forget'\n"
+            "  → USE memory_recall with operation hint (this triggers background storage)\n"
+            "\nHOW TO USE NEW TOOLS:\n"
+            '<agent>{"action": "session_cache_qa", "params": {"cache_id": "sc_XXXX", "question": "QUESTION"}}</agent>\n'
+            '<agent>{"action": "memory_recall", "params": {"query": "WHAT TO RECALL"}}</agent>\n'
+            "\nEXAMPLES:\n"
+            'User: "what did that paper say about the dataset?"\n'
+            'You: [calm] Let me check what we read. <agent>{"action": "session_cache_qa", "params": {"cache_id": "sc_1741_a3f2", "question": "what does the paper say about the dataset"}}</agent>\n'
+            "\n"
+            'User: "do you remember my research focus?"\n'
+            'You: [calm] Let me check. <agent>{"action": "memory_recall", "params": {"query": "user research focus and field"}}</agent>\n'
             "\n\nTOOL RESULT RULES:\n"
             "- When context contains a tool result, answer IN ONE SENTENCE using only the key fact.\n"
             "- NEVER speak URLs, raw list text, decimal-precise numbers unless asked, or any context block formatting.\n"
             "- Speak as if YOU know the answer: say 'Bitcoin is around $68,000' not 'the search result says...'\n"
             "- After reading a tool result, NEVER call the same tool again for the same query.\n"
-            "- If context has conflicting values, pick the most reasonable one and mention the rough range briefly.\n",
-        ]
+            "- If context has conflicting values, pick the most reasonable one and mention the rough range briefly.\n"
+        )
         return "".join(parts)
 
     @staticmethod

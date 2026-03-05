@@ -38,13 +38,13 @@ The client is a wire. It has a mic, a speaker, maybe an LED. That is all it does
 Server does all of this:
 •	VAD — Silero, server-side, unchanged
 •	STT — Groq Whisper, server-side, unchanged
-•	All 3 interrupt gates — Gate0 spectral, Gate1 energy/duration, Gate2 filler, Gate3 allam-2-7b
-•	Echo suppression — AriaVoiceFilter (resemblyzer), Gate0EchoCheck (spectral FFT)
+•	All 3 interrupt gates — Gate0 spectral, V5 playback correlation, Gate1 energy/duration, Gate2 filler, Gate3 classifier
+•	Echo suppression — AriaVoiceFilter (resemblyzer), Gate0EchoCheck (spectral FFT), V5 playback reference correlation
 •	Echo warmup — synthesize_silent() runs on server at startup, Aria embedding built server-side
 •	LLM — llama-3.1-8b, allam-2-7b classifier, all on Groq
 •	TTS — Kokoro-ONNX, runs on server, PCM output sent to client
 •	State machine — all 6 states, all transitions
-•	Memory — ChromaDB, short_term deque, all on server
+•	Memory — Five-tier system: short_term deque (RAM), session_cache (RAM), fact_store (SQLite), procedural (SQLite), long_term (ChromaDB) — all on server
 •	Clip files — breath.wav, got_it.wav, backchannel clips — all generated/stored on server
 •	generator.py download — runs on server at startup, not client's concern
 
@@ -54,7 +54,7 @@ Client does only this:
 •	Receive JSON commands → update LED / mute mic / flush speaker buffer
 •	Send keepalive ping every 10s
 
-▌ ESP32 NOTE: AriaVoiceFilter and Gate0 models are loaded and run entirely on the server. The ESP32 never touches them. The ESP32 does not know they exist.
+◌ ESP32 NOTE: AriaVoiceFilter, Gate0, and V5 playback reference correlation are loaded and run entirely on the server. The ESP32 never touches them. The ESP32 does not know they exist.
  4. Multi-User Model — Shared Infrastructure, Isolated Conversations
 Target: up to 8 simultaneous connections (prototype target: 4–5 across ESP32, app, browser). Heavy models load once at server boot and are shared across all sessions. The things that cannot mix are strictly isolated per user. This keeps RAM low without compromising conversation isolation.
 
@@ -72,10 +72,13 @@ Isolated per user — these never touch another user:
 •	State machine — each user has their own 6-state machine running independently
 •	event_bus — instantiated per user. Events from User A's pipeline cannot reach User B's handlers under any circumstances.
 •	VAD + Gate1 noise_floor — calibrated to each user's mic and room environment. A noisy ESP32 room doesn't raise thresholds for a quiet browser user.
+•	V5 playback reference buffer — per-user MicStream instance holds its own 500ms rolling buffer of recently played TTS audio. User A's playback reference never contaminates User B's echo detection.
 •	Gate3 classification context — the transcript being classified belongs to one user only
 •	STT — each user's audio goes to their own Groq Whisper call with their own context
 •	Conversation history — short_term memory deque is per user_id. User A's turns never appear in User B's LLM prompt. Ever.
+•	Session cache — per user. Article text and search results cached in RAM for follow-up questions.
 •	Tool calls + search results — CRITICAL. User A's Tavily web search result never appears in User B's conversation context. Each LLM call is built from that user's isolated history only.
+•	Fact store + procedural (SQLite) — queried and written per user_id. User A's facts never pollute User B's context.
 •	Long-term memory (ChromaDB) — queried and written per user_id. Separate namespace per user.
 •	AudioBridge queues — per user. User A's mic bytes physically cannot reach User B's VAD.
 •	WebSocket connection — per user. Each binary stream is completely separate.
@@ -84,7 +87,9 @@ Isolated per user — these never touch another user:
 How the shared echo model stays correct with multiple users:
 AriaVoiceFilter is fed Aria's TTS audio to update its EMA — the same audio going to every user's speaker because it's the same TTS model. One embedding works for all users. However when 2+ users are in SPEAKING state simultaneously, feed_aria_audio() and feed_tts_spectrum() are called concurrently. Add a threading.Lock() on both EMA update methods.
 
-▌ CONCURRENCY FIX NEEDED: Add threading.Lock() to AriaVoiceFilter.feed_aria_audio() and Gate0EchoCheck.feed_tts_spectrum(). Two users speaking simultaneously without this lock causes EMA corruption.
+V5 playback reference correlation is per-user (each MicStream has its own buffer), so it requires no locking across users. This is actually the most reliable echo suppression layer in multi-user scenarios because it uses the exact audio being played to that specific user.
+
+◌ CONCURRENCY FIX NEEDED: Add threading.Lock() to AriaVoiceFilter.feed_aria_audio() and Gate0EchoCheck.feed_tts_spectrum(). Two users speaking simultaneously without this lock causes EMA corruption. V5 playback reference does not need this fix — it is per-instance.
 
 SharedResources object — passed into every PipelineInstance:
 # websocket/shared_resources.py

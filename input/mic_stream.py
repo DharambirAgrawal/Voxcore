@@ -178,6 +178,7 @@ NOTES ON AUDIO FORMAT:
 import asyncio
 import collections
 import logging
+import threading
 from typing import Any, Optional, List
 
 import numpy as np
@@ -234,6 +235,17 @@ class MicStream:
 
         # V3: Scoped filter toggle — only active when TTS plays real speech
         self._filter_active: bool = False
+
+        # ── V5: Playback reference buffer for echo correlation ────────────
+        # Stores recently played TTS audio (resampled to mic rate) so
+        # check_echo() can detect echo via cross-correlation even on
+        # small 30ms chunks where AriaVoiceFilter can't operate.
+        # ~500ms buffer at 16kHz = 8000 samples.
+        self._playback_ref: collections.deque = collections.deque(maxlen=8000)
+        self._playback_ref_lock: threading.Lock = threading.Lock()
+        self._playback_corr_threshold: float = _echo_cfg.get(
+            "playback_correlation_threshold", 0.45
+        )
 
         # V3: Rolling buffer of recent audio for last_200ms()
         recent_samples = int(self.sample_rate * 0.2)  # 200ms
@@ -533,16 +545,16 @@ class MicStream:
             self._logger.debug("V3 filter_active = %s", active)
 
     def check_echo(self, chunk: np.ndarray) -> bool:
-        """V3: Query whether a chunk is AI echo — for raw-consumer callers.
+        """V3/V5: Query whether a chunk is AI echo — for raw-consumer callers.
 
         InterruptionDetector uses add_raw_consumer() so echo filtering does
-        not happen upstream. This method lets it query the same filters
-        directly without routing through the filtered consumer path.
+        not happen upstream. This method lets it query filters directly.
 
-        Returns True only when echo suppression is active (during real TTS
-        playback) AND at least one filter identifies the chunk as Aria's
-        voice / TTS spectral echo. Safe to call frequently — exceptions are
-        caught and treated as non-echo.
+        V5 addition: playback reference correlation check. Works on small
+        30ms chunks (unlike AriaVoiceFilter which needs 200ms). Compares
+        the mic chunk against a rolling buffer of recently played TTS audio
+        using normalized cross-correlation — similar mechanism to how
+        hardware AEC (WhatsApp, FaceTime) detects echo.
 
         Returns:
             True  → chunk is AI echo, caller should discard it.
@@ -550,6 +562,11 @@ class MicStream:
         """
         if not self._filter_active:
             return False
+
+        # V5: Playback reference correlation — works on small chunks
+        if self._check_playback_correlation(chunk):
+            return True
+
         try:
             if self._aria_filter is not None and self._aria_filter.is_aria_echo(chunk):
                 return True
@@ -560,6 +577,69 @@ class MicStream:
                 return True
         except Exception:
             pass
+        return False
+
+    # ── V5: Playback reference echo detection ─────────────────────────────
+
+    def feed_playback_reference(self, chunk: np.ndarray) -> None:
+        """Feed TTS playback audio (resampled to mic rate) for echo detection.
+
+        Called by AudioPlayer for every frame during TTS playback, alongside
+        the existing AriaVoiceFilter/Gate0 feeds. Builds a rolling reference
+        buffer that check_echo() correlates against.
+        """
+        with self._playback_ref_lock:
+            self._playback_ref.extend(chunk.tolist())
+
+    def clear_playback_reference(self) -> None:
+        """Clear the playback reference when TTS stops."""
+        with self._playback_ref_lock:
+            self._playback_ref.clear()
+
+    def _check_playback_correlation(self, mic_chunk: np.ndarray) -> bool:
+        """Check if mic chunk correlates with recent playback audio.
+
+        Uses normalized cross-correlation over possible acoustic delays.
+        If peak correlation exceeds threshold, the mic is hearing echo.
+
+        Math: When only echo is present, correlation ≈ 0.6–0.9.
+        When user speaks over echo (real interrupt), the mixed signal
+        decorrelates: at equal power, correlation drops to ~0.35.
+        Threshold of 0.45 catches pure echo but passes real speech.
+        """
+        with self._playback_ref_lock:
+            ref_len = len(self._playback_ref)
+            if ref_len < len(mic_chunk) * 2:
+                return False
+            ref = np.array(self._playback_ref, dtype=np.float32)
+
+        chunk_power = float(np.dot(mic_chunk, mic_chunk))
+        if chunk_power < 1e-10:
+            return False
+
+        n = len(mic_chunk)
+        # Cross-correlate: slide mic_chunk over the reference buffer.
+        # np.correlate mode='valid' gives one value per alignment.
+        corr = np.correlate(ref, mic_chunk, mode='valid')  # length = ref_len - n + 1
+
+        # Compute reference segment power for each alignment using cumsum trick
+        ref_sq = ref ** 2
+        cumsum = np.empty(len(ref_sq) + 1, dtype=np.float64)
+        cumsum[0] = 0.0
+        np.cumsum(ref_sq, out=cumsum[1:])
+        seg_power = cumsum[n:] - cumsum[:len(corr)]  # power of each ref segment
+
+        # Normalise: corr[i] / sqrt(seg_power[i] * chunk_power)
+        denom = np.sqrt(seg_power * chunk_power) + 1e-10
+        normalised = np.abs(corr) / denom
+
+        peak = float(np.max(normalised))
+        if peak > self._playback_corr_threshold:
+            self._logger.debug(
+                "V5 playback-ref BLOCKED: peak_corr=%.3f > %.2f",
+                peak, self._playback_corr_threshold,
+            )
+            return True
         return False
 
     def last_200ms(self) -> np.ndarray:

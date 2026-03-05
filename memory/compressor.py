@@ -5,269 +5,191 @@
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 PURPOSE:
-    When the short-term memory window overflows, evicted turns are batched
-    and sent to the compressor. This module uses a deep-thinking LLM
-    (qwen3-32b via Groq) to summarize batches of old turns into concise
-    summaries, which are then stored in long-term ChromaDB memory.
+    When the short-term memory window overflows (compress_after_turns reached),
+    this module summarises the conversation turns via llm_fast and stores
+    the summary into ChromaDB long-term memory with proper type/category tags.
 
-    This keeps context efficient: instead of storing raw turns, compressed
-    summaries capture key information at a fraction of the token cost.
+    Critical fix (v5): after compression, only the last 3 turns are retained
+    in working memory. Without this, compression fires on EVERY subsequent
+    turn and ChromaDB fills with duplicate summaries.
 
-═══════════════════════════════════════════════════════════════════════════════════
-IMPORTS REQUIRED:
-═══════════════════════════════════════════════════════════════════════════════════
-
-import logging
-import asyncio
-from typing import Optional
-
-from core.event_bus import EventBus, EventType
-from core.session import Turn
-from brain.llm_client import LLMClient
+    Also filters noise: turns under 5 words or filler-only are excluded
+    from the summary input.
 
 ═══════════════════════════════════════════════════════════════════════════════════
-CONSTANTS:
-═══════════════════════════════════════════════════════════════════════════════════
-
-COMPRESS_MODEL = "qwen/qwen3-32b"            # Deep thinking model for summarization (Groq namespace)
-MAX_SUMMARY_TOKENS = 300                    # Max tokens for the summary output
-BATCH_SIZE = 5                              # Minimum turns before compressing
-
-COMPRESS_SYSTEM_PROMPT = '''You are a conversation summarizer. Given a batch of
-conversation turns, produce a concise summary capturing:
-1. Key facts mentioned by the user (names, preferences, dates)
-2. Decisions made or action items
-3. Emotional context or tone shifts
-4. Any explicit requests to "remember" something
-
-Output ONLY the summary, no preamble. Keep it under 150 words.'''
-
-═══════════════════════════════════════════════════════════════════════════════════
-CLASSES:
-═══════════════════════════════════════════════════════════════════════════════════
-
-──────────────────────────────────────────────────────────────────────────────────
-CLASS: MemoryCompressor
-──────────────────────────────────────────────────────────────────────────────────
-    Summarizes overflow conversation turns using a deep-thinking LLM.
-
-    CONSTRUCTOR: __init__(self, event_bus: EventBus, llm_client: LLMClient)
-    ─────────────────────────────────────────────────────────────
-        INPUTS:
-            - event_bus: EventBus — For subscribing to MEMORY_COMPRESS events
-              and publishing results back with summary attached
-            - llm_client: LLMClient — Shared LLM client for Groq API access
-        INITIALIZES:
-            self._bus = event_bus
-            self._llm = llm_client
-            self._pending: list[Turn] = []
-            self._is_compressing: bool = False
-            self._logger = logging.getLogger("MemoryCompressor")
-
-    METHODS:
-    ─────────────────────────────────────────────────────────────
-
-    async def run(self) -> None
-        INPUTS: None
-        OUTPUT: None (runs forever)
-        WHAT IT DOES:
-            1. Subscribe to EventType.MEMORY_COMPRESS → self._on_compress_request
-            2. Log "MemoryCompressor ready"
-            3. Block forever with asyncio.Event().wait()
-
-    async def _on_compress_request(self, event) -> None
-        INPUTS:
-            - event: Event — data["turns"] is a list of Turn objects
-        OUTPUT: None
-        WHAT IT DOES:
-            1. turns = event.data.get("turns", [])
-            2. self._pending.extend(turns)
-            3. If len(self._pending) < BATCH_SIZE: return  # Wait for more
-            4. If self._is_compressing: return  # Don't stack compressions
-            5. batch = self._pending[:BATCH_SIZE * 2]  # Take up to 2x batch
-            6. self._pending = self._pending[len(batch):]
-            7. asyncio.create_task(self._compress_batch(batch))
-
-    async def _compress_batch(self, turns: list[Turn]) -> None
-        INPUTS:
-            - turns: list[Turn] — Batch of conversation turns to summarize
-        OUTPUT: None
-        WHAT IT DOES:
-            1. self._is_compressing = True
-            2. formatted = self._format_turns(turns)
-            3. Try:
-               a. summary = await self._llm.complete(
-                      model=COMPRESS_MODEL,
-                      system_prompt=COMPRESS_SYSTEM_PROMPT,
-                      user_prompt=formatted,
-                      max_tokens=MAX_SUMMARY_TOKENS,
-                      temperature=0.3
-                  )
-               b. If summary and summary.strip():
-                  Publish EventType.MEMORY_STORE with data={
-                      "summary": summary.strip(),
-                      "turns": turns,
-                      "turn_count": len(turns)
-                  }
-                  Log f"Compressed {len(turns)} turns into {len(summary)} chars"
-               c. Else:
-                  Log warning "Empty summary from compressor"
-            4. Except Exception as e:
-               Log error f"Compression failed: {e}"
-               # Put turns back into pending for retry
-               self._pending = turns + self._pending
-            5. Finally:
-               self._is_compressing = False
-
-    def _format_turns(self, turns: list[Turn]) -> str
-        INPUTS:
-            - turns: list[Turn] — Turns to format for the LLM prompt
-        OUTPUT:
-            - str — Formatted conversation text
-        WHAT IT DOES:
-            1. lines = []
-            2. For each turn in turns:
-               lines.append(f"[{turn.role}]: {turn.text}")
-            3. Return "\n".join(lines)
-
-    def get_pending_count(self) -> int
-        INPUTS: None
-        OUTPUT: int — Number of turns waiting to be compressed
-        WHAT IT DOES:
-            return len(self._pending)
-
-    @property
-    def is_busy(self) -> bool
-        OUTPUT: bool — Whether a compression is in progress
-        WHAT IT DOES:
-            return self._is_compressing
-
-═══════════════════════════════════════════════════════════════════════════════════
-EXPORTS:
-    - MemoryCompressor   (class)
-═══════════════════════════════════════════════════════════════════════════════════
-
 NOTES:
-    - Uses qwen3-32b for high-quality summarization (deep thinking)
+    - Uses models.llm_fast from config for summarization (cheap, runs every 20 turns)
     - Temperature 0.3 for consistent, factual summaries
     - Compression runs as background task — doesn't block conversation
-    - Failed compressions re-queue turns for retry
-    - The MEMORY_STORE event is consumed by LongTermMemory.store()
+    - CRITICAL FIX (v5): After compressing, only last 3 turns are retained
+      in working memory. Without this, compression fires on every subsequent
+      turn and ChromaDB fills with duplicate summaries.
+    - Noise filter: turns under 5 words and filler-only responses are excluded
 """
 
 
 import logging
 import asyncio
+import os
+from datetime import datetime
 from typing import Optional
+
+from groq import AsyncGroq
 
 from core.event_bus import EventBus, EventType
 from core.session import Turn
-from brain.llm_client import LLMClient
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-COMPRESS_MODEL = "qwen/qwen3-32b"
 MAX_SUMMARY_TOKENS = 300
-BATCH_SIZE = 5
 
-COMPRESS_SYSTEM_PROMPT = """You are a conversation summarizer. Given a batch of
-conversation turns, produce a concise summary capturing:
-1. Key facts mentioned by the user (names, preferences, dates)
-2. Decisions made or action items
-3. Emotional context or tone shifts
-4. Any explicit requests to "remember" something
+# Filler responses that should never be stored in long-term memory
+FILLER_RESPONSES = frozenset({
+    "okay", "yes", "no", "thanks", "got it", "sure",
+    "right", "yeah", "alright", "fine", "understood",
+    "yep", "nope", "cool", "nice", "great", "good",
+    "hmm", "uh huh", "mm hmm", "oh", "ah",
+})
 
-Output ONLY the summary, no preamble. Keep it under 150 words."""
+COMPRESS_SYSTEM_PROMPT = """Summarize this conversation excerpt in 2-3 sentences.
+Third person. Facts only. No filler. No AI speech.
+Do not include greetings, filler words, or one-word responses.
+
+CRITICAL — preserve these EXACTLY as they appear (do NOT paraphrase):
+- Full URLs (https://...)
+- Names of people, places, companies
+- Numbers, dates, code snippets
+- Any explicit user preference or instruction
+If a URL or name was mentioned, it MUST appear verbatim in the summary."""
 
 
 class MemoryCompressor:
-    """Summarizes overflow conversation turns using a deep-thinking LLM."""
+    """Summarizes overflow conversation turns and stores to long-term memory.
 
-    def __init__(self, event_bus: EventBus, llm_client: LLMClient) -> None:
+    v5: Works directly with short_term and long_term stores.
+    Critical fix: clears working memory after compression (keeps last 3 turns).
+    """
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        short_term,
+        long_term,
+        config: dict,
+    ) -> None:
         self._bus: EventBus = event_bus
-        self._llm: LLMClient = llm_client
-        self._pending: list[Turn] = []
+        self._short_term = short_term
+        self._long_term = long_term
+        self._config: dict = config
+        self._model: str = config.get("models", {}).get("llm_fast", "llama-3.1-8b-instant")
+        self._compress_after: int = config.get("memory", {}).get("compress_after_turns", 20)
         self._is_compressing: bool = False
+        self._groq = AsyncGroq(max_retries=0)
         self._logger: logging.Logger = logging.getLogger("MemoryCompressor")
 
     async def run(self) -> None:
-        """Subscribe to MEMORY_COMPRESS events and process them forever."""
-        compress_queue: asyncio.Queue = self._bus.subscribe(EventType.MEMORY_COMPRESS)
-        self._logger.info("MemoryCompressor ready")
+        """Subscribe to TURN_COMPLETE and check if compression is needed."""
+        self._bus.subscribe(EventType.TURN_COMPLETE, self._on_turn_complete)
+        self._logger.info("MemoryCompressor ready (threshold=%d turns)", self._compress_after)
+        await asyncio.Event().wait()
 
-        while True:
-            event = await compress_queue.get()
-            await self._on_compress_request(event)
-
-    async def _on_compress_request(self, event) -> None:
-        """Handle incoming compress requests — batch turns and trigger compression."""
-        turns = event.data.get("turns", [])
-        self._pending.extend(turns)
-
-        if len(self._pending) < BATCH_SIZE:
-            return
-
+    async def _on_turn_complete(self, event) -> None:
+        """Check if compression should trigger after each turn."""
         if self._is_compressing:
             return
 
-        # Take up to 2x batch size
-        take_count = min(len(self._pending), BATCH_SIZE * 2)
-        batch = self._pending[:take_count]
-        self._pending = self._pending[take_count:]
-
-        asyncio.create_task(self._compress_batch(batch))
-
-    async def _compress_batch(self, turns: list[Turn]) -> None:
-        """Compress a batch of turns into a summary via the deep-thinking LLM."""
-        self._is_compressing = True
-        formatted = self._format_turns(turns)
-
-        try:
-            messages = [
-                {"role": "system", "content": COMPRESS_SYSTEM_PROMPT},
-                {"role": "user", "content": formatted},
-            ]
-            summary = await self._llm.complete(
-                messages=messages,
-                model=COMPRESS_MODEL,
-                max_tokens=MAX_SUMMARY_TOKENS,
-                temperature=0.3,
+        current_count = len(self._short_term)
+        if current_count >= self._compress_after:
+            self._logger.info(
+                "Compression triggered: %d turns >= %d threshold",
+                current_count, self._compress_after,
             )
+            asyncio.create_task(self._compress())
 
-            if summary and summary.strip():
-                await self._bus.publish(
-                    EventType.MEMORY_COMPRESSED,
-                    {
-                        "summary": summary.strip(),
-                        "turns": turns,
-                        "turn_count": len(turns),
-                    },
-                    source="MemoryCompressor",
-                )
-                self._logger.info(
-                    "Compressed %d turns into %d chars", len(turns), len(summary)
-                )
-            else:
-                self._logger.warning("Empty summary from compressor")
+    async def _compress(self) -> None:
+        """Compress current working memory, store summary, keep last 3 turns."""
+        self._is_compressing = True
+        try:
+            turns = self._short_term.get_recent()
+            if not turns:
+                return
+
+            # Filter noise — only include turns with real content
+            meaningful = [
+                t for t in turns
+                if len(t.content.split()) > 5
+                and t.content.lower().strip() not in FILLER_RESPONSES
+            ]
+
+            if meaningful:
+                summary = await self._build_summary_llm(meaningful)
+                if summary:
+                    await self._long_term.store(
+                        text=summary,
+                        memory_type="episodic",
+                        category="event",
+                        importance=0.4,
+                        metadata={
+                            "turn_count": len(turns),
+                            "compressed_at": datetime.now().isoformat(),
+                        },
+                    )
+
+            # ✅ THE FIX — keep last 6 turns, clear the rest
+            # (was 3, but that's too aggressive — URLs/names shared 4 turns
+            #  ago were being dropped before the LLM could reference them)
+            keep_count = 6
+            all_turns = list(self._short_term._window)
+            self._short_term._window.clear()
+            self._short_term._overflow_buffer.clear()
+            for turn in all_turns[-keep_count:]:
+                self._short_term._window.append(turn)
+
+            self._logger.info(
+                "Compressed. Kept last %d of %d turns.", keep_count, len(turns)
+            )
 
         except Exception as e:
             self._logger.error("Compression failed: %s", e)
-            # Re-queue turns for retry
-            self._pending = list(turns) + self._pending
-
         finally:
             self._is_compressing = False
 
-    def _format_turns(self, turns: list[Turn]) -> str:
-        """Format turns into a readable conversation transcript for the LLM."""
+    async def _build_summary_llm(self, turns: list[Turn]) -> Optional[str]:
+        """Summarise turns using llm_fast via Groq."""
+        formatted = self._format_turns(turns)
+        try:
+            response = await self._groq.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": COMPRESS_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Conversation:\n{formatted}"},
+                ],
+                max_tokens=MAX_SUMMARY_TOKENS,
+                temperature=0.3,
+            )
+            text = response.choices[0].message.content
+            return text.strip() if text else None
+        except Exception as e:
+            self._logger.error("Summary LLM call failed: %s", e)
+            return None
+
+    async def compress_session_end(self) -> None:
+        """Called from session shutdown — compress remaining turns."""
+        remaining = self._short_term.get_recent()
+        if len(remaining) > 2:
+            await self._compress()
+
+    @staticmethod
+    def _format_turns(turns: list[Turn]) -> str:
+        """Format turns into a readable conversation transcript."""
         lines: list[str] = []
         for turn in turns:
             lines.append(f"[{turn.role}]: {turn.content}")
         return "\n".join(lines)
 
     def get_pending_count(self) -> int:
-        """Return the number of turns waiting to be compressed."""
-        return len(self._pending)
+        """Return 0 — pending queue is no longer used in v5."""
+        return 0
 
     @property
     def is_busy(self) -> bool:

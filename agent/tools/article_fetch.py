@@ -61,7 +61,7 @@ class ArticleFetchTool(BaseTool):
         "meta-llama/llama-4-maverick-17b-128e-instruct",  # 6K TPM but different quota
     ]
 
-    def __init__(self, config: dict | None = None) -> None:
+    def __init__(self, config: dict | None = None, session_cache=None) -> None:
         super().__init__(config)
         cfg = self.config.get("article_fetch", {}) if self.config else {}
         self.fetch_timeout: int = cfg.get("fetch_timeout_seconds", self.DEFAULT_FETCH_TIMEOUT)
@@ -71,6 +71,7 @@ class ArticleFetchTool(BaseTool):
         self.long_article_model: str = cfg.get("long_article_model", self.DEFAULT_LONG_MODEL)
         self.fallback_models: list[str] = cfg.get("fallback_models", self.DEFAULT_FALLBACK_MODELS)
         self.default_summary_max_words: int = cfg.get("default_summary_max_words", self.DEFAULT_SUMMARY_MAX_WORDS)
+        self._session_cache = session_cache
         self._logger = logging.getLogger("Tool.article_fetch")
 
     async def execute(self, params: dict) -> str:
@@ -129,6 +130,21 @@ class ArticleFetchTool(BaseTool):
             summary = await self._summarise_with_fallback(
                 cleaned_text, instruction, model_chain
             )
+
+            # ── Store full text in session cache for follow-up QA ──
+            if self._session_cache is not None:
+                title = self._extract_title(raw_html)
+                cache_id = self._session_cache.store(
+                    content_type="article",
+                    full_content=cleaned_text,
+                    summary=summary,
+                    source_url=url,
+                    title=title,
+                )
+                # Append cache reference — response_parser strips [ref:...] from TTS
+                # but keeps it in working memory so the AI can use session_cache_qa later
+                return f"{summary} [ref:{cache_id}]"
+
             return summary
 
         except Exception as e:
@@ -249,3 +265,15 @@ class ArticleFetchTool(BaseTool):
         except Exception as e:
             self._logger.error("Summarisation failed on model '%s': %s", model, e, exc_info=True)
             return "I fetched the article but ran into an error while summarising it.", False
+
+    @staticmethod
+    def _extract_title(html: str) -> str:
+        """Extract page title from raw HTML."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            title_tag = soup.find("title")
+            if title_tag and title_tag.string:
+                return title_tag.string.strip()[:200]
+        except Exception:
+            pass
+        return "Untitled"

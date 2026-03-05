@@ -186,6 +186,8 @@ NOTES:
 import logging
 import hashlib
 import time
+from datetime import datetime
+from math import exp
 from typing import Optional
 from pathlib import Path
 
@@ -201,6 +203,15 @@ from core.event_bus import EventBus, EventType
 DEFAULT_PERSIST_DIR = "data/chromadb"
 DEFAULT_COLLECTION = "voxcore_memory"
 MAX_RESULTS = 10
+
+# Recency decay constants — lambda per category (higher = faster decay)
+RECENCY_LAMBDA = {
+    "event": 0.1,
+    "fact": 0.05,
+    "preference": 0.03,
+    "correction": 0.02,
+    "instruction": 0.01,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -232,18 +243,36 @@ class LongTermMemory:
         )
         self._bus.subscribe(EventType.MEMORY_COMPRESSED, self._on_compress)
 
-    async def store(self, text: str, metadata: dict = None) -> str:
-        """Embed and store a text document, returning its hash-based ID."""
+    async def store(
+        self,
+        text: str,
+        memory_type: str = "semantic",
+        category: str = "fact",
+        importance: float = 0.5,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """Embed and store a text document with type/category tags."""
         doc_id = hashlib.sha256(text.encode()).hexdigest()[:16]
-        meta = metadata or {}
-        meta["stored_at"] = time.time()
-        meta["text_length"] = len(text)
+        meta = {
+            "timestamp": datetime.now().isoformat(),
+            "memory_type": memory_type,
+            "category": category,
+            "importance": importance,
+            "access_count": 0,
+            "last_accessed": datetime.now().isoformat(),
+            "stored_at": time.time(),
+            "text_length": len(text),
+            **(metadata or {}),
+        }
         self._collection.upsert(
             ids=[doc_id],
             documents=[text],
             metadatas=[meta],
         )
-        self._logger.info(f"Stored document {doc_id} ({len(text)} chars)")
+        self._logger.info(
+            "Stored document %s (%d chars) type=%s cat=%s",
+            doc_id, len(text), memory_type, category,
+        )
         return doc_id
 
     async def query(
@@ -251,17 +280,37 @@ class LongTermMemory:
         query_text: str,
         top_k: int = 5,
         where_filter: dict = None,
+        memory_type: Optional[str] = None,
     ) -> list[dict]:
-        """Semantic similarity search against stored documents."""
+        """Semantic similarity search with re-ranking by recency + importance."""
         top_k = min(top_k, MAX_RESULTS)
-        kwargs = {"query_texts": [query_text], "n_results": top_k}
+
+        # Fetch 3× candidates for re-ranking
+        collection_count = self._collection.count()
+        if collection_count == 0:
+            return []
+        n_fetch = min(top_k * 3, collection_count)
+
+        # Build where clause
+        where = {}
+        if memory_type:
+            where["memory_type"] = {"$eq": memory_type}
         if where_filter:
-            kwargs["where"] = where_filter
+            where.update(where_filter)
+
+        kwargs = {
+            "query_texts": [query_text],
+            "n_results": n_fetch,
+        }
+        if where:
+            kwargs["where"] = where
+
         results = self._collection.query(**kwargs)
 
-        output: list[dict] = []
+        # Build raw result list
+        raw_results: list[dict] = []
         for i in range(len(results["ids"][0])):
-            output.append(
+            raw_results.append(
                 {
                     "id": results["ids"][0][i],
                     "content": results["documents"][0][i],
@@ -269,13 +318,55 @@ class LongTermMemory:
                     "metadata": results["metadatas"][0][i],
                 }
             )
-        return output
+
+        # Re-rank with recency decay + importance + similarity
+        now = datetime.now()
+        for result in raw_results:
+            meta = result["metadata"]
+            # Calculate days since last access
+            try:
+                last_acc = datetime.fromisoformat(meta.get("last_accessed", meta.get("timestamp", now.isoformat())))
+                days = max((now - last_acc).days, 0)
+            except (ValueError, TypeError):
+                days = 30  # default fallback
+
+            lam = RECENCY_LAMBDA.get(meta.get("category", "fact"), 0.05)
+            recency = exp(-lam * days)
+            importance = float(meta.get("importance", 0.5))
+            similarity = 1 - result["distance"]
+
+            result["final_score"] = (
+                0.6 * similarity + 0.25 * importance + 0.15 * recency
+            )
+
+        # Sort by final_score DESC, return top_k
+        raw_results.sort(key=lambda r: r["final_score"], reverse=True)
+        returned = raw_results[:top_k]
+
+        # Update access tracking for returned results
+        for r in returned:
+            try:
+                self._collection.update(
+                    ids=[r["id"]],
+                    metadatas=[{
+                        **r["metadata"],
+                        "access_count": int(r["metadata"].get("access_count", 0)) + 1,
+                        "last_accessed": now.isoformat(),
+                    }],
+                )
+            except Exception:
+                pass  # non-critical
+
+        return returned
 
     async def _on_compress(self, event) -> None:
-        """Handle MEMORY_COMPRESS events by storing summaries or raw turns."""
+        """Handle MEMORY_COMPRESSED events by storing summaries."""
         if "summary" in event.data:
             await self.store(
                 event.data["summary"],
+                memory_type="episodic",
+                category="event",
+                importance=0.4,
                 metadata={
                     "source": "compressor",
                     "turn_count": len(event.data.get("turns", [])),
@@ -283,9 +374,13 @@ class LongTermMemory:
             )
         else:
             for turn in event.data.get("turns", []):
-                text = f"{turn.role}: {turn.text}"
+                text = f"{turn.role}: {turn.content}"
                 await self.store(
-                    text, metadata={"source": "overflow", "role": turn.role}
+                    text,
+                    memory_type="episodic",
+                    category="event",
+                    importance=0.3,
+                    metadata={"source": "overflow", "role": turn.role},
                 )
 
     async def delete(self, doc_id: str) -> bool:
@@ -310,6 +405,19 @@ class LongTermMemory:
         )
         self._logger.info("Long-term memory cleared")
 
+    async def recall(
+        self,
+        query: str,
+        memory_type: Optional[str] = None,
+        top_k: int = 5,
+    ) -> list[dict]:
+        """Convenience alias for query() used by retriever and memory_recall."""
+        return await self.query(
+            query_text=query,
+            top_k=top_k,
+            memory_type=memory_type,
+        )
+
     async def save_session(self, session) -> None:
         """Summarize and persist the current session's history to ChromaDB on shutdown.
 
@@ -332,6 +440,9 @@ class LongTermMemory:
         # Store as a single document with session metadata
         await self.store(
             transcript,
+            memory_type="episodic",
+            category="event",
+            importance=0.3,
             metadata={
                 "source": "session_save",
                 "session_id": session.session_id,

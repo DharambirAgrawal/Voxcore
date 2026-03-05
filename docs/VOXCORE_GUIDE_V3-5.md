@@ -18,7 +18,12 @@ voxcore/agent/
     ├── __init__.py              # Exports all tool classes
     ├── base_tool.py             # Abstract base — every tool implements this
     ├── web_search.py            # Search internet via Tavily / DuckDuckGo fallback
-    └── article_fetch.py         # Fetch URL → clean text → spoken summary via Groq
+    ├── article_fetch.py         # Fetch URL → clean text → spoken summary via Groq
+    │                            #   Stores full text in session_cache, appends [ref:id]
+    ├── memory_recall.py         # [NEW v3.6] Search across all 5 memory tiers
+    │                            #   Result → text_injector → main LLM synthesizes
+    └── session_cache_qa.py      # [NEW v3.6] QA over cached content (articles, searches)
+                                 #   produces_spoken_output=True → TTS directly
 ```
 
 **Rule:** One tool = one file. Each file is fully self-contained. Adding a new tool means adding one file here and one line in `tool_router.py` and `config.yaml`. Nothing else changes.
@@ -64,12 +69,14 @@ This is the single registration point. To add a new tool: import it here, add on
 ```python
 from agent.tools.web_search import WebSearchTool
 from agent.tools.article_fetch import ArticleFetchTool
-# Add new tools here — one import per tool
+from agent.tools.memory_recall import MemoryRecallTool
+from agent.tools.session_cache_qa import SessionCacheQATool
 
 TOOL_MAP = {
-    "web_search":    WebSearchTool,
-    "article_fetch": ArticleFetchTool,
-    # Add new tools here — one line per tool
+    "web_search":       WebSearchTool,
+    "article_fetch":    ArticleFetchTool,
+    "memory_recall":    MemoryRecallTool,
+    "session_cache_qa": SessionCacheQATool,
 }
 ```
 
@@ -89,7 +96,8 @@ from agent.slow_llm import SlowLLM
 from agent.tools.base_tool import BaseTool
 from agent.tools.web_search import WebSearchTool
 from agent.tools.article_fetch import ArticleFetchTool
-# Add new tool exports here
+from agent.tools.memory_recall import MemoryRecallTool
+from agent.tools.session_cache_qa import SessionCacheQATool
 ```
 
 ---
