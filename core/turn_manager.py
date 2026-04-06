@@ -428,8 +428,53 @@ class TurnManager:
             # publishes LLM_SPEECH_TOKEN events internally).
             await self.session.set_state(TurnState.SPEAKING)
 
+            # suppress_stream_done_if_empty=True: if the model is rate-limited
+            # and returns nothing, LLM_STREAM_DONE is NOT fired yet so that we
+            # can retry with a fallback model in the same turn (below).
             stream = self.llm_client.stream_response(messages, model)
-            full_text = await self.response_parser.parse_stream(stream)
+            full_text = await self.response_parser.parse_stream(
+                stream, suppress_stream_done_if_empty=True
+            )
+
+            # ── Rate-limit mid-stream recovery ────────────────────────────
+            # If the model hit a 429 after pick_available() already chose it
+            # (i.e. the cached rate-limit window had just expired), the stream
+            # returns empty and the client now knows it is rate-limited again.
+            # Retry once with the best available fallback model.
+            if not full_text.strip() and self.llm_client.is_rate_limited(model):
+                fallback = self.llm_client.pick_available(*self._llm_fallback_chain)
+                if fallback and not self.llm_client.is_rate_limited(fallback):
+                    self._logger.warning(
+                        "Rate-limited mid-stream on %s → retrying with %s",
+                        model, fallback,
+                    )
+                    stream2 = self.llm_client.stream_response(messages, fallback)
+                    # This call fires LLM_STREAM_DONE normally on completion.
+                    full_text = await self.response_parser.parse_stream(stream2)
+                else:
+                    # Every model is rate-limited — fire DONE so TTS doesn't
+                    # stall indefinitely, and surface a brief spoken message.
+                    self._logger.error(
+                        "All fallback models rate-limited — no response for this turn"
+                    )
+                    await self.event_bus.publish(
+                        EventType.LLM_SPEECH_TOKEN,
+                        {
+                            "text": "I'm sorry, I'm having trouble connecting right now. Please try again in a moment.",
+                            "sentence_index": 0,
+                            "emotion": "neutral",
+                        },
+                        source="TurnManager",
+                    )
+                    await self.event_bus.publish(EventType.LLM_STREAM_DONE, {})
+                    return
+            elif not full_text.strip():
+                # Empty for a non-rate-limit reason — fire DONE so TTS doesn't stall.
+                await self.event_bus.publish(EventType.LLM_STREAM_DONE, {})
+
+            # Don't record an empty assistant turn in session history.
+            if not full_text.strip():
+                return
 
             # Stream complete — record assistant turn
             await self.session.add_turn("assistant", full_text)

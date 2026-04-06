@@ -20,8 +20,6 @@ Requirements (already in requirements.txt):
 import argparse
 import asyncio
 import json
-import struct
-import sys
 import signal
 import time
 import threading

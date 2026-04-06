@@ -25,7 +25,6 @@ INTERRUPT TYPES:
 import asyncio
 import logging
 import os
-from collections import deque
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -98,11 +97,9 @@ class InterruptRouter:
             sm_cfg.get("paused_resume_phrases", list(RESUME_PHRASES))
         )
 
-        # Deferred INJECT — queue of transcripts from "after this can you..." requests.
-        # Using a deque so multiple mid-TTS INJECTs never overwrite each other.
-        # TurnManager pops from the front after each TTS turn ends and processes
-        # them one-by-one (next pop fires on the next PLAYBACK_DONE).
-        self._pending_deferred_tasks: deque[str] = deque()
+        # Deferred INJECT — stores transcript of "after this can you..." requests
+        # so they fire automatically when the current TTS turn ends.
+        self._pending_deferred_task: Optional[str] = None
 
         self._logger = logging.getLogger("InterruptRouter")
 
@@ -192,7 +189,7 @@ class InterruptRouter:
         if is_deferred:
             # Deferred request: play bridge clip first so the user knows we
             # heard them, THEN resume TTS — avoids the clip and TTS overlapping.
-            self._pending_deferred_tasks.append(transcript)
+            self._pending_deferred_task = transcript
             bridge_clip = self._bridge_clips.get("new_question", "sure.wav")
             bridge_path = os.path.join(self._clips_dir, bridge_clip)
             if os.path.isfile(bridge_path):
@@ -210,11 +207,11 @@ class InterruptRouter:
             # Store as pending deferred task so _handle_playback_done fires
             # a fresh LLM turn once the current sentence finishes — identical
             # to deferred but without the bridge clip.
-            self._pending_deferred_tasks.append(transcript)
+            self._pending_deferred_task = transcript
             await self._audio_player.resume()
             self._logger.info(
-                "INJECT — queued '%s' for post-TTS LLM response (at %s) [queue depth: %d]",
-                transcript[:40], inject_point, len(self._pending_deferred_tasks),
+                "INJECT — queued '%s' for post-TTS LLM response (at %s)",
+                transcript[:40], inject_point,
             )
 
         from core.session import TurnState
@@ -223,14 +220,15 @@ class InterruptRouter:
         await self._session.set_state(TurnState.SPEAKING)
 
     def pop_deferred_task(self) -> Optional[str]:
-        """Pop and return the oldest pending deferred task transcript.
+        """Return and clear any pending deferred task transcript.
 
         Called by TurnManager after playback ends to fire deferred requests
         (e.g. 'after this can you tell me the bitcoin price').
-        Remaining tasks in the queue will fire on subsequent PLAYBACK_DONE events.
-        Returns None if the queue is empty.
+        Returns None if no deferred task is pending.
         """
-        return self._pending_deferred_tasks.popleft() if self._pending_deferred_tasks else None
+        task = self._pending_deferred_task
+        self._pending_deferred_task = None
+        return task
 
     # ── INTERRUPT:STOP ───────────────────────────────────────────────────────
 

@@ -247,18 +247,6 @@ class AudioPlayer:
         self._volume_restore_queue: asyncio.Queue = event_bus.subscribe(EventType.VOLUME_RESTORE)
         self._pause_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_PAUSE)
         self._resume_queue: asyncio.Queue = event_bus.subscribe(EventType.PLAYBACK_RESUME)
-        # V5: Reset _tts_stream_done immediately when new speech tokens arrive.
-        # Without this, the following race occurs during article_fetch:
-        #   1. Bridge phrase ("Sure, let me read that...") finishes → TTS_ALL_DONE fires
-        #      → _tts_stream_done = True
-        #   2. parse_stream() fires LLM_SPEECH_TOKEN events for the article
-        #   3. TTS synthesis hasn't produced a chunk yet (takes ~200ms)
-        #   4. Bridge audio drains → queue empty + _tts_stream_done=True → PLAYBACK_DONE fires
-        #   5. State → LISTENING while 15 seconds of article audio is still in the TTS queue
-        # Fix: when any LLM_SPEECH_TOKEN arrives, immediately clear _tts_stream_done so
-        # condition (queue_empty AND _tts_stream_done) cannot both be true until TTS_ALL_DONE
-        # fires again after the article is fully synthesized.
-        self._speech_token_queue: asyncio.Queue = event_bus.subscribe(EventType.LLM_SPEECH_TOKEN)
 
         # State
         self._is_playing: bool = False
@@ -303,29 +291,11 @@ class AudioPlayer:
             self._process_backchannels(),
             self._playback_loop(),
             self._watch_tts_all_done(),
-            self._watch_speech_tokens(),
             self._process_volume_duck(),
             self._process_volume_restore(),
             self._process_pause(),
             self._process_resume(),
         )
-
-    async def _watch_speech_tokens(self) -> None:
-        """V5: Reset _tts_stream_done the moment new speech tokens arrive.
-
-        LLM_SPEECH_TOKEN events fire from parse_stream() before TTS has
-        synthesized anything.  Clearing _tts_stream_done here ensures the
-        PLAYBACK_DONE gate (queue_empty AND _tts_stream_done) cannot be
-        satisfied during the synthesis gap between the bridge phrase and
-        the first article chunk.
-        """
-        while True:
-            await self._speech_token_queue.get()
-            if self._tts_stream_done:
-                self._tts_stream_done = False
-                self._logger.debug(
-                    "LLM_SPEECH_TOKEN received — _tts_stream_done reset (more audio coming)"
-                )
 
     async def _watch_tts_all_done(self) -> None:
         """Set _tts_stream_done when TTSClient signals all sentences synthesized.
@@ -408,7 +378,6 @@ class AudioPlayer:
             finally:
                 if self._mic_stream is not None:
                     self._mic_stream.set_filter_active(False)
-                    self._mic_stream.clear_playback_reference()  # V5
             self._is_playing = False
 
             # Only fire PLAYBACK_DONE when TTS has finished synthesizing
@@ -552,12 +521,6 @@ class AudioPlayer:
                         len(feed_frame),
                     )
 
-                # ═══════════════════════════════════════════════════════════
-                # V5: Feed playback reference for echo correlation check
-                # ═══════════════════════════════════════════════════════════
-                if self._mic_stream is not None:
-                    self._mic_stream.feed_playback_reference(feed_frame)
-
                 offset = end
 
                 # Yield to event loop so interrupts/pauses can be detected
@@ -589,16 +552,7 @@ class AudioPlayer:
     async def _process_interrupts(self) -> None:
         """Listen for interrupt events and immediately stop playback."""
         while True:
-            event = await self._interrupt_queue.get()
-
-            # Skip if flush() already handled this (it publishes INTERRUPT_DETECTED
-            # to cancel TTSClient, which also arrives here)
-            source = ""
-            if hasattr(event, "data") and event.data:
-                source = event.data.get("source", "")
-            if source == "flush":
-                continue
-
+            await self._interrupt_queue.get()
             self._logger.info("INTERRUPT — stopping playback")
 
             self._is_interrupted = True
@@ -708,11 +662,9 @@ class AudioPlayer:
         while True:
             event = await self._backchannel_queue.get()
 
-            # Only fire during LISTENING — discard events queued during any
-            # other state (SPEAKING, THINKING, PENDING, PAUSED, INTERRUPTED)
-            if self.session.state != TurnState.LISTENING:
-                continue
             if self._is_playing:
+                continue
+            if self.session.state == TurnState.SPEAKING:
                 continue
 
             clip_path: str = event.data["clip_path"]
@@ -817,7 +769,6 @@ class AudioPlayer:
             self._is_paused = True
             if self._mic_stream is not None:
                 self._mic_stream.set_filter_active(False)
-                self._mic_stream.clear_playback_reference()  # V5
             self._logger.info("V3: Playback PAUSED (filter OFF)")
 
     async def resume(self) -> None:
@@ -839,9 +790,6 @@ class AudioPlayer:
         - Clears audio accumulator
         - Stops current audio stream
         - Toggles filter OFF
-        - Publishes INTERRUPT_DETECTED so TTSClient drains its synthesis queue
-        - Resets _tts_stream_done to prevent stale TTS_ALL_DONE from old
-          article/response from prematurely firing PLAYBACK_DONE on the next one
         """
         self._is_interrupted = True
         self._is_paused = False
@@ -868,21 +816,6 @@ class AudioPlayer:
 
         if self._mic_stream is not None:
             self._mic_stream.set_filter_active(False)
-            self._mic_stream.clear_playback_reference()  # V5
-
-        # Reset TTS-done flag — prevents stale TTS_ALL_DONE from a cancelled
-        # article/response from firing premature PLAYBACK_DONE on the next one.
-        self._tts_stream_done = False
-
-        # Notify TTSClient to stop synthesizing remaining sentences.
-        # In v3, InterruptRouter calls flush() directly (not via INTERRUPT_DETECTED
-        # event), so TTSClient's _is_cancelled flag was never set — it would keep
-        # synthesizing for 10+ seconds after the user said "stop".
-        await self.event_bus.publish(
-            EventType.INTERRUPT_DETECTED,
-            {"source": "flush"},
-            source="AudioPlayer",
-        )
 
         await asyncio.sleep(0.05)
         self._is_interrupted = False

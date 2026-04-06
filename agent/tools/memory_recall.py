@@ -12,7 +12,6 @@ PURPOSE:
     synthesize into a spoken response.
 """
 
-import logging
 
 from agent.tools.base_tool import BaseTool
 from memory.retriever import MemoryRetriever

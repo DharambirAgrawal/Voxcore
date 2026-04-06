@@ -3,306 +3,6 @@
 ║                              VOXCORE — main.py                                  ║
 ║                         ENTRY POINT — BOOTS ALL ASYNC TASKS                     ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
-
-PURPOSE:
-    This is the single entry point for the entire VoxCore system. It initializes
-    all modules, loads configuration, sets up the event bus, and launches all
-    concurrent async tasks (mic capture, VAD, STT, LLM, TTS, backchannel,
-    safety, interfaces) as a coordinated asyncio task group.
-
-    Run with:  python main.py
-    Or:        python main.py --config custom_config.yaml --interface cli
-
-═══════════════════════════════════════════════════════════════════════════════════
-IMPORTS REQUIRED:
-═══════════════════════════════════════════════════════════════════════════════════
-
-import asyncio                          # Core async event loop
-import argparse                         # CLI argument parsing
-import signal                           # Graceful shutdown on SIGINT/SIGTERM
-import sys                              # sys.exit
-import os                               # Environment variable access
-import logging                          # Structured logging for all modules
-
-from pathlib import Path                # Path operations for config file
-from dotenv import load_dotenv          # Load .env file (GROQ_API_KEY, etc.)
-
-import yaml                             # Parse config.yaml
-
-# Internal module imports
-from core.session import Session
-from core.event_bus import EventBus
-from core.turn_manager import TurnManager
-
-from input.mic_stream import MicStream
-from input.vad import VADProcessor
-from input.stt import STTClient
-from input.text_injector import TextInjector
-from input.interruption_detector import InterruptionDetector
-
-from backchannel.cue_detector import CueDetector
-from backchannel.selector import BackchannelSelector
-
-from brain.llm_client import LLMClient
-from brain.prompt_builder import PromptBuilder
-from brain.response_parser import ResponseParser
-from brain.emotion_tagger import EmotionTagger
-from brain.router import BrainRouter
-
-from output.tts_client import TTSClient
-from output.audio_player import AudioPlayer
-from output.voice_profile import VoiceProfile
-
-from agent.text_out import TextOut
-from agent.tool_router import ToolRouter
-from agent.slow_llm import SlowLLM
-
-from memory.short_term import ShortTermMemory
-from memory.long_term import LongTermMemory
-from memory.compressor import MemoryCompressor
-
-from safety.guard import SafetyGuard
-
-from interfaces.cli import CLIInterface
-from interfaces.websocket_server import WebSocketServer
-from interfaces.api import APIServer
-
-═══════════════════════════════════════════════════════════════════════════════════
-FUNCTIONS & CLASSES:
-═══════════════════════════════════════════════════════════════════════════════════
-
-──────────────────────────────────────────────────────────────────────────────────
-FUNCTION: load_config(config_path: str) -> dict
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - config_path: str — Path to the YAML config file (default: "config.yaml")
-    
-    OUTPUT:
-        - dict — Parsed configuration dictionary with all settings from config.yaml
-    
-    WHAT IT DOES:
-        1. Opens the YAML file at config_path using Path(config_path).read_text()
-        2. Parses with yaml.safe_load()
-        3. Validates that required top-level keys exist: persona, models, audio,
-           backchannel, memory, agent, safety, server
-        4. Returns the parsed dict
-    
-    ERROR HANDLING:
-        - If file not found, logs error and sys.exit(1)
-        - If YAML parse error, logs error and sys.exit(1)
-        - If missing required keys, logs which keys are missing and sys.exit(1)
-
-──────────────────────────────────────────────────────────────────────────────────
-FUNCTION: setup_logging(level: str = "INFO") -> None
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - level: str — Logging level string ("DEBUG", "INFO", "WARNING", "ERROR")
-    
-    OUTPUT:
-        - None (configures the root logger)
-    
-    WHAT IT DOES:
-        1. Calls logging.basicConfig() with:
-           - level=getattr(logging, level)
-           - format="%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s"
-           - datefmt="%H:%M:%S"
-        2. Sets specific loggers for noisy libraries to WARNING:
-           - logging.getLogger("httpx").setLevel(logging.WARNING)
-           - logging.getLogger("httpcore").setLevel(logging.WARNING)
-           - logging.getLogger("chromadb").setLevel(logging.WARNING)
-
-──────────────────────────────────────────────────────────────────────────────────
-FUNCTION: parse_args() -> argparse.Namespace
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - None (reads sys.argv)
-    
-    OUTPUT:
-        - argparse.Namespace with attributes:
-            - config: str (default "config.yaml")
-            - interface: str (choices: "cli", "server", "both"; default "cli")
-            - log_level: str (default "INFO")
-            - no_mic: bool (flag, for testing without microphone)
-    
-    WHAT IT DOES:
-        1. Creates ArgumentParser with description "VoxCore — Full-Duplex Conversational AI"
-        2. Adds arguments:
-           --config / -c  : path to config.yaml
-           --interface / -i: which interface to launch
-           --log-level / -l: logging verbosity
-           --no-mic: disable mic for headless/testing mode
-        3. Returns parser.parse_args()
-
-──────────────────────────────────────────────────────────────────────────────────
-ASYNC FUNCTION: initialize_system(config: dict, args: argparse.Namespace)
-                -> dict[str, Any]
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - config: dict — Parsed config.yaml dictionary
-        - args: argparse.Namespace — CLI arguments
-    
-    OUTPUT:
-        - dict — A dictionary of all initialized module instances keyed by name:
-          {
-            "event_bus": EventBus,
-            "session": Session,
-            "turn_manager": TurnManager,
-            "mic_stream": MicStream,
-            "vad": VADProcessor,
-            "stt": STTClient,
-            "text_injector": TextInjector,
-            "interruption_detector": InterruptionDetector,
-            "cue_detector": CueDetector,
-            "backchannel_selector": BackchannelSelector,
-            "llm_client": LLMClient,
-            "prompt_builder": PromptBuilder,
-            "response_parser": ResponseParser,
-            "emotion_tagger": EmotionTagger,
-            "brain_router": BrainRouter,
-            "tts_client": TTSClient,
-            "audio_player": AudioPlayer,
-            "voice_profile": VoiceProfile,
-            "text_out": TextOut,
-            "tool_router": ToolRouter,
-            "slow_llm": SlowLLM,
-            "short_term_memory": ShortTermMemory,
-            "long_term_memory": LongTermMemory,
-            "compressor": MemoryCompressor,
-            "safety_guard": SafetyGuard,
-          }
-    
-    WHAT IT DOES:
-        1. Creates EventBus instance (no args)
-        2. Creates Session(config=config["persona"], event_bus=event_bus)
-        3. Creates VoiceProfile(config=config["persona"])
-        4. Creates each module, injecting event_bus, session, and relevant config sections
-        5. Initializes LongTermMemory (connects to ChromaDB)
-        6. If long_term_memory is enabled, queries for past session context and injects
-           via text_injector at startup
-        7. Returns dict of all instances
-    
-    INITIALIZATION ORDER (matters for dependencies):
-        EventBus → Session → VoiceProfile → MicStream → VADProcessor → STTClient →
-        TextInjector → InterruptionDetector → LLMClient → PromptBuilder →
-        ResponseParser → EmotionTagger → BrainRouter → TTSClient → AudioPlayer →
-        TextOut → SlowLLM → ToolRouter → ShortTermMemory → LongTermMemory →
-        MemoryCompressor → SafetyGuard → CueDetector → BackchannelSelector →
-        TurnManager (last, since it orchestrates everything)
-
-──────────────────────────────────────────────────────────────────────────────────
-ASYNC FUNCTION: run_pipeline(modules: dict, config: dict, args: argparse.Namespace)
-                -> None
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - modules: dict — All initialized module instances from initialize_system()
-        - config: dict — Parsed config
-        - args: argparse.Namespace — CLI arguments
-    
-    OUTPUT:
-        - None (runs indefinitely until shutdown signal)
-    
-    WHAT IT DOES:
-        1. Creates an asyncio.TaskGroup (Python 3.11+)
-        2. Starts the following concurrent tasks inside the group:
-           a. modules["mic_stream"].run()          — continuous mic capture loop
-           b. modules["vad"].run()                  — continuous VAD processing loop
-           c. modules["stt"].run()                  — listens for SPEECH_END, transcribes
-           d. modules["turn_manager"].run()         — state machine event loop
-           e. modules["response_parser"].run()      — LLM token parsing loop
-           f. modules["audio_player"].run()          — audio playback loop
-           g. modules["interruption_detector"].run() — interrupt monitoring loop
-           h. modules["text_out"].run()              — agent JSON emission loop
-           i. modules["tool_router"].run()           — tool execution loop
-           j. modules["safety_guard"].run()          — async safety checking loop
-           k. If backchannel enabled:
-              - modules["cue_detector"].run()
-              - modules["backchannel_selector"].run()
-           l. If args.interface in ("cli", "both"):
-              - modules["cli"].run()
-           m. If args.interface in ("server", "both"):
-              - Start uvicorn server for WebSocket + API
-        3. All tasks run concurrently via asyncio.gather() or TaskGroup
-        4. On any task exception, logs and initiates graceful shutdown
-
-──────────────────────────────────────────────────────────────────────────────────
-ASYNC FUNCTION: shutdown(modules: dict) -> None
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - modules: dict — All module instances
-    
-    OUTPUT:
-        - None
-    
-    WHAT IT DOES:
-        1. Logs "Shutting down VoxCore..."
-        2. Calls modules["session"].save() to persist any unsaved state
-        3. If long_term_memory enabled, saves current session to ChromaDB
-        4. Closes mic stream (releases sounddevice resources)
-        5. Closes any open WebSocket connections
-        6. Cancels all running asyncio tasks
-        7. Logs "VoxCore shutdown complete."
-
-──────────────────────────────────────────────────────────────────────────────────
-FUNCTION: main() -> None
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - None
-    
-    OUTPUT:
-        - None (entry point)
-    
-    WHAT IT DOES:
-        1. Calls load_dotenv() to load .env
-        2. Calls parse_args()
-        3. Calls setup_logging(args.log_level)
-        4. Calls load_config(args.config)
-        5. Registers signal handlers for SIGINT and SIGTERM to trigger shutdown()
-        6. Runs asyncio.run(async_main(config, args))
-    
-    This is the function called by:  if __name__ == "__main__": main()
-
-──────────────────────────────────────────────────────────────────────────────────
-ASYNC FUNCTION: async_main(config: dict, args: argparse.Namespace) -> None
-──────────────────────────────────────────────────────────────────────────────────
-    INPUTS:
-        - config: dict — Parsed configuration
-        - args: argparse.Namespace
-    
-    OUTPUT:
-        - None
-    
-    WHAT IT DOES:
-        1. Calls modules = await initialize_system(config, args)
-        2. Wraps run_pipeline(modules, config, args) in try/except
-        3. On KeyboardInterrupt or CancelledError, calls await shutdown(modules)
-        4. On any unexpected exception, logs traceback and calls shutdown
-
-═══════════════════════════════════════════════════════════════════════════════════
-EXPORTS:
-═══════════════════════════════════════════════════════════════════════════════════
-    This file exports nothing. It is the entry point only.
-    
-    Entry: if __name__ == "__main__": main()
-
-═══════════════════════════════════════════════════════════════════════════════════
-EXECUTION:
-    python main.py
-    python main.py --config my_config.yaml --interface server --log-level DEBUG
-    python main.py --no-mic --interface cli   # Testing mode without microphone
-═══════════════════════════════════════════════════════════════════════════════════
-"""
-
-
-
-
-
-
-
-"""
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║                              VOXCORE — main.py                                  ║
-║                         ENTRY POINT — BOOTS ALL ASYNC TASKS                     ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
@@ -329,7 +29,7 @@ from input.text_injector import TextInjector
 from input.interruption_detector import InterruptionDetector
 from input.filler_detector import FillerDetector
 from input.speaking_monitor import SpeakingMonitor
-# V3: Echo suppression layers
+# Echo suppression layers
 from input.aria_voice_filter import AriaVoiceFilter
 from input.gate0_echo_check import Gate0EchoCheck
 
@@ -349,7 +49,7 @@ from output.voice_profile import VoiceProfile
 from agent.text_out import TextOut
 from agent.tool_router import ToolRouter
 from agent.slow_llm import SlowLLM
-# V3: Interrupt router
+# Interrupt router
 from brain.interrupt_router import InterruptRouter
 
 from memory.short_term import ShortTermMemory
@@ -486,10 +186,10 @@ async def initialize_system(
         event_bus=event_bus,
         mic_stream=mic_stream,
         vad=vad,
-        config=config,  # V2: pass full config so it can read speaking_monitor section
+        config=config,  # pass full config so it can read speaking_monitor section
     )
 
-    # V2: Filler detector (Gate 2) and Speaking Monitor (Gate 3)
+    # Filler detector (Gate 2) and Speaking Monitor (Gate 3)
     filler_detector = FillerDetector(
         config=config.get("speaking_monitor", {})
     )
@@ -506,14 +206,14 @@ async def initialize_system(
     tts_client = TTSClient(
         event_bus=event_bus,
         voice_profile=voice_profile,
-        config=config,  # V2: pass full config so it can read backchannel.emotional_clips
+        config=config,  # pass full config so it can read backchannel.emotional_clips
     )
     audio_player = AudioPlayer(
         session=session, event_bus=event_bus, config=config["audio"]
     )
 
 
-    # ── V3: Echo suppression layers ───────────────────────────────────────
+    # ── Echo suppression layers ───────────────────────────────────────
     echo_cfg = config.get("echo_suppression", {})
     aria_filter = AriaVoiceFilter(
         similarity_threshold=echo_cfg.get("aria_similarity_threshold", 0.75),
@@ -529,7 +229,7 @@ async def initialize_system(
     mic_stream.set_v3_filters(aria_filter, gate0)
     audio_player.set_v3_refs(mic_stream, aria_filter, gate0)
 
-    # V3: Create SpeakingMonitor with audio_player and gate3_done_event
+    # Create SpeakingMonitor with audio_player and gate3_done_event
     speaking_monitor = SpeakingMonitor(
         session=session,
         event_bus=event_bus,
@@ -573,7 +273,7 @@ async def initialize_system(
         config=config,
     )
 
-    # V5: New memory tiers
+    # New memory tiers
     fact_store = FactStore(config=config)
     procedural = ProceduralStore(config=config)
     session_cache = SessionCache()
@@ -590,7 +290,7 @@ async def initialize_system(
         fact_store=fact_store,
     )
 
-    # V5: Register new tools that need memory components
+    # Register new tools that need memory components
     tool_router.set_memory_components(
         session_cache=session_cache,
         retriever=retriever,
@@ -614,7 +314,7 @@ async def initialize_system(
     backchannel_selector = BackchannelSelector(
         session=session,
         event_bus=event_bus,
-        config=config,  # V2: pass full config so it can read backchannel section
+        config=config,  # pass full config so it can read backchannel section
     )
 
     # ── Turn Manager (last — orchestrates everything) ────────────────────
@@ -629,7 +329,7 @@ async def initialize_system(
         config=config,
     )
 
-    # ── V3: Interrupt Router ───────────────────────────────────────────
+    # ── Interrupt Router ───────────────────────────────────────────
     interrupt_router = InterruptRouter(
         config=config,
         audio_player=audio_player,
@@ -647,13 +347,13 @@ async def initialize_system(
     try:
         await long_term_memory.initialize()
 
-        # V5: Initialize SQLite stores
+        # Initialize SQLite stores
         await fact_store.initialize()
         await procedural.initialize()
 
         mem_cfg = config.get("memory", {})
         if mem_cfg.get("long_term_enabled", False):
-            # V5: Build session-start memory block from all stores
+            # Build session-start memory block from all stores
             memory_block = await loader.build_session_block()
             if memory_block:
                 prompt_builder.set_memory_block(memory_block)
@@ -664,7 +364,7 @@ async def initialize_system(
     except Exception as exc:
         logger.warning("Could not initialize memory system: %s", exc)
 
-    # V5: Wire memory components to TurnManager for background extraction
+    # Wire memory components to TurnManager for background extraction
     turn_manager.set_memory_components(
         background_llm=background_llm,
         short_term=short_term_memory,
@@ -709,7 +409,7 @@ async def initialize_system(
         "loader": loader,
         "retriever": retriever,
         "safety_guard": safety_guard,
-        # V3: New modules
+        # New modules
         "aria_filter": aria_filter,
         "gate0": gate0,
         "gate3_done_event": gate3_done_event,
@@ -747,7 +447,7 @@ async def run_pipeline(
     tasks.append(asyncio.create_task(modules["short_term_memory"].run(), name="short_term_memory"))
     tasks.append(asyncio.create_task(modules["compressor"].run(), name="compressor"))
 
-    # V2: Speaking Monitor (Gate 2 + Gate 3 interrupt classification)
+    # Speaking Monitor (Gate 2 + Gate 3 interrupt classification)
     sm_cfg = config.get("speaking_monitor", {})
     if sm_cfg.get("enabled", True):
         tasks.append(asyncio.create_task(
@@ -860,7 +560,7 @@ async def shutdown(modules: dict[str, Any]) -> None:
     except Exception as exc:
         logger.warning("Long-term memory save error: %s", exc)
 
-    # V5: Flush remaining turns via compressor
+    # Flush remaining turns via compressor
     try:
         compressor = modules.get("compressor")
         if compressor and hasattr(compressor, "compress_session_end"):
@@ -868,7 +568,7 @@ async def shutdown(modules: dict[str, Any]) -> None:
     except Exception as exc:
         logger.warning("Session-end compression error: %s", exc)
 
-    # V5: Clear session cache (RAM only, no persistence needed)
+    # Clear session cache (RAM only, no persistence needed)
     try:
         sc = modules.get("session_cache")
         if sc:
@@ -915,7 +615,7 @@ async def async_main(config: dict, args: argparse.Namespace) -> None:
     modules: dict[str, Any] = {}
     try:
         modules = await initialize_system(config, args)
-        # V3: Startup warmup — pre-warm echo filters before conversation
+        # Startup warmup — pre-warm echo filters before conversation
         await startup_warmup(modules, config)
         await run_pipeline(modules, config, args)
     except (KeyboardInterrupt, asyncio.CancelledError):

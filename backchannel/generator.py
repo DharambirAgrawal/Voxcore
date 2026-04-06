@@ -60,7 +60,7 @@ BACKCHANNEL_PHRASES = {
 
 }
 
-# V2: Emotional reaction clips — used inline during AI speech when the LLM
+# Emotional reaction clips — used inline during AI speech when the LLM
 # emits tags like [laughs], [chuckles], [light_laugh], [sighs].
 EMOTIONAL_CLIPS = {
     "laughs":       "Ha, that's great!",
@@ -69,7 +69,7 @@ EMOTIONAL_CLIPS = {
     "sighs":        "Mm.",
 }
 
-# V3: Pre-pause clips — played instantly when entering PENDING state
+# Pre-pause clips — played instantly when entering PENDING state
 # These give the user audio feedback while Gate 3 classifies.
 PRE_PAUSE_CLIPS = {
     "breath":   "Hmm.",        # Soft breath-like sound
@@ -154,8 +154,8 @@ class ClipGenerator:
         """Generate all backchannel clips and emotional clips, skipping existing ones."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
-        # V2: Merge emotional clips into the generation pass
-        # V3: Add pre-pause clips for PENDING state filler
+        # Merge emotional clips into the generation pass
+        # Add pre-pause clips for PENDING state filler
         all_phrases = {**phrases, **EMOTIONAL_CLIPS, **PRE_PAUSE_CLIPS}
         results: dict[str, bool] = {}
 
@@ -211,8 +211,8 @@ class ClipGenerator:
         """Delete existing clips and regenerate all (including emotional clips)."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         phrases = phrases or BACKCHANNEL_PHRASES
-        # V2: Merge emotional clips
-        # V3: Add pre-pause clips
+        # Merge emotional clips
+        # Add pre-pause clips
         all_phrases = {**phrases, **EMOTIONAL_CLIPS, **PRE_PAUSE_CLIPS}
 
         for clip_name in all_phrases:

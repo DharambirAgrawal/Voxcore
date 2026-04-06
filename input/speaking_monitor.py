@@ -124,7 +124,7 @@ ATTENTION_PREFIXES: tuple[str, ...] = (
     "excuse me",
 )
 
-# V3: Deferral phrases — if ANY of these appear in the transcript, the user
+# Deferral phrases — if ANY of these appear in the transcript, the user
 # wants the AI to continue and handle the request LATER.  Forces INJECT.
 DEFERRAL_PHRASES: tuple[str, ...] = (
     "after this", "after the story", "after that", "after you finish",
@@ -170,8 +170,8 @@ class SpeakingMonitor:
         self.event_bus = event_bus
         self.mic_stream = mic_stream
         self.filler_detector = filler_detector
-        self._audio_player = audio_player       # V3: direct ref for pause/resume
-        self._gate3_done_event = gate3_done_event  # V3: stops filler clip
+        self._audio_player = audio_player       # direct ref for pause/resume
+        self._gate3_done_event = gate3_done_event  # stops filler clip
 
         # Config
         monitor_cfg = config.get("speaking_monitor", {})
@@ -200,22 +200,22 @@ class SpeakingMonitor:
 
         self._logger = logging.getLogger("SpeakingMonitor")
 
-        # V3: Gate 3 timeout
+        # Gate 3 timeout
         self._gate3_timeout_s: float = monitor_cfg.get("gate3_timeout_s", 3.0)
-        # V3: VAD-end silence wait
+        # VAD-end silence wait
         self._vad_silence_ms: int = monitor_cfg.get("vad_interrupt_silence_ms", 300)
-        # V3: Re-classify interval (samples) — every 1.5s of audio
+        # Re-classify interval (samples) — every 1.5s of audio
         self._reclassify_samples: int = monitor_cfg.get("gate3_reclassify_every_samples", 24000)
-        # V3: Pre-pause clip from config
+        # Pre-pause clip from config
         bc_cfg = config.get("backchannel", {})
         self._clips_dir: str = bc_cfg.get("clips_dir", "backchannel/clips/heart/")
         self._pre_pause_clip: str = monitor_cfg.get("pre_pause_clip", "mm_hmm.wav")
 
-        # V3: HF endpoint failure counter — skip HF after consecutive failures
+        # HF endpoint failure counter — skip HF after consecutive failures
         self._hf_consecutive_failures: int = 0
         self._hf_max_failures: int = 1  # after 1 failure, go straight to Groq
 
-        # V3: Pre-pause chunk count — used to prefer clean post-pause audio
+        # Pre-pause chunk count — used to prefer clean post-pause audio
         self._pre_pause_chunk_count: int = 0
 
     async def run(self) -> None:
@@ -267,7 +267,7 @@ class SpeakingMonitor:
                     )
                     continue
 
-                # V3: Get Gate 1 path info
+                # Get Gate 1 path info
                 gate1_path = event.data.get("path", "B")
 
                 # Run classification in background task
@@ -306,7 +306,7 @@ class SpeakingMonitor:
             if old_state == TurnState.SOFT_INJECT.value:
                 self._logger.debug("SpeakingMonitor: SOFT_INJECT → SPEAKING (preserved buffers)")
             elif old_state == TurnState.PAUSED.value:
-                # V3: Resuming from PAUSED — keep buffers, stay active
+                # Resuming from PAUSED — keep buffers, stay active
                 self._logger.debug("SpeakingMonitor: PAUSED → SPEAKING (resumed)")
             else:
                 self._is_active = True
@@ -318,11 +318,11 @@ class SpeakingMonitor:
             self._logger.debug("SpeakingMonitor: SOFT_INJECT (staying active)")
 
         elif new_state == TurnState.PAUSED.value:
-            # V3: PAUSED — stay active (we may need to re-classify)
+            # PAUSED — stay active (we may need to re-classify)
             self._logger.debug("SpeakingMonitor: PAUSED (staying active)")
 
         elif new_state == TurnState.PENDING.value:
-            # V3: PENDING — classification in progress
+            # PENDING — classification in progress
             self._logger.debug("SpeakingMonitor: PENDING (classifying)")
 
         elif new_state in (
@@ -331,7 +331,7 @@ class SpeakingMonitor:
             TurnState.INTERRUPTED.value,
         ):
             self._is_active = False
-            # V3: If leaving PENDING/PAUSED, ensure filler clip stops
+            # If leaving PENDING/PAUSED, ensure filler clip stops
             if old_state in (TurnState.PENDING.value, TurnState.PAUSED.value):
                 if self._gate3_done_event is not None:
                     self._gate3_done_event.set()
@@ -367,7 +367,7 @@ class SpeakingMonitor:
             self._last_classify_time = time.time()
 
             # ── Step 1: PAUSE playback → enter PENDING ───────────────────
-            # V3: Call audio_player.pause() DIRECTLY for ~3ms response
+            # Call audio_player.pause() DIRECTLY for ~3ms response
             if self._audio_player is not None:
                 await self._audio_player.pause()
             else:
@@ -396,20 +396,20 @@ class SpeakingMonitor:
                 len(_kept), len(_kept) * 30,
             )
 
-            # V3: Set session state to PENDING
+            # Set session state to PENDING
             await self.session.set_state(TurnState.PENDING)
             paused = True
 
-            # V3: Play pre-pause filler clip IMMEDIATELY (~3ms from Gate 2 pass)
+            # Play pre-pause filler clip IMMEDIATELY (~3ms from Gate 2 pass)
             # This gives the user instant audio feedback while Gate 3 runs
             if self._gate3_done_event is not None:
                 self._gate3_done_event.clear()
             clip_path = os.path.join(self._clips_dir, self._pre_pause_clip)
             if self._audio_player is not None and os.path.isfile(clip_path):
-                # V3: Play filler clip exactly once
+                # Play filler clip exactly once
                 asyncio.create_task(self._audio_player.play_clip(clip_path))
 
-            # V3: Publish PENDING event for WebSocket clients
+            # Publish PENDING event for WebSocket clients
             await self.event_bus.publish(
                 EventType.PENDING,
                 {"gate1_path": gate1_path, "urgency_hint": gate1_path == "A"},
@@ -478,7 +478,7 @@ class SpeakingMonitor:
                 # ── Step 4: Fast keyword check ───────────────────────────────
                 normalised = transcript.strip().lower().rstrip(".!?,")
 
-                # V3: Check for deferral phrases FIRST — these always mean INJECT
+                # Check for deferral phrases FIRST — these always mean INJECT
                 has_deferral = any(d in normalised for d in DEFERRAL_PHRASES)
 
                 # Exact match OR any multi-word stop phrase is a substring
@@ -498,7 +498,7 @@ class SpeakingMonitor:
                     paused = False
                     return
 
-                # V3: If deferral phrase detected, skip keyword bypass → let LLM classify
+                # If deferral phrase detected, skip keyword bypass → let LLM classify
                 # "after this can you tell me bitcoin price" should be INJECT, not INTERRUPT
                 if has_deferral:
                     self._logger.info(
@@ -520,7 +520,7 @@ class SpeakingMonitor:
                     return
 
                 # ── Step 6: Filler word check ────────────────────────────────
-                # V3: Path A (HIGH_ENERGY_BURST) skips filler check
+                # Path A (HIGH_ENERGY_BURST) skips filler check
                 if gate1_path != "A":
                     is_filler, matched_word = self.filler_detector.is_filler(transcript)
                     if is_filler:
@@ -567,7 +567,7 @@ class SpeakingMonitor:
                 )
 
             # ── Step 8: VAD-end action — wait for user silence ───────────
-            # V3: Re-classify every 1.5s if user keeps speaking
+            # Re-classify every 1.5s if user keeps speaking
             decision, interrupt_type = await self._wait_for_user_to_finish(
                 transcript, gate1_data, decision, interrupt_type,
                 urgency_hint=urgency_hint,
@@ -587,7 +587,7 @@ class SpeakingMonitor:
 
             # Route based on decision
             if decision == "IGNORE":
-                # V3: Play a soft acknowledgment so user feels heard
+                # Play a soft acknowledgment so user feels heard
                 if self._audio_player is not None:
                     ack_clip = os.path.join(self._clips_dir, "got_it.wav")
                     if os.path.exists(ack_clip):
@@ -632,10 +632,10 @@ class SpeakingMonitor:
     async def _do_resume(self, reason: str) -> None:
         """Resume playback — AI continues from where it paused."""
         self._last_classify_time = time.time()
-        # V3: Stop the filler clip first
+        # Stop the filler clip first
         if self._gate3_done_event is not None:
             self._gate3_done_event.set()
-        # V3: Resume via direct call (faster) or event fallback
+        # Resume via direct call (faster) or event fallback
         if self._audio_player is not None:
             await self._audio_player.resume()
         else:
@@ -644,7 +644,7 @@ class SpeakingMonitor:
                 {"reason": reason},
                 source="SpeakingMonitor",
             )
-        # V3: Return to SPEAKING state
+        # Return to SPEAKING state
         await self.session.set_state(TurnState.SPEAKING)
 
     async def _do_interrupt(self, gate1_data: dict, transcript: str) -> None:
@@ -661,7 +661,7 @@ class SpeakingMonitor:
             source="SpeakingMonitor",
         )
 
-    # ── V3: CLASSIFIED event publishing ──────────────────────────────────
+    # ── CLASSIFIED event publishing ──────────────────────────────────
 
     async def _publish_classified(
         self,
@@ -780,7 +780,7 @@ class SpeakingMonitor:
                 silence_duration = 0.0
                 time_since_reclassify += check_interval
 
-            # V3: Re-classify every 1.5s if user keeps speaking
+            # Re-classify every 1.5s if user keeps speaking
             if time_since_reclassify >= reclassify_interval_s:
                 time_since_reclassify = 0.0
                 self._logger.debug("Re-classifying after %.1fs of continued speech", reclassify_interval_s)
@@ -982,7 +982,7 @@ class SpeakingMonitor:
         data.add_field("sample_rate", str(self._sample_rate))
 
         async with aiohttp.ClientSession() as http_session:
-            # V3: timeout slashed to 1.5s to prevent massive 5-second hangs on HF failures
+            # timeout slashed to 1.5s to prevent massive 5-second hangs on HF failures
             async with http_session.post(
                 url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=1.5)
             ) as resp:

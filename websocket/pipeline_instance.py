@@ -209,6 +209,11 @@ class PipelineInstance:
             event_bus=event_bus, config=config.get("memory")
         )
 
+        # Wire MemoryTool if available
+        mem_tool = tool_router._tools.get("memory") if hasattr(tool_router, "_tools") else None
+        if mem_tool is not None and hasattr(mem_tool, "set_memory"):
+            mem_tool.set_memory(long_term_memory)
+
         compressor = MemoryCompressor(event_bus=event_bus, llm_client=llm_client)
 
         # ── Safety ────────────────────────────────────────────────────────

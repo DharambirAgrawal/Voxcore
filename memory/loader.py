@@ -15,7 +15,6 @@ PURPOSE:
 
 import logging
 import time
-from typing import Optional
 
 logger = logging.getLogger("MemoryLoader")
 
@@ -171,7 +170,3 @@ class MemoryLoader:
                 final_sections.append(s)
 
         return "\n\n".join(final_sections)
-
-    def get_stored_summary(self) -> str:
-        """Return the cached session memory block."""
-        return self._cached_summary

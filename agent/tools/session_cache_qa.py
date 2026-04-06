@@ -13,8 +13,6 @@ PURPOSE:
     SPOKEN_TOOL_OUTPUT event. The main LLM never sees it.
 """
 
-import logging
-import os
 
 from groq import AsyncGroq
 

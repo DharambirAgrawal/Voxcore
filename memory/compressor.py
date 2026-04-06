@@ -30,7 +30,6 @@ NOTES:
 
 import logging
 import asyncio
-import os
 from datetime import datetime
 from typing import Optional
 
@@ -186,10 +185,6 @@ class MemoryCompressor:
         for turn in turns:
             lines.append(f"[{turn.role}]: {turn.content}")
         return "\n".join(lines)
-
-    def get_pending_count(self) -> int:
-        """Return 0 — pending queue is no longer used in v5."""
-        return 0
 
     @property
     def is_busy(self) -> bool:
