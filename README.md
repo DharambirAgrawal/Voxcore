@@ -1,59 +1,99 @@
-# VoxCore: Full-Duplex Conversational AI System
+# VoxCore
 
-**VoxCore** is a voice-first, full-duplex conversational AI system inspired by NVIDIA PersonaPlex. It allows users to speak naturally to an AI that listens and responds in real-time, supports interruptions, backchannels, injects context mid-conversation, and outputs structured JSON for agentic tasks. All of this runs entirely on Groq's free-tier APIs.
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Status](https://img.shields.io/badge/status-active--development-orange)
 
-## 🌟 The Core Goal
-A black box you speak into. It speaks back. It understands, reasons, acts, and never blocks. Everything from Speech-to-Text (STT), Language Model (LLM) reasoning, Text-to-Speech (TTS), backchanneling, and agentic output runs concurrently inside it. You inject text in; you get voice and JSON out.
+A full-duplex voice AI pipeline that listens and speaks at the same time — handling interruptions, backchanneling, and agentic tool calls over an async, multi-model architecture.
 
-## ✨ Features
+## Overview
 
-- **Full-duplex conversation**: Simulated via VAD + interrupt handling.
-- **Backchanneling**: Simulated natural conversational cues (e.g., "uh-huh", "go on") via a parallel track.
-- **Agentic JSON output**: Emits JSON tool calls dynamically based on voice requests.
-- **Text-in injection**: Inject real-time external data (e.g., tool results, notifications) effortlessly into the ongoing conversation.
-- **Tool calling / agent tasks**: LLM is equipped to trigger async tool execution.
-- **Memory across sessions**: Powered by ChromaDB for persistent, long-term memory.
-- **Free to run**: Leverages Groq’s free-tier models natively.
-- **Emotional TTS tags**: Expressive speech via prompt emotion tagging (e.g., `[cheerful]`, `[sad]`).
+VoxCore is a voice-first conversational AI system, loosely inspired by NVIDIA's PersonaPlex. Rather than the usual turn-based "record → transcribe → respond → play" loop, it runs speech capture, transcription, LLM reasoning, and speech synthesis as concurrent asyncio tasks connected by a shared event bus — so the assistant can be interrupted mid-sentence, react to what you're saying while it's still talking, and inject external context (tool results, notifications) into the conversation without stopping to ask.
 
-## 🧠 Brain Routing Strategy
+It's built entirely on Groq's free-tier APIs for STT/LLM/safety, plus a local ONNX text-to-speech engine, so it runs at low latency without a GPU or a paid API bill.
 
-VoxCore uses a multi-LLM architecture:
-1. **Primary Conversational LLM (Fast Brain):** `llama-3.1-8b-instant`. Handles ALL real-time speech responses.
-2. **Complex Reasoning (Smart Brain):** `meta-llama/llama-4-scout-17b-16e-instruct`.
-3. **Agentic/Tool Use (Agentic Brain):** `moonshotai/kimi-k2-instruct`.
-4. **Deep Synthesis (Deep Brain):** `qwen/qwen3-32b`.
-5. **Max Intelligence (Power Brain):** `openai/gpt-oss-120b`.
-6. **Safety Filtering:** `meta-llama/llama-guard-4-12b`.
+## Features
 
-## ⚙️ Installation & Setup
+- **Full-duplex conversation loop** — voice activity detection (Silero VAD) and an event-driven turn state machine (`LISTENING` → `THINKING` → `SPEAKING` → `INTERRUPTED`) simulate simultaneous listening and speaking instead of strict turn-taking.
+- **Multi-gate interrupt classification** — layered gates (energy burst detection, filler-word filtering, and an LLM-based semantic classifier) decide whether a sound during playback is a real interruption, a backchannel ("uh-huh"), or noise, before deciding whether to pause or keep talking.
+- **Echo suppression** — a multi-layer pipeline (speech enhancement, speaker-embedding similarity via `resemblyzer`, and spectral/temporal gating) to stop the assistant from hearing and reacting to its own TTS output through the mic.
+- **Backchanneling** — a separate async track detects natural phrase pauses in the user's speech and plays short pre-generated audio cues ("mm-hmm", "go on") without interrupting the main pipeline.
+- **Agentic tool calls** — the LLM emits structured `<agent>{"action": ..., "params": ...}</agent>` tags to invoke tools (web search, calendar, memory) whose results are injected back into the live conversation.
+- **Multi-model brain routing** — different Groq-hosted models are assigned to different jobs: a fast model handles real-time replies, larger models are reserved for complex reasoning, tool use, and deep summarization.
+- **Persistent memory** — short-term rolling context plus long-term semantic memory backed by ChromaDB, with periodic LLM-driven compression of conversation history.
+- **Safety filtering** — input and output are checked against Llama Guard before being spoken or acted on.
+- **Local TTS** — speech synthesis runs on-device via Kokoro-ONNX (no API key, no per-request cost), with emotion tags parsed from LLM output for logging/analytics.
+- **CLI and network interfaces** — a colored terminal debug interface, plus optional FastAPI REST + WebSocket servers for remote clients.
 
-1. Clone the repository and navigate into the project directory:
-   ```bash
-   git clone https://github.com/your-username/voxcore.git
-   cd voxcore
-   ```
+## Tech Stack
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+- **Language:** Python 3.11+ (asyncio throughout)
+- **STT / LLM / Safety:** [Groq API](https://groq.com/) — Whisper (`whisper-large-v3-turbo`), multiple Llama/Qwen/GPT-OSS models for routed reasoning, Llama Guard for safety
+- **TTS:** [Kokoro-ONNX](https://github.com/thewh1teagle/kokoro-onnx) (local, ONNX runtime)
+- **VAD:** Silero VAD via `torch` / `torchaudio` (CPU-only)
+- **Echo suppression:** `resemblyzer` (speaker embeddings), `denoiser` (Facebook Research speech enhancement)
+- **Audio I/O & analysis:** `sounddevice`, `soundfile`, `numpy`, `scipy`, `librosa`
+- **Memory:** `chromadb` for vector-based long-term memory
+- **Networking:** `fastapi`, `uvicorn`, `websockets`
+- **Config:** YAML-based single source of truth (`config.yaml`), `python-dotenv` for secrets
 
-3. Setup environment variables:
-   Create a `.env` file in the root based on `.env.example` (or set the variables manually):
-   ```env
-   GROQ_API_KEY=your_groq_api_key
-   ```
+## Getting Started
 
-4. Generate backchannel clips (One-time setup):
-   ```bash
-   python -m backchannel.generator
-   ```
+### Prerequisites
 
-5. Launch VoxCore:
-   ```bash
-   python main.py
-   ```
+- Python 3.11+
+- A [Groq API key](https://console.groq.com/keys) (free tier)
+- Kokoro-ONNX model files (`kokoro-v1.0.onnx`, `voices-v1.0.bin`) — download from the [Kokoro-ONNX releases page](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files) and place them under `models/` (gitignored, not bundled in this repo)
 
-## 📖 Documentation
-Detailed architectural designs, data flows, and module responsibilities can be found in the [docs/DOCUMENTATION.md](./docs/DOCUMENTATION.md) and [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) files.
+### Installation
+
+```bash
+git clone https://github.com/DharambirAgrawal/Voxcore.git
+cd Voxcore
+pip install -r requirements.txt
+```
+
+Set up your environment variables:
+
+```bash
+cp .env.example .env
+# then edit .env and set GROQ_API_KEY (required)
+```
+
+Generate the backchannel audio clips (one-time setup, uses local Kokoro TTS):
+
+```bash
+python -m backchannel.generator
+```
+
+## Usage
+
+Run the assistant with the terminal interface (default):
+
+```bash
+python main.py
+```
+
+Other run modes:
+
+```bash
+python main.py --interface server        # FastAPI REST + WebSocket server only
+python main.py --interface both           # CLI + server
+python main.py --no-mic --interface cli   # Text-only mode, no microphone required
+python main.py --config custom.yaml --log-level DEBUG
+```
+
+All behavior — persona, model selection, audio thresholds, memory, safety, and interrupt tuning — is controlled from `config.yaml`.
+
+## How It Works
+
+VoxCore's pipeline is built around an `EventBus` that decouples its modules: microphone capture, VAD, STT, the LLM brain, TTS, and interrupt/backchannel detection all run as independent asyncio tasks that publish and subscribe to events rather than calling each other directly.
+
+Conversation state is tracked as a small state machine — `LISTENING`, `THINKING`, `SPEAKING`, `INTERRUPTED` — driven by VAD and LLM events. While the assistant is speaking, a separate "speaking monitor" continuously classifies incoming audio through multiple gates (energy burst detection, then filler-word filtering, then an LLM-based semantic check) to decide whether the user is backchanneling, genuinely interrupting, or just making noise — and only then does it pause or reroute the response. Because the mic keeps listening while the TTS is playing, a dedicated echo-suppression stack (speaker-embedding similarity + spectral/temporal gating) is used to stop the assistant from mistaking its own voice for user input.
+
+## Documentation
+
+Further design notes and architecture deep-dives live in [`docs/`](./docs), including [`ARCHITECTURE.md`](./docs/ARCHITECTURE.md) and [`DOCUMENTATION.md`](./docs/DOCUMENTATION.md).
+
+## Status
+
+This is an actively evolving personal project (currently on its third architectural iteration, per `docs/`). Some features — such as the HuggingFace STT fallback and the web search tool — expect additional self-hosted or third-party API keys not included in `.env.example` by default.
